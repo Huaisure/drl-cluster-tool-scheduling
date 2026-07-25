@@ -1,0 +1,201 @@
+{
+  "Modules": {
+    "LP1": { "type": "LP" },
+    "LP2": { "type": "LP" },
+    "LP3": { "type": "LP" },
+    "AL": { "type": "PM" },
+    "LLA": {
+      "type": "LL",
+      "load_lock": {
+        "initial_state": "atmosphere",
+        "atmosphere_to_vacuum_time": 15.0,
+        "vacuum_to_atmosphere_time": 20.0,
+        "tm_required_states": {
+          "TM1": "atmosphere",
+          "TM2": "vacuum"
+        }
+      }
+    },
+    "LLB": {
+      "type": "LL",
+      "load_lock": {
+        "initial_state": "atmosphere",
+        "atmosphere_to_vacuum_time": 15.0,
+        "vacuum_to_atmosphere_time": 20.0,
+        "tm_required_states": {
+          "TM1": "atmosphere",
+          "TM2": "vacuum"
+        }
+      }
+    },
+    "LLC": { "type": "PM" },
+    "LLD": { "type": "PM" },
+    "PM1": { "type": "PM" },
+    "PM2": { "type": "PM" },
+    "PM3": { "type": "PM" },
+    "PM4": { "type": "PM" },
+    "PM5": { "type": "PM" },
+    "PM6": { "type": "PM" },
+    "PM7": { "type": "PM" },
+    "PM8": { "type": "PM" },
+    "PM9": { "type": "PM" },
+    "PM10": { "type": "PM" }
+  },
+  "ClusterTool": {
+    "TM1": {
+      "arm_type": "single_arm",
+      "module_ids": ["LP1", "LP2", "LP3", "AL", "LLA", "LLB"],
+      "travel_times": 1.0,
+      "load_time": 4.0,
+      "unload_time": 4.0
+    },
+    "TM2": {
+      "arm_type": "dual_arm",
+      "module_ids": ["LLA", "LLB", "LLC", "LLD", "PM7", "PM8", "PM9", "PM10"],
+      "travel_times": 2.0,
+      "load_time": 4.0,
+      "unload_time": 4.0
+    },
+    "TM3": {
+      "arm_type": "dual_arm",
+      "module_ids": ["LLC", "LLD", "PM1", "PM2", "PM3", "PM4", "PM5", "PM6"],
+      "travel_times": 2.0,
+      "load_time": 4.0,
+      "unload_time": 4.0
+    }
+  },
+  "just_in_time": {
+    "residency_time": 15,
+    "completion_to_next_load_time": 30
+  },
+  "cleaning": {
+    "module_ids": ["PM1", "PM2", "PM3", "PM4", "PM5", "PM6", "PM7", "PM8", "PM9", "PM10"],
+    "process_switch": {
+      "clean_time": 200
+    },
+    "wafer_count": {
+      "wafer_count_threshold": 13,
+      "clean_time": 300
+    }
+  },
+  "routes": {
+    "A": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": "LLA", "process_time": 0 },
+      { "module_id": "PM7", "process_time": 70 },
+      { "module_id": "PM8", "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": "LLB", "process_time": 0 },
+      { "module_id": "PM7", "process_time": 70 },
+      { "module_id": "PM8", "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": "LLB", "process_time": 0 },
+      { "module_id": "PM7", "process_time": 70 },
+      { "module_id": "PM8", "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": "LLB", "process_time": 0 },
+      { "module_id": "PM7", "process_time": 70 },
+      { "module_id": "PM8", "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": "LLB", "process_time": 0 },
+      { "module_id": "PM7", "process_time": 70 },
+      { "module_id": "PM8", "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": "LLB", "process_time": 0 }
+    ],
+    "B": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": ["PM1", "PM2"], "process_time": 300 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "C": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": ["PM1", "PM2", "PM3", "PM4"], "process_time": 600 },
+      { "module_id": "LLD", "process_time": 0 },
+      { "module_id": ["PM9", "PM10"], "process_time": 200 },
+      { "module_id": ["LLA", "LLB"], "process_time": 70 }
+    ],
+    "D": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": ["PM9", "PM10"], "process_time": 200 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "E": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "PM1", "process_time": 600 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "F": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "PM2", "process_time": 600 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "G": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "PM3", "process_time": 600 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "H": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": "PM4", "process_time": 600 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "I": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "PM9", "process_time": 200 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "J": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "PM10", "process_time": 200 },
+      { "module_id": "LLD", "process_time": 70 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 }
+    ],
+    "K": [
+      { "module_id": "AL", "process_time": 8 },
+      { "module_id": ["LLA", "LLB"], "process_time": 0 },
+      { "module_id": ["PM7", "PM8"], "process_time": 70 },
+      { "module_id": "LLC", "process_time": 0 },
+      { "module_id": ["PM1", "PM2", "PM3", "PM4"], "process_time": 600 },
+      { "module_id": "LLD", "process_time": 0 },
+      { "module_id": ["PM9", "PM10"], "process_time": 200 },
+      { "module_id": ["LLA", "LLB"], "process_time": 70 }
+    ]
+  }
+}
