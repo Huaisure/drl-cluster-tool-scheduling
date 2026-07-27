@@ -50,8 +50,9 @@ def first_legal_action(
 def network_greedy_selector(
     env: ClusterEnv,
     model: ClusterActorCritic,
+    time_scale: float = 1.0,
 ) -> ActionSelector:
-    encoder = ClusterObservationEncoder.from_env(env)
+    encoder = ClusterObservationEncoder.from_env(env, time_scale)
     device = next(model.parameters()).device
 
     def select(
@@ -128,20 +129,23 @@ def run_all(seed: int = 0) -> list[RolloutResult]:
     for path in sorted(SCENARIO_DIR.glob("*.json")):
         problem = load_problem(path)
         env = ClusterEnv(problem)
-        results.append(
-            rollout(
-                env,
-                path.stem,
-                "first_legal",
-                first_legal_action,
-            )
+        reference = rollout(
+            env,
+            path.stem,
+            "first_legal",
+            first_legal_action,
         )
+        results.append(reference)
         results.append(
             rollout(
                 env,
                 path.stem,
                 "untrained_network_greedy",
-                network_greedy_selector(env, model),
+                network_greedy_selector(
+                    env,
+                    model,
+                    reference.makespan,
+                ),
             )
         )
     return results

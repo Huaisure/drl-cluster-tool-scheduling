@@ -9,9 +9,10 @@ from torch import Tensor, nn
 
 from problem import ClusterProblem, ModuleType, WaferKey
 
-WAFER_FEATURE_DIM = 5
+GLOBAL_FEATURE_DIM = 6
+WAFER_FEATURE_DIM = 8
 MODULE_FEATURE_DIM = 7
-ROBOT_FEATURE_DIM = 1
+ROBOT_FEATURE_DIM = 4
 
 GLOBAL_TYPE = 0
 ROBOT_TYPE = 1
@@ -24,17 +25,20 @@ CANDIDATE_RELATION = 0
 WAFER_LOCATION_RELATION = 1
 ROBOT_LOCATION_RELATION = 2
 ROBOT_HOLDS_RELATION = 3
-RELATION_COUNT = 4
+CANDIDATE_TIME_RELATION = 4
+RELATION_COUNT = 5
 
 
 @dataclass(frozen=True)
 class EncodedObservation:
     """One unpadded entity-state representation."""
 
+    global_features: np.ndarray
     robot_features: np.ndarray
     wafer_features: np.ndarray
     module_features: np.ndarray
     candidate_modules: np.ndarray
+    candidate_process_times: np.ndarray
     wafer_locations: np.ndarray
     robot_location: np.ndarray
     robot_holds: np.ndarray
@@ -45,10 +49,12 @@ class EncodedObservation:
 class EntityBatch:
     """Padded tensors consumed by :class:`ClusterActorCritic`."""
 
+    global_features: Tensor
     robot_features: Tensor
     wafer_features: Tensor
     module_features: Tensor
     candidate_modules: Tensor
+    candidate_process_times: Tensor
     wafer_locations: Tensor
     robot_location: Tensor
     robot_holds: Tensor
@@ -140,10 +146,14 @@ class ClusterObservationEncoder:
         problem: ClusterProblem,
         wafer_keys: Sequence[WaferKey],
         module_ids: Sequence[str],
+        time_scale: float = 1.0,
     ) -> None:
+        if not np.isfinite(time_scale) or time_scale <= 0:
+            raise ValueError("time_scale must be finite and positive")
         self.problem = problem
         self.wafer_keys = tuple(wafer_keys)
         self.module_ids = tuple(module_ids)
+        self.time_scale = float(time_scale)
         self._module_index = {module_id: index for index, module_id in enumerate(self.module_ids)}
         self._lp_id = next(module_id for module_id in self.module_ids if problem.Modules[module_id].type is ModuleType.LP)
 
@@ -154,8 +164,17 @@ class ClusterObservationEncoder:
             raise ValueError("module_ids must match the problem modules")
 
     @classmethod
-    def from_env(cls, env: Any) -> ClusterObservationEncoder:
-        return cls(env.problem, env.wafer_keys, env.module_ids)
+    def from_env(
+        cls,
+        env: Any,
+        time_scale: float = 1.0,
+    ) -> ClusterObservationEncoder:
+        return cls(
+            env.problem,
+            env.wafer_keys,
+            env.module_ids,
+            time_scale,
+        )
 
     def encode(
         self,
@@ -180,12 +199,23 @@ class ClusterObservationEncoder:
 
         wafer_features = np.zeros((wafer_count, WAFER_FEATURE_DIM), dtype=np.float32)
         candidate_modules = np.zeros((wafer_count, module_count), dtype=np.bool_)
+        candidate_process_times = np.zeros(
+            (wafer_count, module_count),
+            dtype=np.float32,
+        )
         wafer_locations = np.zeros_like(candidate_modules)
         robot_holds = wafer_module == module_count
+        total_process_work = 0.0
+        total_visits = 0
 
         for wafer_index, (route_id, _) in enumerate(self.wafer_keys):
             route = self.problem.routes[route_id]
             completed_step = len(route.visits) + 1
+            route_process_times = [
+                visit.process_time or 0.0 for visit in route.visits
+            ]
+            total_process_work += sum(route_process_times)
+            total_visits += len(route.visits)
             step = int(wafer_step[wafer_index])
             if not 0 <= step <= completed_step:
                 raise ValueError(f"wafer_step[{wafer_index}] is outside its route")
@@ -194,12 +224,21 @@ class ClusterObservationEncoder:
             if not np.isfinite(remaining) or remaining < 0:
                 raise ValueError("process_remaining must contain finite non-negative values")
 
+            remaining_steps = max(0, completed_step - step)
+            next_process_time = (
+                route_process_times[step]
+                if step < len(route_process_times)
+                else 0.0
+            )
             wafer_features[wafer_index] = (
                 step / completed_step,
-                np.log1p(remaining),
+                remaining / self.time_scale,
                 float(remaining == 0.0),
                 float(robot_holds[wafer_index]),
                 float(step == completed_step),
+                remaining_steps / completed_step,
+                next_process_time / self.time_scale,
+                sum(route_process_times[step:]) / self.time_scale,
             )
             if wafer_module[wafer_index] < module_count:
                 wafer_locations[wafer_index, wafer_module[wafer_index]] = True
@@ -212,7 +251,11 @@ class ClusterObservationEncoder:
             else:
                 targets = ()
             for module_id in targets:
-                candidate_modules[wafer_index, self._module_index[module_id]] = True
+                module_index = self._module_index[module_id]
+                candidate_modules[wafer_index, module_index] = True
+                candidate_process_times[
+                    wafer_index, module_index
+                ] = next_process_time / self.time_scale
 
         occupancy = wafer_locations.sum(axis=0)
         module_features = np.zeros((module_count, MODULE_FEATURE_DIM), dtype=np.float32)
@@ -236,12 +279,33 @@ class ClusterObservationEncoder:
         robot_location = np.zeros(module_count, dtype=np.bool_)
         if robot_module < module_count:
             robot_location[robot_module] = True
+        robot = next(iter(self.problem.ClusterTool.values()))
 
         return EncodedObservation(
-            robot_features=np.asarray([robot_holds.any()], dtype=np.float32),
+            global_features=np.asarray(
+                [
+                    np.log1p(wafer_count),
+                    np.log1p(module_count),
+                    np.log1p(len(self.problem.routes)),
+                    np.log1p(self.time_scale),
+                    total_process_work / self.time_scale,
+                    total_visits / wafer_count,
+                ],
+                dtype=np.float32,
+            ),
+            robot_features=np.asarray(
+                [
+                    robot_holds.any(),
+                    robot.pick_time / self.time_scale,
+                    robot.place_time / self.time_scale,
+                    float(robot.travel_times) / self.time_scale,
+                ],
+                dtype=np.float32,
+            ),
             wafer_features=wafer_features,
             module_features=module_features,
             candidate_modules=candidate_modules,
+            candidate_process_times=candidate_process_times,
             wafer_locations=wafer_locations,
             robot_location=robot_location,
             robot_holds=robot_holds,
@@ -265,6 +329,12 @@ def collate_observations(
     max_wafers = max(item.wafer_features.shape[0] for item in encoded)
     max_modules = max(item.module_features.shape[0] for item in encoded)
 
+    global_features = torch.zeros(
+        batch_size,
+        GLOBAL_FEATURE_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
     robot_features = torch.zeros(batch_size, ROBOT_FEATURE_DIM, dtype=torch.float32, device=device)
     wafer_features = torch.zeros(
         batch_size,
@@ -287,6 +357,13 @@ def collate_observations(
         dtype=torch.bool,
         device=device,
     )
+    candidate_process_times = torch.zeros(
+        batch_size,
+        max_wafers,
+        max_modules,
+        dtype=torch.float32,
+        device=device,
+    )
     wafer_locations = torch.zeros_like(candidate_modules)
     robot_location = torch.zeros(batch_size, max_modules, dtype=torch.bool, device=device)
     robot_holds = torch.zeros(batch_size, max_wafers, dtype=torch.bool, device=device)
@@ -303,10 +380,20 @@ def collate_observations(
         wafer_count = item.wafer_features.shape[0]
         module_count = item.module_features.shape[0]
 
+        global_features[batch_index] = torch.as_tensor(
+            item.global_features,
+            device=device,
+        )
         robot_features[batch_index] = torch.as_tensor(item.robot_features, device=device)
         wafer_features[batch_index, :wafer_count] = torch.as_tensor(item.wafer_features, device=device)
         module_features[batch_index, :module_count] = torch.as_tensor(item.module_features, device=device)
         candidate_modules[batch_index, :wafer_count, :module_count] = torch.as_tensor(item.candidate_modules, device=device)
+        candidate_process_times[
+            batch_index, :wafer_count, :module_count
+        ] = torch.as_tensor(
+            item.candidate_process_times,
+            device=device,
+        )
         wafer_locations[batch_index, :wafer_count, :module_count] = torch.as_tensor(item.wafer_locations, device=device)
         robot_location[batch_index, :module_count] = torch.as_tensor(item.robot_location, device=device)
         robot_holds[batch_index, :wafer_count] = torch.as_tensor(item.robot_holds, device=device)
@@ -317,10 +404,12 @@ def collate_observations(
         action_mask[batch_index, max_wafers : max_wafers + module_count] = torch.as_tensor(item.action_mask[wafer_count:], device=device)
 
     return EntityBatch(
+        global_features=global_features,
         robot_features=robot_features,
         wafer_features=wafer_features,
         module_features=module_features,
         candidate_modules=candidate_modules,
+        candidate_process_times=candidate_process_times,
         wafer_locations=wafer_locations,
         robot_location=robot_location,
         robot_holds=robot_holds,
@@ -361,6 +450,7 @@ class ClusterActorCritic(nn.Module):
         self.config = config or TransformerConfig()
         model_dim = self.config.model_dim
 
+        self.global_encoder = _FeatureEncoder(GLOBAL_FEATURE_DIM, model_dim)
         self.robot_encoder = _FeatureEncoder(ROBOT_FEATURE_DIM, model_dim)
         self.wafer_encoder = _FeatureEncoder(WAFER_FEATURE_DIM, model_dim)
         self.module_encoder = _FeatureEncoder(MODULE_FEATURE_DIM, model_dim)
@@ -428,7 +518,10 @@ class ClusterActorCritic(nn.Module):
         module_count = batch.module_valid.shape[1]
         device = batch.wafer_features.device
 
-        global_token = self.global_token.expand(batch_size, 1, -1)
+        global_token = (
+            self.global_encoder(batch.global_features)
+            + self.global_token
+        ).unsqueeze(1)
         robot_token = self.robot_encoder(batch.robot_features).unsqueeze(1)
         wafer_tokens = self.wafer_encoder(batch.wafer_features)
         module_tokens = self.module_encoder(batch.module_features)
@@ -486,6 +579,7 @@ class ClusterActorCritic(nn.Module):
             device=token_valid.device,
         )
         candidate = batch.candidate_modules.to(dtype)
+        candidate_process_times = batch.candidate_process_times.to(dtype)
         wafer_locations = batch.wafer_locations.to(dtype)
         robot_location = batch.robot_location.to(dtype)
         robot_holds = batch.robot_holds.to(dtype)
@@ -498,6 +592,12 @@ class ClusterActorCritic(nn.Module):
         relations[:, ROBOT_LOCATION_RELATION, module_slice, 1] = robot_location
         relations[:, ROBOT_HOLDS_RELATION, 1, wafer_slice] = robot_holds
         relations[:, ROBOT_HOLDS_RELATION, wafer_slice, 1] = robot_holds
+        relations[
+            :, CANDIDATE_TIME_RELATION, wafer_slice, module_slice
+        ] = candidate_process_times
+        relations[
+            :, CANDIDATE_TIME_RELATION, module_slice, wafer_slice
+        ] = candidate_process_times.transpose(1, 2)
 
         attention_bias = torch.einsum(
             "brij,rh->bhij",
@@ -515,6 +615,11 @@ class ClusterActorCritic(nn.Module):
         batch_size, wafer_count, wafer_dim = batch.wafer_features.shape
         if wafer_dim != WAFER_FEATURE_DIM:
             raise ValueError("wafer_features has an invalid feature dimension")
+        if batch.global_features.shape != (
+            batch_size,
+            GLOBAL_FEATURE_DIM,
+        ):
+            raise ValueError("global_features has an invalid shape")
         if batch.robot_features.shape != (
             batch_size,
             ROBOT_FEATURE_DIM,
@@ -532,6 +637,11 @@ class ClusterActorCritic(nn.Module):
 
         expected_shapes = {
             "candidate_modules": (batch_size, wafer_count, module_count),
+            "candidate_process_times": (
+                batch_size,
+                wafer_count,
+                module_count,
+            ),
             "wafer_locations": (batch_size, wafer_count, module_count),
             "robot_location": (batch_size, module_count),
             "robot_holds": (batch_size, wafer_count),

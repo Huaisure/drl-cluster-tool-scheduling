@@ -80,15 +80,17 @@ def test_collate_builds_relations_and_pads_action_sections() -> None:
         include_pm2=False
     )
     encoders = [
-        ClusterObservationEncoder.from_env(first_env),
-        ClusterObservationEncoder.from_env(second_env),
+        ClusterObservationEncoder.from_env(first_env, time_scale=10),
+        ClusterObservationEncoder.from_env(second_env, time_scale=10),
     ]
 
     batch = collate_observations(
         encoders, [first_observation, second_observation]
     )
 
-    assert batch.wafer_features.shape == (2, 2, 5)
+    assert batch.global_features.shape == (2, 6)
+    assert batch.robot_features.shape == (2, 4)
+    assert batch.wafer_features.shape == (2, 2, 8)
     assert batch.module_features.shape == (2, 3, 7)
     assert batch.wafer_valid.tolist() == [[True, True], [True, False]]
     assert batch.module_valid.tolist() == [
@@ -110,6 +112,9 @@ def test_collate_builds_relations_and_pads_action_sections() -> None:
     assert batch.candidate_modules[
         0, 0, first_modules["PM2"]
     ]
+    assert batch.candidate_process_times[
+        0, 0, first_modules["PM1"]
+    ] == 0.2
     assert not batch.candidate_modules[
         0, 0, first_modules["LP"]
     ]
@@ -224,10 +229,14 @@ def test_wafer_tokens_are_permutation_equivariant() -> None:
 
     permutation = torch.tensor([1, 0])
     permuted = type(batch)(
+        global_features=batch.global_features,
         robot_features=batch.robot_features,
         wafer_features=batch.wafer_features[:, permutation],
         module_features=batch.module_features,
         candidate_modules=batch.candidate_modules[:, permutation],
+        candidate_process_times=(
+            batch.candidate_process_times[:, permutation]
+        ),
         wafer_locations=batch.wafer_locations[:, permutation],
         robot_location=batch.robot_location,
         robot_holds=batch.robot_holds[:, permutation],

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import math
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from torch.distributions import Categorical
 from cluster_env import ClusterEnv
 from examples.run_scenarios import (
     SCENARIO_DIR,
+    first_legal_action,
     network_greedy_selector,
     rollout,
 )
@@ -26,13 +29,52 @@ from network import (
     TransformerConfig,
     collate_observations,
 )
-from problem import load_problem
+from problem import ClusterProblem, load_problem
+
+
+CHECKPOINT_VERSION = 2
+UPDATE_FIELDS = (
+    "update",
+    "global_step",
+    "completed_episodes",
+    "success_rate",
+    "mean_makespan",
+    "mean_normalized_return",
+    "policy_loss",
+    "value_loss",
+    "entropy",
+    "approx_kl",
+    "clip_fraction",
+    "choice_fraction",
+    "grad_norm",
+)
+EPISODE_FIELDS = (
+    "update",
+    "global_step",
+    "scenario",
+    "makespan",
+    "reference_makespan",
+    "normalized_cost",
+    "normalized_return",
+    "reward",
+    "success",
+)
+EVALUATION_FIELDS = (
+    "scenario",
+    "reference_makespan",
+    "makespan",
+    "normalized_cost",
+    "relative_gain",
+    "action_count",
+    "valid",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class PPOConfig:
     scenario_paths: tuple[Path, ...]
-    checkpoint: Path = Path("checkpoints/ppo_cluster.pt")
+    run_dir: Path = Path("runs/ppo_cluster")
+    checkpoint: Path = Path("runs/ppo_cluster/checkpoint.pt")
     resume: Path | None = None
     total_steps: int = 100_000
     rollout_steps: int = 128
@@ -45,7 +87,6 @@ class PPOConfig:
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
     max_grad_norm: float = 0.5
-    reward_scale: float = 0.01
     model_dim: int = 64
     num_heads: int = 4
     num_layers: int = 2
@@ -70,7 +111,7 @@ class PPOConfig:
                 raise ValueError(f"{name} must be positive")
         if not self.scenario_paths:
             raise ValueError("at least one scenario is required")
-        if not 0.0 < self.learning_rate:
+        if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be in [0, 1]")
@@ -78,8 +119,6 @@ class PPOConfig:
             raise ValueError("gae_lambda must be in [0, 1]")
         if not 0.0 < self.clip_coefficient < 1.0:
             raise ValueError("clip_coefficient must be in (0, 1)")
-        if self.reward_scale <= 0.0:
-            raise ValueError("reward_scale must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +135,8 @@ class RolloutBatch:
 class EpisodeStat:
     scenario: str
     makespan: float
+    reference_makespan: float
+    normalized_return: float
     reward: float
     success: bool
 
@@ -117,6 +158,22 @@ def _resolve_device(name: str) -> torch.device:
     if device.type == "mps" and not torch.backends.mps.is_available():
         raise ValueError("MPS was requested but is not available")
     return device
+
+
+def _reference_makespans(
+    problems: list[ClusterProblem],
+) -> list[float]:
+    references = []
+    for index, problem in enumerate(problems):
+        scenario = str(problem.meta.get("name", f"env_{index}"))
+        result = rollout(
+            ClusterEnv(problem),
+            scenario,
+            "reference_first_legal",
+            first_legal_action,
+        )
+        references.append(result.makespan)
+    return references
 
 
 def _stack_entity_batches(batches: list[EntityBatch]) -> EntityBatch:
@@ -152,7 +209,8 @@ def _advantages(
 
     for step in reversed(range(rewards.shape[0])):
         next_values = (
-            last_values if step == rewards.shape[0] - 1
+            last_values
+            if step == rewards.shape[0] - 1
             else values[step + 1]
         )
         next_non_terminal = ~dones[step]
@@ -169,10 +227,19 @@ def _advantages(
     return result
 
 
+def _normalized_reward(
+    reward: float,
+    reference_makespan: float,
+    success: bool,
+) -> float:
+    return reward / reference_makespan + float(success)
+
+
 def _collect_rollout(
     model: ClusterActorCritic,
     envs: list[ClusterEnv],
     encoders: list[ClusterObservationEncoder],
+    references: list[float],
     observations: list[dict[str, Any]],
     episode_rewards: list[float],
     config: PPOConfig,
@@ -200,26 +267,38 @@ def _collect_rollout(
 
         env_actions = states.to_env_actions(model_actions).cpu().tolist()
         next_observations = []
-        rewards = []
+        normalized_rewards = []
         dones = []
         for index, (env, action) in enumerate(zip(envs, env_actions)):
             observation, reward, terminated, truncated, info = env.step(
                 action
             )
             done = terminated or truncated
+            success = bool(info.get("is_success"))
             episode_rewards[index] += reward
-            rewards.append(reward * config.reward_scale)
+            normalized_reward = _normalized_reward(
+                reward,
+                references[index],
+                done and success,
+            )
+            normalized_rewards.append(normalized_reward)
             dones.append(done)
 
             if done:
+                normalized_return = (
+                    episode_rewards[index] / references[index]
+                    + float(success)
+                )
                 episode_stats.append(
                     EpisodeStat(
                         scenario=str(
                             env.problem.meta.get("name", f"env_{index}")
                         ),
                         makespan=float(info["time"]),
+                        reference_makespan=references[index],
+                        normalized_return=normalized_return,
                         reward=episode_rewards[index],
-                        success=bool(info.get("is_success")),
+                        success=success,
                     )
                 )
                 observation, _ = env.reset()
@@ -233,7 +312,11 @@ def _collect_rollout(
         )
         value_steps.append(output.value)
         reward_steps.append(
-            torch.tensor(rewards, dtype=torch.float32, device=device)
+            torch.tensor(
+                normalized_rewards,
+                dtype=torch.float32,
+                device=device,
+            )
         )
         done_steps.append(
             torch.tensor(dones, dtype=torch.bool, device=device)
@@ -294,6 +377,7 @@ def _ppo_update(
         "entropy": 0.0,
         "approx_kl": 0.0,
         "clip_fraction": 0.0,
+        "choice_fraction": 0.0,
         "grad_norm": 0.0,
     }
     minibatch_count = 0
@@ -308,9 +392,11 @@ def _ppo_update(
             minibatch_indexes = indexes[
                 start : start + config.minibatch_size
             ]
-            output = model(
-                _select_states(rollout_batch.states, minibatch_indexes)
+            states = _select_states(
+                rollout_batch.states,
+                minibatch_indexes,
             )
+            output = model(states)
             distribution = Categorical(logits=output.logits)
             new_log_probabilities = distribution.log_prob(
                 rollout_batch.actions[minibatch_indexes]
@@ -320,17 +406,32 @@ def _ppo_update(
                 - rollout_batch.old_log_probabilities[minibatch_indexes]
             )
             ratio = log_ratio.exp()
-            minibatch_advantages = advantages[minibatch_indexes]
+            has_choice = states.action_mask.sum(dim=1) > 1
+            choice_fraction = has_choice.float().mean()
 
-            unclipped_policy_loss = -minibatch_advantages * ratio
-            clipped_policy_loss = -minibatch_advantages * ratio.clamp(
-                1.0 - config.clip_coefficient,
-                1.0 + config.clip_coefficient,
-            )
-            policy_loss = torch.maximum(
-                unclipped_policy_loss,
-                clipped_policy_loss,
-            ).mean()
+            if has_choice.any():
+                minibatch_advantages = advantages[
+                    minibatch_indexes
+                ][has_choice]
+                choice_ratio = ratio[has_choice]
+                unclipped_policy_loss = (
+                    -minibatch_advantages * choice_ratio
+                )
+                clipped_policy_loss = (
+                    -minibatch_advantages
+                    * choice_ratio.clamp(
+                        1.0 - config.clip_coefficient,
+                        1.0 + config.clip_coefficient,
+                    )
+                )
+                policy_loss = torch.maximum(
+                    unclipped_policy_loss,
+                    clipped_policy_loss,
+                ).mean()
+                entropy = distribution.entropy()[has_choice].mean()
+            else:
+                policy_loss = output.value.sum() * 0.0
+                entropy = output.value.sum() * 0.0
 
             old_values = rollout_batch.old_values[minibatch_indexes]
             returns = rollout_batch.returns[minibatch_indexes]
@@ -344,7 +445,6 @@ def _ppo_update(
                 (output.value - returns).square(),
                 (clipped_values - returns).square(),
             ).mean()
-            entropy = distribution.entropy().mean()
             loss = (
                 policy_loss
                 + config.value_coefficient * value_loss
@@ -360,16 +460,26 @@ def _ppo_update(
             optimizer.step()
 
             with torch.no_grad():
-                approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                clip_fraction = (
-                    (ratio - 1.0).abs() > config.clip_coefficient
-                ).float().mean()
+                if has_choice.any():
+                    choice_log_ratio = log_ratio[has_choice]
+                    choice_ratio = ratio[has_choice]
+                    approx_kl = (
+                        (choice_ratio - 1.0) - choice_log_ratio
+                    ).mean()
+                    clip_fraction = (
+                        (choice_ratio - 1.0).abs()
+                        > config.clip_coefficient
+                    ).float().mean()
+                else:
+                    approx_kl = torch.zeros((), device=ratio.device)
+                    clip_fraction = torch.zeros((), device=ratio.device)
             metrics = {
                 "policy_loss": policy_loss,
                 "value_loss": value_loss,
                 "entropy": entropy,
                 "approx_kl": approx_kl,
                 "clip_fraction": clip_fraction,
+                "choice_fraction": choice_fraction,
                 "grad_norm": grad_norm,
             }
             for name, value in metrics.items():
@@ -382,34 +492,22 @@ def _ppo_update(
     }
 
 
-def _checkpoint_payload(
-    model: ClusterActorCritic,
-    optimizer: torch.optim.Optimizer,
-    config: PPOConfig,
-    global_step: int,
-    update: int,
-) -> dict[str, object]:
-    serialized_config = asdict(config)
-    serialized_config["scenario_paths"] = [
+def _serialize_config(config: PPOConfig) -> dict[str, object]:
+    serialized = asdict(config)
+    serialized["scenario_paths"] = [
         str(path) for path in config.scenario_paths
     ]
-    serialized_config["checkpoint"] = str(config.checkpoint)
-    serialized_config["resume"] = (
-        None if config.resume is None else str(config.resume)
-    )
-    return {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "config": serialized_config,
-        "global_step": global_step,
-        "update": update,
-    }
+    for name in ("run_dir", "checkpoint", "resume"):
+        value = getattr(config, name)
+        serialized[name] = None if value is None else str(value)
+    return serialized
 
 
 def _save_checkpoint(
     model: ClusterActorCritic,
     optimizer: torch.optim.Optimizer,
     config: PPOConfig,
+    references: list[float],
     global_step: int,
     update: int,
 ) -> None:
@@ -418,44 +516,328 @@ def _save_checkpoint(
         config.checkpoint.suffix + ".tmp"
     )
     torch.save(
-        _checkpoint_payload(
-            model,
-            optimizer,
-            config,
-            global_step,
-            update,
-        ),
+        {
+            "version": CHECKPOINT_VERSION,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": _serialize_config(config),
+            "reference_makespans": references,
+            "global_step": global_step,
+            "update": update,
+        },
         temporary_path,
     )
     temporary_path.replace(config.checkpoint)
 
 
+def _append_csv(
+    path: Path,
+    fieldnames: Sequence[str],
+    row: dict[str, object],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _rolling_mean(values: list[float], window: int = 10) -> np.ndarray:
+    result = []
+    for index in range(len(values)):
+        start = max(0, index - window + 1)
+        result.append(sum(values[start : index + 1]) / (index - start + 1))
+    return np.asarray(result)
+
+
+def _plot_training_curves(run_dir: Path) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    update_rows = _read_csv(run_dir / "updates.csv")
+    episode_rows = _read_csv(run_dir / "episodes.csv")
+    if not update_rows:
+        raise RuntimeError("cannot plot training curves without update data")
+
+    steps = np.asarray(
+        [int(row["global_step"]) for row in update_rows]
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    colors = plt.get_cmap("tab10")
+
+    grouped_episodes: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in episode_rows:
+        grouped_episodes[row["scenario"]].append(row)
+    for index, (scenario, rows) in enumerate(
+        sorted(grouped_episodes.items())
+    ):
+        color = colors(index)
+        episode_steps = [
+            int(row["global_step"]) for row in rows
+        ]
+        makespans = [float(row["makespan"]) for row in rows]
+        normalized_returns = [
+            float(row["normalized_return"]) for row in rows
+        ]
+        axes[0, 0].plot(
+            episode_steps,
+            _rolling_mean(makespans),
+            label=scenario,
+            color=color,
+            marker=".",
+        )
+        axes[0, 1].plot(
+            episode_steps,
+            _rolling_mean(normalized_returns),
+            label=scenario,
+            color=color,
+            marker=".",
+        )
+
+    axes[0, 0].set_title("Episode makespan (rolling mean)")
+    axes[0, 0].set_ylabel("Makespan")
+    axes[0, 1].set_title("Normalized return (rolling mean)")
+    axes[0, 1].axhline(0.0, color="0.5", linewidth=1)
+    axes[0, 1].set_ylabel("1 - makespan / reference")
+    if grouped_episodes:
+        axes[0, 0].legend(fontsize=8)
+        axes[0, 1].legend(fontsize=8)
+
+    axes[1, 0].plot(
+        steps,
+        [float(row["value_loss"]) for row in update_rows],
+        label="value loss",
+        marker=".",
+    )
+    axes[1, 0].plot(
+        steps,
+        [abs(float(row["policy_loss"])) for row in update_rows],
+        label="|policy loss|",
+        marker=".",
+    )
+    axes[1, 0].set_title("PPO losses")
+    axes[1, 0].set_yscale("symlog", linthresh=1e-5)
+    axes[1, 0].legend(fontsize=8)
+
+    entropy_line = axes[1, 1].plot(
+        steps,
+        [float(row["entropy"]) for row in update_rows],
+        label="entropy",
+        marker=".",
+    )[0]
+    kl_axis = axes[1, 1].twinx()
+    kl_line = kl_axis.plot(
+        steps,
+        [
+            max(float(row["approx_kl"]), 1e-12)
+            for row in update_rows
+        ],
+        label="approx KL",
+        marker=".",
+        color="tab:orange",
+    )[0]
+    axes[1, 1].set_title("Policy diagnostics")
+    axes[1, 1].set_ylabel("Entropy")
+    kl_axis.set_ylabel("Approx KL")
+    kl_axis.set_yscale("log")
+    axes[1, 1].legend(
+        [entropy_line, kl_line],
+        ["entropy", "approx KL"],
+        fontsize=8,
+    )
+
+    for axis in axes.flat:
+        axis.set_xlabel("Environment steps")
+        axis.grid(alpha=0.25)
+    fig.tight_layout()
+    curve_path = run_dir / "training_curves.png"
+    fig.savefig(curve_path, dpi=160)
+    plt.close(fig)
+    return curve_path
+
+
+def _episode_rows(
+    stats: list[EpisodeStat],
+    update: int,
+    global_step: int,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "update": update,
+            "global_step": global_step,
+            "scenario": stat.scenario,
+            "makespan": stat.makespan,
+            "reference_makespan": stat.reference_makespan,
+            "normalized_cost": stat.makespan / stat.reference_makespan,
+            "normalized_return": stat.normalized_return,
+            "reward": stat.reward,
+            "success": stat.success,
+        }
+        for stat in stats
+    ]
+
+
+def _update_row(
+    metrics: dict[str, float],
+    stats: list[EpisodeStat],
+    update: int,
+    global_step: int,
+) -> dict[str, object]:
+    completed = len(stats)
+    return {
+        "update": update,
+        "global_step": global_step,
+        "completed_episodes": completed,
+        "success_rate": (
+            sum(stat.success for stat in stats) / completed
+            if completed
+            else ""
+        ),
+        "mean_makespan": (
+            sum(stat.makespan for stat in stats) / completed
+            if completed
+            else ""
+        ),
+        "mean_normalized_return": (
+            sum(stat.normalized_return for stat in stats) / completed
+            if completed
+            else ""
+        ),
+        **metrics,
+    }
+
+
+def _print_update(
+    row: dict[str, object],
+    stats: list[EpisodeStat],
+    last_update: int,
+) -> None:
+    success = row["success_rate"]
+    success_text = (
+        f"{100 * float(success):5.1f}%" if success != "" else "  n/a "
+    )
+    scenario_values: dict[str, list[float]] = defaultdict(list)
+    for stat in stats:
+        scenario_values[stat.scenario].append(stat.makespan)
+    scenario_text = ", ".join(
+        f"{name}={sum(values) / len(values):.1f}"
+        for name, values in sorted(scenario_values.items())
+    )
+    if not scenario_text:
+        scenario_text = "no completed episode"
+    normalized_return = row["mean_normalized_return"]
+    normalized_text = (
+        f"{float(normalized_return):+.4f}"
+        if normalized_return != ""
+        else "n/a"
+    )
+
+    print(
+        f"[Update {int(row['update']):4d}/{last_update}] "
+        f"steps={int(row['global_step']):7d}  "
+        f"episodes={int(row['completed_episodes']):2d}  "
+        f"success={success_text}"
+    )
+    print(
+        f"  schedule: {scenario_text}  |  "
+        f"normalized_return={normalized_text}"
+    )
+    print(
+        f"  PPO: policy={float(row['policy_loss']):+.5f}  "
+        f"value={float(row['value_loss']):.5f}  "
+        f"entropy={float(row['entropy']):.4f}  "
+        f"KL={float(row['approx_kl']):.2e}  "
+        f"choice={100 * float(row['choice_fraction']):.1f}%"
+    )
+
+
 def _evaluation(
     model: ClusterActorCritic,
     envs: list[ClusterEnv],
+    references: list[float],
 ) -> list[dict[str, object]]:
     model.eval()
     results = []
-    for env in envs:
+    for env, reference in zip(envs, references):
         scenario = str(env.problem.meta.get("name", "scenario"))
         result = rollout(
             env,
             scenario,
             "trained_network_greedy",
-            network_greedy_selector(env, model),
+            network_greedy_selector(env, model, reference),
         )
-        results.append(asdict(result))
+        results.append(
+            {
+                "scenario": scenario,
+                "reference_makespan": reference,
+                "makespan": result.makespan,
+                "normalized_cost": result.makespan / reference,
+                "relative_gain": 1.0 - result.makespan / reference,
+                "action_count": result.action_count,
+                "valid": result.valid,
+            }
+        )
     return results
+
+
+def _print_evaluation(results: list[dict[str, object]]) -> None:
+    if not results:
+        return
+    print("\nFinal greedy evaluation")
+    print("-" * 78)
+    print(
+        f"{'Scenario':<24} {'Reference':>10} {'Model':>10} "
+        f"{'Gain':>10} {'Valid':>8}"
+    )
+    print("-" * 78)
+    for result in results:
+        print(
+            f"{str(result['scenario']):<24} "
+            f"{float(result['reference_makespan']):>10.1f} "
+            f"{float(result['makespan']):>10.1f} "
+            f"{100 * float(result['relative_gain']):>9.2f}% "
+            f"{str(result['valid']):>8}"
+        )
+    print("-" * 78)
+
+
+def _prepare_run_dir(config: PPOConfig) -> None:
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    if config.resume is None:
+        for filename in (
+            "updates.csv",
+            "episodes.csv",
+            "evaluation.csv",
+            "training_curves.png",
+        ):
+            path = config.run_dir / filename
+            if path.exists():
+                path.unlink()
 
 
 def train(config: PPOConfig) -> dict[str, object]:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = _resolve_device(config.device)
+    _prepare_run_dir(config)
+
     problems = [load_problem(path) for path in config.scenario_paths]
+    references = _reference_makespans(problems)
     envs = [ClusterEnv(problem) for problem in problems]
     encoders = [
-        ClusterObservationEncoder.from_env(env) for env in envs
+        ClusterObservationEncoder.from_env(env, reference)
+        for env, reference in zip(envs, references)
     ]
     observations = [
         env.reset(seed=config.seed + index)[0]
@@ -485,6 +867,16 @@ def train(config: PPOConfig) -> dict[str, object]:
             map_location=device,
             weights_only=True,
         )
+        if checkpoint.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(
+                "checkpoint uses an older network/reward format; "
+                "start a new training run"
+            )
+        saved_references = checkpoint.get("reference_makespans")
+        if saved_references != references:
+            raise ValueError(
+                "checkpoint reference makespans do not match the scenarios"
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         global_step = int(checkpoint["global_step"])
@@ -495,11 +887,26 @@ def train(config: PPOConfig) -> dict[str, object]:
     update_count = math.ceil(remaining_steps / steps_per_update)
     last_update = first_update + update_count - 1
 
+    print("=" * 78)
+    print("Masked PPO training")
+    print(
+        f"device={device}  scenarios={len(envs)}  "
+        f"target_steps={config.total_steps}  run_dir={config.run_dir}"
+    )
+    print("Reference makespans:")
+    for problem, reference in zip(problems, references):
+        print(
+            f"  - {problem.meta.get('name', 'scenario')}: "
+            f"{reference:.1f}"
+        )
+    print("=" * 78)
+
     for update in range(first_update, last_update + 1):
         rollout_batch, observations, episode_stats = _collect_rollout(
             model,
             envs,
             encoders,
+            references,
             observations,
             episode_rewards,
             config,
@@ -512,25 +919,30 @@ def train(config: PPOConfig) -> dict[str, object]:
             config,
         )
         global_step += steps_per_update
+        update_row = _update_row(
+            metrics,
+            episode_stats,
+            update,
+            global_step,
+        )
+        _append_csv(
+            config.run_dir / "updates.csv",
+            UPDATE_FIELDS,
+            update_row,
+        )
+        for episode_row in _episode_rows(
+            episode_stats,
+            update,
+            global_step,
+        ):
+            _append_csv(
+                config.run_dir / "episodes.csv",
+                EPISODE_FIELDS,
+                episode_row,
+            )
 
         if update % config.log_interval == 0 or update == last_update:
-            completed = len(episode_stats)
-            metrics.update(
-                update=update,
-                global_step=global_step,
-                completed_episodes=completed,
-                success_rate=(
-                    sum(stat.success for stat in episode_stats) / completed
-                    if completed
-                    else None
-                ),
-                mean_makespan=(
-                    sum(stat.makespan for stat in episode_stats) / completed
-                    if completed
-                    else None
-                ),
-            )
-            print(json.dumps(metrics, sort_keys=True))
+            _print_update(update_row, episode_stats, last_update)
 
         if (
             update % config.checkpoint_interval == 0
@@ -540,28 +952,52 @@ def train(config: PPOConfig) -> dict[str, object]:
                 model,
                 optimizer,
                 config,
+                references,
                 global_step,
                 update,
             )
+            _plot_training_curves(config.run_dir)
 
     if update_count == 0:
         _save_checkpoint(
             model,
             optimizer,
             config,
+            references,
             global_step,
             first_update - 1,
         )
+        if _read_csv(config.run_dir / "updates.csv"):
+            _plot_training_curves(config.run_dir)
 
-    evaluation = _evaluation(model, envs) if config.evaluate else []
+    evaluation = (
+        _evaluation(model, envs, references)
+        if config.evaluate
+        else []
+    )
     for result in evaluation:
-        print(json.dumps({"evaluation": result}, sort_keys=True))
+        _append_csv(
+            config.run_dir / "evaluation.csv",
+            EVALUATION_FIELDS,
+            result,
+        )
+    _print_evaluation(evaluation)
+
+    curve_path = config.run_dir / "training_curves.png"
+    print("\nSaved outputs")
+    print(f"  checkpoint : {config.checkpoint}")
+    print(f"  updates    : {config.run_dir / 'updates.csv'}")
+    print(f"  episodes   : {config.run_dir / 'episodes.csv'}")
+    print(f"  curves     : {curve_path}")
 
     return {
         "checkpoint": str(config.checkpoint),
+        "run_dir": str(config.run_dir),
+        "curves": str(curve_path),
         "device": str(device),
         "global_step": global_step,
         "updates": update_count,
+        "reference_makespans": references,
         "evaluation": evaluation,
     }
 
@@ -576,11 +1012,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=_default_scenarios(),
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("checkpoints/ppo_cluster.pt"),
-    )
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--total-steps", type=int, default=100_000)
     parser.add_argument("--rollout-steps", type=int, default=128)
@@ -593,7 +1026,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-coefficient", type=float, default=0.5)
     parser.add_argument("--entropy-coefficient", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--reward-scale", type=float, default=0.01)
     parser.add_argument("--model-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -612,9 +1044,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.run_dir is not None:
+        run_dir = args.run_dir
+    elif args.resume is not None:
+        run_dir = args.resume.parent
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = Path("runs") / f"ppo_cluster_{timestamp}"
+    checkpoint = args.checkpoint or run_dir / "checkpoint.pt"
+
     config = PPOConfig(
         scenario_paths=tuple(args.scenarios),
-        checkpoint=args.checkpoint,
+        run_dir=run_dir,
+        checkpoint=checkpoint,
         resume=args.resume,
         total_steps=args.total_steps,
         rollout_steps=args.rollout_steps,
@@ -627,7 +1069,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         value_coefficient=args.value_coefficient,
         entropy_coefficient=args.entropy_coefficient,
         max_grad_norm=args.max_grad_norm,
-        reward_scale=args.reward_scale,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -638,8 +1079,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_interval=args.checkpoint_interval,
         evaluate=not args.no_eval,
     )
-    summary = train(config)
-    print(json.dumps({"training": summary}, sort_keys=True))
+    train(config)
     return 0
 
 
