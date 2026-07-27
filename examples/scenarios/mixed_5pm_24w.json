@@ -1,0 +1,65 @@
+{
+  "_meta": {
+    "name": "mixed_5pm_24w",
+    "description": "24 wafers from three routes share entry, parallel-process and exit PMs"
+  },
+  "Modules": {
+    "LP": {"type": "LP"},
+    "PM1": {"type": "PM"},
+    "PM2": {"type": "PM"},
+    "PM3": {"type": "PM"},
+    "PM4": {"type": "PM"},
+    "PM5": {"type": "PM"}
+  },
+  "ClusterTool": {
+    "TM1": {
+      "module_ids": ["LP", "PM1", "PM2", "PM3", "PM4", "PM5"],
+      "arm_type": "single_arm",
+      "travel_times": 1,
+      "pick_time": 1,
+      "place_time": 1
+    }
+  },
+  "routes": {
+    "A": [
+      {"module_id": "PM1", "process_time": 4},
+      {"module_ids": ["PM3", "PM4"], "process_time": 6},
+      {"module_id": "PM5", "process_time": 5}
+    ],
+    "B": [
+      {"module_id": "PM2", "process_time": 7},
+      {"module_ids": ["PM3", "PM4"], "process_time": 3},
+      {"module_id": "PM5", "process_time": 8}
+    ],
+    "C": [
+      {"module_ids": ["PM1", "PM2"], "process_time": 5},
+      {"module_id": "PM4", "process_time": 4},
+      {"module_id": "PM5", "process_time": 6}
+    ]
+  },
+  "initial_state": {
+    "robots": {
+      "TM1": {"position_module_id": "LP"}
+    },
+    "wafers": [
+      {
+        "route_id": "A",
+        "wafer_index": "0-7",
+        "step_index": 0,
+        "location": {"kind": "module", "module_id": "LP"}
+      },
+      {
+        "route_id": "B",
+        "wafer_index": "0-7",
+        "step_index": 0,
+        "location": {"kind": "module", "module_id": "LP"}
+      },
+      {
+        "route_id": "C",
+        "wafer_index": "0-7",
+        "step_index": 0,
+        "location": {"kind": "module", "module_id": "LP"}
+      }
+    ]
+  }
+}

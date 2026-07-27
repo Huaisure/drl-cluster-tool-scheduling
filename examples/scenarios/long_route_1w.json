@@ -1,17 +1,18 @@
 {
   "_meta": {
-    "name": "serial_3pm_10w",
-    "description": "10 wafers of route A pass through PM1, PM2 and PM3 in series"
+    "name": "long_route_1w",
+    "description": "One wafer follows an eight-step route with repeated PM visits"
   },
   "Modules": {
     "LP": {"type": "LP"},
     "PM1": {"type": "PM"},
     "PM2": {"type": "PM"},
-    "PM3": {"type": "PM"}
+    "PM3": {"type": "PM"},
+    "PM4": {"type": "PM"}
   },
   "ClusterTool": {
     "TM1": {
-      "module_ids": ["LP", "PM1", "PM2", "PM3"],
+      "module_ids": ["LP", "PM1", "PM2", "PM3", "PM4"],
       "arm_type": "single_arm",
       "travel_times": 1,
       "pick_time": 1,
@@ -21,8 +22,13 @@
   "routes": {
     "A": [
       {"module_id": "PM1", "process_time": 4},
-      {"module_id": "PM2", "process_time": 6},
-      {"module_id": "PM3", "process_time": 5}
+      {"module_id": "PM2", "process_time": 3},
+      {"module_id": "PM3", "process_time": 7},
+      {"module_id": "PM2", "process_time": 2},
+      {"module_id": "PM4", "process_time": 6},
+      {"module_id": "PM1", "process_time": 5},
+      {"module_id": "PM3", "process_time": 4},
+      {"module_id": "PM4", "process_time": 3}
     ]
   },
   "initial_state": {
@@ -32,7 +38,7 @@
     "wafers": [
       {
         "route_id": "A",
-        "wafer_index": "0-9",
+        "wafer_index": "0",
         "step_index": 0,
         "location": {"kind": "module", "module_id": "LP"}
       }
