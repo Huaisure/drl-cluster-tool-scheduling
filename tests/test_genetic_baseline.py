@@ -7,7 +7,7 @@ import pytest
 
 from baseline import solve
 from baseline.genetic import main
-from cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ClusterEnv
 from problem import load_problem
 from validator import ValidatorSuite
 

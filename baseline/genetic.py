@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ClusterEnv
 from problem import ClusterProblem, load_problem
 
 

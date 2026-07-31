@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from cluster_env import ClusterEnv
-from network import (
+from cluster_rl.cluster_env import ClusterEnv
+from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
     TransformerConfig,

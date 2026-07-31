@@ -15,14 +15,14 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
-from cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ClusterEnv
 from examples.run_scenarios import (
     SCENARIO_DIR,
     first_legal_action,
     network_greedy_selector,
     rollout,
 )
-from network import (
+from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
     EntityBatch,

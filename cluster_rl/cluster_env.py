@@ -22,6 +22,7 @@ from validator import PICK, PLACE
 class _WaferState:
     step_index: int
     module_id: str | None
+    robot_id: str | None
     ready_at: float
 
 
@@ -39,50 +40,39 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self.problem = problem
         self._validate_problem()
 
-        self._robot_id, robot = next(iter(problem.ClusterTool.items()))
-        self._lp_id = next(
-            module_id
-            for module_id, module in problem.Modules.items()
-            if module.type is ModuleType.LP
-        )
+        self._robot_ids = tuple(sorted(problem.ClusterTool))
+        self._lp_id = next(module_id for module_id, module in problem.Modules.items() if module.type is ModuleType.LP)
         snapshot = problem.initial_state.to_snapshot()
         self._wafer_keys = tuple(sorted(snapshot.wafers_by_key))
         self._module_ids = tuple(sorted(problem.Modules))
-        self._module_index = {
-            module_id: index for index, module_id in enumerate(self._module_ids)
-        }
+        self._module_index = {module_id: index for index, module_id in enumerate(self._module_ids)}
+        self._robot_index = {robot_id: index for index, robot_id in enumerate(self._robot_ids)}
 
         wafer_count = len(self._wafer_keys)
         module_count = len(self._module_ids)
-        self.action_space = spaces.Discrete(wafer_count + module_count)
+        robot_count = len(self._robot_ids)
+
+        self.action_space = spaces.Discrete([wafer_count + module_count])
         self.observation_space = spaces.Dict(
             {
-                "wafer_module": spaces.MultiDiscrete(
-                    np.full(wafer_count, module_count + 1, dtype=np.int64)
-                ),
+                "wafer_loc": spaces.MultiDiscrete(np.full(wafer_count, module_count + robot_count)),
                 "wafer_step": spaces.MultiDiscrete(
                     np.asarray(
-                        [
-                            len(problem.routes[route_id].visits) + 2
-                            for route_id, _ in self._wafer_keys
-                        ],
-                        dtype=np.int64,
+                        [len(problem.routes[route_id].visits) for route_id, _ in self._wafer_keys],
                     )
                 ),
                 "process_remaining": spaces.Box(
                     low=0.0,
-                    high=np.inf,
+                    high=float("+inf"),
                     shape=(wafer_count,),
                     dtype=np.float32,
                 ),
-                "robot_module": spaces.Discrete(module_count + 1),
-                "action_mask": spaces.MultiBinary(wafer_count + module_count),
+                "robot_loc": spaces.Discrete(module_count + 1),
             }
         )
 
-        self._failure_cost = self._failure_bound(robot.travel_times)
         self._time = 0.0
-        self._robot_module: str | None = None
+        self._robot_loc: list[str] = []
         self._wafers: list[_WaferState] = []
         self._actions: list[dict[str, object]] = []
 
@@ -107,15 +97,17 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         super().reset(seed=seed)
         snapshot = self.problem.initial_state.to_snapshot()
         self._time = 0.0
-        self._robot_module = snapshot.tm_positions.get(self._robot_id)
+        self._robot_module = [snapshot.tm_positions.get(robot_id) for robot_id in self._robot_ids]
         self._wafers = [
             _WaferState(
                 step_index=snapshot.wafers_by_key[key].step_index,
                 module_id=snapshot.wafers_by_key[key].location.module_id,
+                robot_id=snapshot.wafers_by_key[key].location.robot_id,
                 ready_at=0.0,
             )
             for key in self._wafer_keys
         ]
+
         self._actions = []
         return self._observation(), {"time": self._time}
 
@@ -144,9 +136,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
         deadlocked = self._advance_to_decision()
         completed = self._complete()
-        reward = previous_time - (
-            self._failure_cost if deadlocked else self._time
-        )
+        reward = previous_time - (self._failure_cost if deadlocked else self._time)
         info: dict[str, Any] = {"time": self._time}
         if completed or deadlocked:
             info.update(
@@ -165,92 +155,37 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         if robot.arm_type is not TMArmType.SINGLE_ARM:
             raise ValueError("ClusterEnv requires a single-arm TM")
 
-        lp_ids = [
-            module_id
-            for module_id, module in self.problem.Modules.items()
-            if module.type is ModuleType.LP
-        ]
+        lp_ids = [module_id for module_id, module in self.problem.Modules.items() if module.type is ModuleType.LP]
         if len(lp_ids) != 1:
             raise ValueError("ClusterEnv requires exactly one LP")
-        if any(
-            module.type not in {ModuleType.LP, ModuleType.PM}
-            for module in self.problem.Modules.values()
-        ):
+        if any(module.type not in {ModuleType.LP, ModuleType.PM} for module in self.problem.Modules.values()):
             raise ValueError("ClusterEnv supports only LP and PM modules")
 
         unreachable = set(self.problem.Modules) - set(robot.module_ids)
         if unreachable:
-            raise ValueError(
-                f"TM {robot_id} cannot reach modules: {sorted(unreachable)}"
-            )
+            raise ValueError(f"TM {robot_id} cannot reach modules: {sorted(unreachable)}")
         for route_id, route in self.problem.routes.items():
             for visit in route.visits:
-                if any(
-                    self.problem.Modules[module_id].type is not ModuleType.PM
-                    for module_id in visit.module_ids
-                ):
-                    raise ValueError(
-                        f"Route {route_id} must contain only PM visits"
-                    )
+                if any(self.problem.Modules[module_id].type is not ModuleType.PM for module_id in visit.module_ids):
+                    raise ValueError(f"Route {route_id} must contain only PM visits")
 
         snapshot = self.problem.initial_state.to_snapshot()
         if not snapshot.wafers_by_key:
             raise ValueError("ClusterEnv requires at least one wafer")
         lp_id = lp_ids[0]
         for wafer in snapshot.wafers_by_key.values():
-            if (
-                not isinstance(wafer.location, ModuleLocation)
-                or wafer.location.module_id != lp_id
-                or wafer.step_index != 0
-                or (wafer.process_end_time or 0) > 0
-            ):
-                raise ValueError(
-                    "Every wafer must start ready in the LP at step_index 0"
-                )
-
-    def _failure_bound(self, travel_time: float) -> float:
-        robot = self.problem.ClusterTool[self._robot_id]
-        total = 0.0
-        durations = [1.0, robot.pick_time, robot.place_time, travel_time]
-        for route_id, _ in self._wafer_keys:
-            visits = self.problem.routes[route_id].visits
-            total += (len(visits) + 1) * (
-                robot.pick_time + robot.place_time + 2 * travel_time
-            )
-            for visit in visits:
-                duration = visit.process_time or 0.0
-                total += duration
-                durations.append(duration)
-        return total + max(durations)
+            if not isinstance(wafer.location, ModuleLocation) or wafer.location.module_id != lp_id or wafer.step_index != 0 or (wafer.process_end_time or 0) > 0:
+                raise ValueError("Every wafer must start ready in the LP at step_index 0")
 
     def _observation(self) -> dict[str, Any]:
-        robot_index = len(self._module_ids)
         return {
-            "wafer_module": np.asarray(
-                [
-                    robot_index
-                    if wafer.module_id is None
-                    else self._module_index[wafer.module_id]
-                    for wafer in self._wafers
-                ],
+            "wafer_loc": np.asarray(
+                [self._robot_index[wafer.robot_id] if wafer.module_id is None else self._module_index[wafer.module_id] for wafer in self._wafers],
                 dtype=np.int64,
             ),
-            "wafer_step": np.asarray(
-                [wafer.step_index for wafer in self._wafers],
-                dtype=np.int64,
-            ),
-            "process_remaining": np.asarray(
-                [
-                    max(0.0, wafer.ready_at - self._time)
-                    for wafer in self._wafers
-                ],
-                dtype=np.float32,
-            ),
-            "robot_module": np.int64(
-                robot_index
-                if self._robot_module is None
-                else self._module_index[self._robot_module]
-            ),
+            "wafer_step": np.asarray([wafer.step_index for wafer in self._wafers], dtype=np.int64),
+            "process_remaining": np.asarray([max(0.0, wafer.ready_at - self._time) for wafer in self._wafers], dtype=np.float32),
+            "robot_loc": np.asarray([self._module_index[_m] if _m is not None else len(self._module_ids) for _m in self._robot_module], dtype=np.int64),
             "action_mask": self._action_mask(),
         }
 
@@ -262,14 +197,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
         if held_index is None:
             for index, wafer in enumerate(self._wafers):
-                if (
-                    wafer.module_id is not None
-                    and wafer.ready_at <= self._time
-                    and any(
-                        self._has_capacity(module_id, excluding=index)
-                        for module_id in self._targets(index)
-                    )
-                ):
+                if wafer.module_id is not None and wafer.ready_at <= self._time and any(self._has_capacity(module_id, excluding=index) for module_id in self._targets(index)):
                     mask[index] = 1
             return mask
 
@@ -294,19 +222,12 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         module_id: str,
         excluding: int | None = None,
     ) -> bool:
-        occupants = sum(
-            index != excluding and wafer.module_id == module_id
-            for index, wafer in enumerate(self._wafers)
-        )
+        occupants = sum(index != excluding and wafer.module_id == module_id for index, wafer in enumerate(self._wafers))
         return occupants < self.problem.Modules[module_id].capacity
 
     def _held_index(self) -> int | None:
         return next(
-            (
-                index
-                for index, wafer in enumerate(self._wafers)
-                if wafer.module_id is None
-            ),
+            (index for index, wafer in enumerate(self._wafers) if wafer.module_id is None),
             None,
         )
 
@@ -334,11 +255,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self._record(PLACE, wafer_index, module_id, next_step, start, end)
 
         route = self.problem.routes[self._wafer_keys[wafer_index][0]]
-        process_time = (
-            route.visits[next_step - 1].process_time or 0.0
-            if next_step <= len(route.visits)
-            else 0.0
-        )
+        process_time = route.visits[next_step - 1].process_time or 0.0 if next_step <= len(route.visits) else 0.0
         wafer.step_index = next_step
         wafer.module_id = module_id
         wafer.ready_at = end + process_time
@@ -377,22 +294,5 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             }
         )
 
-    def _advance_to_decision(self) -> bool:
-        while not self._complete() and not self._action_mask().any():
-            ready_times = [
-                wafer.ready_at
-                for wafer in self._wafers
-                if wafer.module_id is not None and wafer.ready_at > self._time
-            ]
-            if not ready_times:
-                return True
-            self._time = min(ready_times)
-        return False
-
     def _complete(self) -> bool:
-        return all(
-            wafer.module_id == self._lp_id
-            and wafer.step_index
-            == len(self.problem.routes[key[0]].visits) + 1
-            for key, wafer in zip(self._wafer_keys, self._wafers)
-        )
+        return all(wafer.module_id == self._lp_id and wafer.step_index == len(self.problem.routes[key[0]].visits) + 1 for key, wafer in zip(self._wafer_keys, self._wafers))

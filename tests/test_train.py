@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from examples.run_scenarios import SCENARIO_DIR
-from train import PPOConfig, _advantages, _normalized_reward, train
+from cluster_rl.train import PPOConfig, _advantages, _normalized_reward, train
 
 
 def test_advantages_stop_bootstrapping_at_episode_end() -> None:

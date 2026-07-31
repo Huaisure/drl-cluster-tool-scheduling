@@ -5,7 +5,7 @@ from collections import Counter
 import numpy as np
 import pytest
 
-from cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ClusterEnv
 from problem import parse_problem
 from validator import ValidatorSuite
 

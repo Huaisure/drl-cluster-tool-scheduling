@@ -4,8 +4,8 @@ from collections import Counter
 
 import torch
 
-from cluster_env import ClusterEnv
-from network import (
+from cluster_rl.cluster_env import ClusterEnv
+from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
     TransformerConfig,
