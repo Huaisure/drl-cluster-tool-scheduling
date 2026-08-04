@@ -1,0 +1,2 @@
+update,global_step,completed_episodes,success_rate,mean_makespan,mean_normalized_return,policy_loss,value_loss,entropy,approx_kl,clip_fraction,choice_fraction,grad_norm
+1,1800,12,1.0,89.75,-0.02141382868937049,0.16445378214120865,0.01170746108982712,0.775757372379303,7.775842020030233e-05,0.0,0.154296875,0.10119064105674624

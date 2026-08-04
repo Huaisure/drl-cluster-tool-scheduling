@@ -54,6 +54,8 @@ operation 的相对剩余时间。不同类型的时间共用同一个尺度，�
 - `robot -located_at-> module` / `module -has_robot-> robot`。
 - `robot -operates_on-> wafer` / `wafer -operation_of-> robot`；
 - `robot -operation_at-> module` / `module -has_operation-> robot`。
+- `wafer -returns_to-> module` / `module -return_destination_of-> wafer`：
+  每片Wafer完成工艺后规定返回的LP，多LP场景下保持Wafer级别的目标身份。
 
 `held_by/holds` 根据 `robot_holding` 构建，因此在 Pick 执行期间，wafer
 可以同时连接源 module 和持有它的 robot，准确表达 `[Pick.start, Pick.end)`。

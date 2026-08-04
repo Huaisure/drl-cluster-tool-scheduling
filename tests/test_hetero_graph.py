@@ -291,6 +291,61 @@ def test_is_ready_requires_processing_complete_and_fifo_head() -> None:
     assert graph.nodes["wafer"].features[next_head, is_ready_index] == 1.0
 
 
+def test_multi_lp_graph_keeps_return_identity_and_independent_heads() -> None:
+    problem = parse_problem(
+        {
+            "Modules": {
+                "LP1": {"type": "LP"},
+                "LP2": {"type": "LP"},
+                "PM1": {"type": "PM"},
+            },
+            "ClusterTool": {
+                "TM1": {
+                    "module_ids": ["LP1", "LP2", "PM1"],
+                    "arm_type": "single_arm",
+                    "travel_times": 1,
+                    "pick_time": 1,
+                    "place_time": 1,
+                }
+            },
+            "routes": {"A": [{"module_id": "PM1", "process_time": 1}]},
+            "initial_state": {
+                "wafers": [
+                    {
+                        "route_id": "A",
+                        "wafer_index": "0",
+                        "location": {"kind": "module", "module_id": "LP1"},
+                    },
+                    {
+                        "route_id": "A",
+                        "wafer_index": "1",
+                        "location": {"kind": "module", "module_id": "LP2"},
+                    },
+                ]
+            },
+        }
+    )
+    env = ClusterEnv(problem)
+    builder = ClusterHeteroGraphBuilder.from_env(env)
+    observation, _ = env.reset()
+    graph = builder.build(observation)
+    lp1 = env.module_ids.index("LP1")
+    lp2 = env.module_ids.index("LP2")
+    is_ready = WAFER_FEATURE_NAMES.index("is_ready")
+
+    assert graph.edges[
+        ("wafer", "returns_to", "module")
+    ].edge_index.tolist() == [[0, 1], [lp1, lp2]]
+    assert graph.nodes["wafer"].features[:, is_ready].tolist() == [1.0, 1.0]
+
+    final_step = builder.route_step_ids.index(("A", 2))
+    can_run_on = graph.edges[
+        ("route_step", "can_run_on", "module")
+    ].edge_index.T.tolist()
+    assert [final_step, lp1] in can_run_on
+    assert [final_step, lp2] in can_run_on
+
+
 def test_graph_exposes_pending_robot_operation_and_pick_start_holding() -> None:
     env = ClusterEnv(load_problem(SCENARIO))
     builder = ClusterHeteroGraphBuilder.from_env(env)

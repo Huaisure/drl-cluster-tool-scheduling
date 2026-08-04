@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+import sys
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, fields
+from contextlib import contextmanager, redirect_stdout
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,7 +35,7 @@ from cluster_rl.network import (
 from problem import ClusterProblem, load_problem
 
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 4
 UPDATE_FIELDS = (
     "update",
     "global_step",
@@ -89,6 +92,7 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     model_dim: int = 64
     num_heads: int = 4
+    hgt_layers: int = 2
     num_layers: int = 2
     feedforward_dim: int = 128
     seed: int = 0
@@ -141,6 +145,28 @@ class EpisodeStat:
     success: bool
 
 
+class _Tee:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+@contextmanager
+def _training_log(path: Path, *, append: bool):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a" if append else "w", encoding="utf-8") as stream:
+        with redirect_stdout(_Tee(sys.stdout, stream)):
+            yield
+
+
 def _default_scenarios() -> tuple[Path, ...]:
     return tuple(sorted(SCENARIO_DIR.glob("*.json")))
 
@@ -177,23 +203,11 @@ def _reference_makespans(
 
 
 def _stack_entity_batches(batches: list[EntityBatch]) -> EntityBatch:
-    tensors = {}
-    for field in fields(EntityBatch):
-        values = torch.stack(
-            [getattr(batch, field.name) for batch in batches],
-            dim=0,
-        )
-        tensors[field.name] = values.flatten(0, 1)
-    return EntityBatch(**tensors)
+    return EntityBatch.concatenate(batches)
 
 
 def _select_states(states: EntityBatch, indexes: Tensor) -> EntityBatch:
-    return EntityBatch(
-        **{
-            field.name: getattr(states, field.name).index_select(0, indexes)
-            for field in fields(EntityBatch)
-        }
-    )
+    return states.index_select(indexes)
 
 
 def _advantages(
@@ -544,6 +558,14 @@ def _append_csv(
         writer.writerow(row)
 
 
+def _ensure_csv(path: Path, fieldnames: Sequence[str]) -> None:
+    if path.exists() and path.stat().st_size:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        csv.DictWriter(stream, fieldnames=fieldnames).writeheader()
+
+
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
@@ -820,6 +842,8 @@ def _prepare_run_dir(config: PPOConfig) -> None:
             "episodes.csv",
             "evaluation.csv",
             "training_curves.png",
+            "train.log",
+            "config.json",
         ):
             path = config.run_dir / filename
             if path.exists():
@@ -827,18 +851,30 @@ def _prepare_run_dir(config: PPOConfig) -> None:
 
 
 def train(config: PPOConfig) -> dict[str, object]:
+    _prepare_run_dir(config)
+    config.run_dir.joinpath("config.json").write_text(
+        json.dumps(_serialize_config(config), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _ensure_csv(config.run_dir / "updates.csv", UPDATE_FIELDS)
+    _ensure_csv(config.run_dir / "episodes.csv", EPISODE_FIELDS)
+    _ensure_csv(config.run_dir / "evaluation.csv", EVALUATION_FIELDS)
+    with _training_log(
+        config.run_dir / "train.log",
+        append=config.resume is not None,
+    ):
+        return _train(config)
+
+
+def _train(config: PPOConfig) -> dict[str, object]:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = _resolve_device(config.device)
-    _prepare_run_dir(config)
 
     problems = [load_problem(path) for path in config.scenario_paths]
     references = _reference_makespans(problems)
     envs = [ClusterEnv(problem) for problem in problems]
-    encoders = [
-        ClusterObservationEncoder.from_env(env, reference)
-        for env, reference in zip(envs, references)
-    ]
+    encoders = [ClusterObservationEncoder.from_env(env) for env in envs]
     observations = [
         env.reset(seed=config.seed + index)[0]
         for index, env in enumerate(envs)
@@ -848,6 +884,7 @@ def train(config: PPOConfig) -> dict[str, object]:
     model_config = TransformerConfig(
         model_dim=config.model_dim,
         num_heads=config.num_heads,
+        hgt_layers=config.hgt_layers,
         num_layers=config.num_layers,
         feedforward_dim=config.feedforward_dim,
         dropout=0.0,
@@ -989,6 +1026,7 @@ def train(config: PPOConfig) -> dict[str, object]:
     print(f"  updates    : {config.run_dir / 'updates.csv'}")
     print(f"  episodes   : {config.run_dir / 'episodes.csv'}")
     print(f"  curves     : {curve_path}")
+    print(f"  console log: {config.run_dir / 'train.log'}")
 
     return {
         "checkpoint": str(config.checkpoint),
@@ -1028,6 +1066,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--model-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--hgt-layers", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--feedforward-dim", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
@@ -1071,6 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_grad_norm=args.max_grad_norm,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
+        hgt_layers=args.hgt_layers,
         num_layers=args.num_layers,
         feedforward_dim=args.feedforward_dim,
         seed=args.seed,

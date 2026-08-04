@@ -195,17 +195,19 @@ def test_masked_random_episode_finishes_with_a_valid_schedule() -> None:
     env = ClusterEnv(problem)
     observation, _ = env.reset(seed=11)
     rng = np.random.default_rng(11)
+    total_reward = 0.0
 
     for _ in range(100):
         legal_actions = np.flatnonzero(observation["action_mask"])
         action = int(rng.choice(legal_actions))
         observation, reward, terminated, truncated, info = env.step(action)
-        assert reward == 0.0
+        total_reward += reward
         if terminated or truncated:
             break
 
     assert terminated and not truncated
     assert info["is_success"]
+    assert total_reward == -info["time"]
     assert ValidatorSuite(problem).validate(env.actions).ok
 
 
@@ -234,3 +236,60 @@ def test_ignored_constraints_do_not_enter_environment_state() -> None:
         "time_to_operation_end",
         "action_mask",
     }
+
+
+def test_multiple_lps_have_independent_fifo_heads_and_return_targets() -> None:
+    problem = parse_problem(
+        {
+            "Modules": {
+                "LP1": {"type": "LP"},
+                "LP2": {"type": "LP"},
+                "PM1": {"type": "PM"},
+            },
+            "ClusterTool": {
+                "TM1": {
+                    "module_ids": ["LP1", "LP2", "PM1"],
+                    "arm_type": "single_arm",
+                    "travel_times": 1,
+                    "pick_time": 1,
+                    "place_time": 1,
+                }
+            },
+            "routes": {"A": [{"module_id": "PM1", "process_time": 1}]},
+            "initial_state": {
+                "robots": {"TM1": {"position_module_id": "LP1"}},
+                "wafers": [
+                    {
+                        "route_id": "A",
+                        "wafer_index": "0",
+                        "location": {"kind": "module", "module_id": "LP1"},
+                    },
+                    {
+                        "route_id": "A",
+                        "wafer_index": "1",
+                        "location": {"kind": "module", "module_id": "LP2"},
+                    },
+                ],
+            },
+        }
+    )
+    env = ClusterEnv(problem)
+    observation, _ = env.reset()
+
+    assert env.return_module_ids == ("LP1", "LP2")
+    assert observation["action_mask"][:2].tolist() == [1, 1]
+
+    for _ in range(100):
+        action = int(np.flatnonzero(observation["action_mask"])[0])
+        observation, _, terminated, _, _ = env.step(action)
+        if terminated:
+            break
+
+    assert terminated
+    assert [wafer.module_id for wafer in env._wafers] == ["LP1", "LP2"]
+    final_places = {
+        (action["route_id"], action["wafer_index"]): action["module_id"]
+        for action in env.actions
+        if action["action_type"] == "place" and action["step_index"] == 2
+    }
+    assert final_places == {("A", 0): "LP1", ("A", 1): "LP2"}

@@ -1,0 +1,4 @@
+scenario,reference_makespan,makespan,normalized_cost,relative_gain,action_count,valid
+long_route_1w,61.0,61.0,1.0,0.0,18,True
+mixed_3pm_20w,323.0,323.0,1.0,0.0,140,True
+mixed_5pm_24w,424.0,396.0,0.9339622641509434,0.06603773584905659,192,True

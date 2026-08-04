@@ -46,6 +46,40 @@ OPERATES_ON: EdgeType = (ROBOT, "operates_on", WAFER)
 OPERATION_OF: EdgeType = (WAFER, "operation_of", ROBOT)
 OPERATION_AT: EdgeType = (ROBOT, "operation_at", MODULE)
 HAS_OPERATION: EdgeType = (MODULE, "has_operation", ROBOT)
+RETURNS_TO: EdgeType = (WAFER, "returns_to", MODULE)
+RETURN_DESTINATION_OF: EdgeType = (
+    MODULE,
+    "return_destination_of",
+    WAFER,
+)
+
+NODE_TYPES = (GLOBAL, WAFER, ROUTE_STEP, MODULE, ROBOT)
+EDGE_TYPES = (
+    LOCATED_IN,
+    CONTAINS,
+    HELD_BY,
+    HOLDS,
+    AT_STEP,
+    CURRENT_FOR,
+    NEXT_STEP,
+    NEXT_FOR,
+    CAN_RUN_ON,
+    SUPPORTS_STEP,
+    PRECEDES,
+    FOLLOWS,
+    CAN_ACCESS,
+    ACCESSIBLE_BY,
+    LOCATED_AT,
+    HAS_ROBOT,
+    OPERATES_ON,
+    OPERATION_OF,
+    OPERATION_AT,
+    HAS_OPERATION,
+    RETURNS_TO,
+    RETURN_DESTINATION_OF,
+    *((GLOBAL, "contextualizes", node_type) for node_type in NODE_TYPES[1:]),
+    *((node_type, "summarizes_into", GLOBAL) for node_type in NODE_TYPES[1:]),
+)
 
 
 def _edge_store(edges: list[tuple[int, int]]) -> EdgeStore:
@@ -90,12 +124,32 @@ class ClusterHeteroGraphBuilder:
             for robot in problem.ClusterTool.values()
         )
 
+        snapshot = problem.initial_state.to_snapshot()
         if set(self.module_ids) != set(problem.Modules):
             raise ValueError("module_ids must match problem.Modules")
         if set(self.wafer_keys) != set(
-            problem.initial_state.to_snapshot().wafers_by_key
+            snapshot.wafers_by_key
         ):
             raise ValueError("wafer_keys must match the initial wafers")
+        self.return_module_ids = tuple(
+            problem.return_module_id(snapshot.wafers_by_key[key])
+            for key in self.wafer_keys
+        )
+        self._return_modules_by_route = {
+            route_id: tuple(
+                sorted(
+                    {
+                        return_module_id
+                        for key, return_module_id in zip(
+                            self.wafer_keys,
+                            self.return_module_ids,
+                        )
+                        if key[0] == route_id
+                    }
+                )
+            )
+            for route_id in problem.routes
+        }
 
         self.route_step_ids: tuple[RouteStepKey, ...] = tuple(
             (route_id, step)
@@ -114,11 +168,6 @@ class ClusterHeteroGraphBuilder:
             route_step: index
             for index, route_step in enumerate(self.route_step_ids)
         }
-        self._lp_id = next(
-            module_id
-            for module_id in self.module_ids
-            if problem.Modules[module_id].type is ModuleType.LP
-        )
         self._total_process_time = sum(
             visit.process_time or 0.0
             for route_id, _ in self.wafer_keys
@@ -481,6 +530,12 @@ class ClusterHeteroGraphBuilder:
             for robot_index, module_index in enumerate(operation_module)
             if module_index < module_count
         ]
+        returns_to = [
+            (wafer_index, self._module_index[return_module_id])
+            for wafer_index, return_module_id in enumerate(
+                self.return_module_ids
+            )
+        ]
 
         can_run_on: list[tuple[int, int]] = []
         precedes: list[tuple[int, int]] = []
@@ -489,7 +544,7 @@ class ClusterHeteroGraphBuilder:
         ):
             route = self.problem.routes[route_id]
             targets = (
-                (self._lp_id,)
+                self._return_modules_by_route[route_id]
                 if step == len(route.visits) + 1
                 else route.visits[step - 1].module_ids
             )
@@ -535,6 +590,8 @@ class ClusterHeteroGraphBuilder:
             OPERATION_OF: _edge_store(_reverse(operates_on)),
             OPERATION_AT: _edge_store(operation_at),
             HAS_OPERATION: _edge_store(_reverse(operation_at)),
+            RETURNS_TO: _edge_store(returns_to),
+            RETURN_DESTINATION_OF: _edge_store(_reverse(returns_to)),
         }
         for node_type, count in (
             (WAFER, len(self.wafer_keys)),

@@ -6,107 +6,166 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 from torch import Tensor, nn
+from torch_geometric.data import Batch, HeteroData
+from torch_geometric.nn import HGTConv
+from torch_geometric.utils import to_dense_batch
 
-from problem import ClusterProblem, ModuleType, WaferKey
+from cluster_rl.hetero_graph.builder import (
+    EDGE_TYPES,
+    GLOBAL,
+    MODULE,
+    NODE_TYPES,
+    ROBOT,
+    ROUTE_STEP,
+    WAFER,
+    ClusterHeteroGraphBuilder,
+)
+from cluster_rl.hetero_graph.feature_schema import (
+    GLOBAL_FEATURE_NAMES,
+    MODULE_FEATURE_NAMES,
+    ROBOT_FEATURE_NAMES,
+    ROUTE_STEP_FEATURE_NAMES,
+    WAFER_FEATURE_NAMES,
+)
+from cluster_rl.hetero_graph.schema import HeteroGraph
+from problem import ClusterProblem, WaferKey
 
-GLOBAL_FEATURE_DIM = 6
-WAFER_FEATURE_DIM = 8
-MODULE_FEATURE_DIM = 7
-ROBOT_FEATURE_DIM = 4
+PICK_ACTION = 0
+PLACE_ACTION = 1
+ADVANCE_ACTION = 2
+ACTION_TYPE_COUNT = 3
+PAD_ACTION = 3
 
-GLOBAL_TYPE = 0
-ROBOT_TYPE = 1
-WAFER_TYPE = 2
-MODULE_TYPE = 3
-PAD_TYPE = 4
-TYPE_COUNT = 5
-
-CANDIDATE_RELATION = 0
-WAFER_LOCATION_RELATION = 1
-ROBOT_LOCATION_RELATION = 2
-ROBOT_HOLDS_RELATION = 3
-CANDIDATE_TIME_RELATION = 4
-RELATION_COUNT = 5
+NODE_FEATURE_DIMS = {
+    GLOBAL: len(GLOBAL_FEATURE_NAMES),
+    WAFER: len(WAFER_FEATURE_NAMES),
+    ROUTE_STEP: len(ROUTE_STEP_FEATURE_NAMES),
+    MODULE: len(MODULE_FEATURE_NAMES),
+    ROBOT: len(ROBOT_FEATURE_NAMES),
+}
 
 
 @dataclass(frozen=True)
 class EncodedObservation:
-    """One unpadded entity-state representation."""
+    """One graph state and its environment-aligned action description."""
 
-    global_features: np.ndarray
-    robot_features: np.ndarray
-    wafer_features: np.ndarray
-    module_features: np.ndarray
-    candidate_modules: np.ndarray
-    candidate_process_times: np.ndarray
-    wafer_locations: np.ndarray
-    robot_location: np.ndarray
-    robot_holds: np.ndarray
+    graph: HeteroData
     action_mask: np.ndarray
+    action_kind: np.ndarray
+    action_entity: np.ndarray
+    action_robot: np.ndarray
 
 
 @dataclass(frozen=True)
 class EntityBatch:
-    """Padded tensors consumed by :class:`ClusterActorCritic`."""
+    """Batched heterogeneous graphs and padded action queries."""
 
-    global_features: Tensor
-    robot_features: Tensor
-    wafer_features: Tensor
-    module_features: Tensor
-    candidate_modules: Tensor
-    candidate_process_times: Tensor
-    wafer_locations: Tensor
-    robot_location: Tensor
-    robot_holds: Tensor
-    wafer_valid: Tensor
-    module_valid: Tensor
+    graph: Batch
     action_mask: Tensor
+    action_valid: Tensor
+    action_kind: Tensor
+    action_entity: Tensor
+    action_robot: Tensor
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.action_mask.shape[0])
 
     def to(self, device: torch.device | str) -> EntityBatch:
-        return EntityBatch(**{field: value.to(device) for field, value in self.__dict__.items()})
+        return EntityBatch(
+            graph=self.graph.to(device),
+            action_mask=self.action_mask.to(device),
+            action_valid=self.action_valid.to(device),
+            action_kind=self.action_kind.to(device),
+            action_entity=self.action_entity.to(device),
+            action_robot=self.action_robot.to(device),
+        )
 
     def to_model_actions(self, env_actions: Tensor) -> Tensor:
-        """Map each environment action into the padded logits layout."""
+        """Environment and model use the same entity-major flat indexes."""
 
-        if env_actions.shape != (self.wafer_features.shape[0],):
-            raise ValueError("env_actions must contain one action per batch item")
-
-        env_actions = env_actions.to(self.action_mask.device)
-        wafer_counts = self.wafer_valid.sum(dim=1)
-        module_counts = self.module_valid.sum(dim=1)
-        is_place = env_actions >= wafer_counts
-        place_index = env_actions - wafer_counts
-        if torch.any(env_actions < 0) or torch.any(is_place & (place_index >= module_counts)):
-            raise ValueError("env_actions contains an out-of-range action")
-
-        return torch.where(
-            is_place,
-            self.wafer_features.shape[1] + place_index,
-            env_actions,
-        )
+        self._validate_actions(env_actions, "env_actions")
+        return env_actions.to(self.action_mask.device)
 
     def to_env_actions(self, model_actions: Tensor) -> Tensor:
-        """Map actions sampled from padded logits back to each environment."""
+        """Environment and model use the same entity-major flat indexes."""
 
-        if model_actions.shape != (self.wafer_features.shape[0],):
-            raise ValueError("model_actions must contain one action per batch item")
+        self._validate_actions(model_actions, "model_actions")
+        return model_actions.to(self.action_mask.device)
 
-        model_actions = model_actions.to(self.action_mask.device)
-        max_wafers = self.wafer_features.shape[1]
-        wafer_counts = self.wafer_valid.sum(dim=1)
-        module_counts = self.module_valid.sum(dim=1)
-        is_place = model_actions >= max_wafers
-        place_index = model_actions - max_wafers
-        invalid_pick = ~is_place & (model_actions >= wafer_counts)
-        invalid_place = is_place & (place_index >= module_counts)
-        if torch.any(model_actions < 0) or torch.any(invalid_pick) or torch.any(invalid_place):
-            raise ValueError("model_actions contains a padded or invalid action")
-
-        return torch.where(
-            is_place,
-            wafer_counts + place_index,
-            model_actions,
+    def index_select(self, indexes: Tensor) -> EntityBatch:
+        indexes = indexes.to(self.action_mask.device, dtype=torch.long)
+        data_list = self.graph.to_data_list()
+        selected_graphs = [data_list[index] for index in indexes.cpu().tolist()]
+        return EntityBatch(
+            graph=Batch.from_data_list(selected_graphs).to(self.action_mask.device),
+            action_mask=self.action_mask.index_select(0, indexes),
+            action_valid=self.action_valid.index_select(0, indexes),
+            action_kind=self.action_kind.index_select(0, indexes),
+            action_entity=self.action_entity.index_select(0, indexes),
+            action_robot=self.action_robot.index_select(0, indexes),
         )
+
+    @classmethod
+    def concatenate(cls, batches: Sequence[EntityBatch]) -> EntityBatch:
+        if not batches:
+            raise ValueError("batches must not be empty")
+
+        device = batches[0].action_mask.device
+        if any(batch.action_mask.device != device for batch in batches):
+            raise ValueError("all batches must be on the same device")
+
+        graphs = [
+            graph
+            for batch in batches
+            for graph in batch.graph.to_data_list()
+        ]
+        max_actions = max(batch.action_mask.shape[1] for batch in batches)
+        batch_size = sum(batch.batch_size for batch in batches)
+        action_mask = torch.zeros(
+            batch_size, max_actions, dtype=torch.bool, device=device
+        )
+        action_valid = torch.zeros_like(action_mask)
+        action_kind = torch.full(
+            (batch_size, max_actions),
+            PAD_ACTION,
+            dtype=torch.long,
+            device=device,
+        )
+        action_entity = torch.zeros(
+            batch_size, max_actions, dtype=torch.long, device=device
+        )
+        action_robot = torch.zeros_like(action_entity)
+
+        offset = 0
+        for batch in batches:
+            end = offset + batch.batch_size
+            width = batch.action_mask.shape[1]
+            action_mask[offset:end, :width] = batch.action_mask
+            action_valid[offset:end, :width] = batch.action_valid
+            action_kind[offset:end, :width] = batch.action_kind
+            action_entity[offset:end, :width] = batch.action_entity
+            action_robot[offset:end, :width] = batch.action_robot
+            offset = end
+
+        return cls(
+            graph=Batch.from_data_list(graphs).to(device),
+            action_mask=action_mask,
+            action_valid=action_valid,
+            action_kind=action_kind,
+            action_entity=action_entity,
+            action_robot=action_robot,
+        )
+
+    def _validate_actions(self, actions: Tensor, name: str) -> None:
+        if actions.shape != (self.batch_size,):
+            raise ValueError(f"{name} must contain one action per batch item")
+        actions = actions.to(self.action_mask.device, dtype=torch.long)
+        in_range = (actions >= 0) & (actions < self.action_valid.shape[1])
+        safe_actions = actions.clamp(0, self.action_valid.shape[1] - 1)
+        valid = self.action_valid.gather(1, safe_actions[:, None]).squeeze(1)
+        if not torch.all(in_range & valid):
+            raise ValueError(f"{name} contains a padded or out-of-range action")
 
 
 @dataclass(frozen=True)
@@ -119,7 +178,8 @@ class PolicyValueOutput:
 class TransformerConfig:
     model_dim: int = 128
     num_heads: int = 8
-    num_layers: int = 4
+    hgt_layers: int = 2
+    num_layers: int = 2
     feedforward_dim: int = 512
     dropout: float = 0.1
 
@@ -128,46 +188,48 @@ class TransformerConfig:
             raise ValueError("model_dim must be positive")
         if self.num_heads <= 0 or self.model_dim % self.num_heads:
             raise ValueError("model_dim must be divisible by num_heads")
-        if self.num_layers <= 0 or self.feedforward_dim <= 0:
-            raise ValueError("num_layers and feedforward_dim must be positive")
+        if self.hgt_layers <= 0 or self.num_layers <= 0:
+            raise ValueError("hgt_layers and num_layers must be positive")
+        if self.feedforward_dim <= 0:
+            raise ValueError("feedforward_dim must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
 
 
 class ClusterObservationEncoder:
-    """Build entity features and relations for one problem instance.
-
-    The ordering must match the environment's ``wafer_keys`` and
-    ``module_ids`` so actor logits retain the environment action ordering.
-    """
+    """Build the canonical heterogeneous graph used by the policy."""
 
     def __init__(
         self,
         problem: ClusterProblem,
         wafer_keys: Sequence[WaferKey],
         module_ids: Sequence[str],
-        time_scale: float = 1.0,
+        time_scale: float | None = None,
     ) -> None:
-        if not np.isfinite(time_scale) or time_scale <= 0:
-            raise ValueError("time_scale must be finite and positive")
-        self.problem = problem
-        self.wafer_keys = tuple(wafer_keys)
-        self.module_ids = tuple(module_ids)
-        self.time_scale = float(time_scale)
-        self._module_index = {module_id: index for index, module_id in enumerate(self.module_ids)}
-        self._lp_id = next(module_id for module_id in self.module_ids if problem.Modules[module_id].type is ModuleType.LP)
+        del time_scale
+        self.builder = ClusterHeteroGraphBuilder(
+            problem,
+            wafer_keys,
+            module_ids,
+        )
 
-        snapshot_keys = set(problem.initial_state.to_snapshot().wafers_by_key)
-        if set(self.wafer_keys) != snapshot_keys:
-            raise ValueError("wafer_keys must match the problem wafers")
-        if set(self.module_ids) != set(problem.Modules):
-            raise ValueError("module_ids must match the problem modules")
+    @property
+    def problem(self) -> ClusterProblem:
+        return self.builder.problem
+
+    @property
+    def wafer_keys(self) -> tuple[WaferKey, ...]:
+        return self.builder.wafer_keys
+
+    @property
+    def module_ids(self) -> tuple[str, ...]:
+        return self.builder.module_ids
 
     @classmethod
     def from_env(
         cls,
         env: Any,
-        time_scale: float = 1.0,
+        time_scale: float | None = None,
     ) -> ClusterObservationEncoder:
         return cls(
             env.problem,
@@ -180,137 +242,47 @@ class ClusterObservationEncoder:
         self,
         observation: Mapping[str, Any],
     ) -> EncodedObservation:
-        wafer_count = len(self.wafer_keys)
-        module_count = len(self.module_ids)
-        wafer_module = np.asarray(observation["wafer_module"], dtype=np.int64)
-        wafer_step = np.asarray(observation["wafer_step"], dtype=np.int64)
-        process_remaining = np.asarray(observation["process_remaining"], dtype=np.float32)
-        action_mask = np.asarray(observation["action_mask"], dtype=np.bool_)
-        robot_module = int(observation["robot_module"])
+        graph = self.builder.build(observation)
+        return _encode_graph(graph)
 
-        if wafer_module.shape != (wafer_count,) or wafer_step.shape != (wafer_count,) or process_remaining.shape != (wafer_count,):
-            raise ValueError("observation wafer arrays have an invalid shape")
-        if action_mask.shape != (wafer_count + module_count,):
-            raise ValueError("observation action_mask has an invalid shape")
-        if np.any((wafer_module < 0) | (wafer_module > module_count)):
-            raise ValueError("wafer_module contains an invalid module index")
-        if not 0 <= robot_module <= module_count:
-            raise ValueError("robot_module contains an invalid module index")
 
-        wafer_features = np.zeros((wafer_count, WAFER_FEATURE_DIM), dtype=np.float32)
-        candidate_modules = np.zeros((wafer_count, module_count), dtype=np.bool_)
-        candidate_process_times = np.zeros(
-            (wafer_count, module_count),
-            dtype=np.float32,
+def _encode_graph(graph: HeteroGraph) -> EncodedObservation:
+    data = HeteroData()
+    for node_type in NODE_TYPES:
+        store = graph.nodes[node_type]
+        data[node_type].x = torch.from_numpy(store.features.copy())
+        data[node_type].num_nodes = len(store.ids)
+    for edge_type in EDGE_TYPES:
+        data[edge_type].edge_index = torch.from_numpy(
+            graph.edges[edge_type].edge_index.copy()
         )
-        wafer_locations = np.zeros_like(candidate_modules)
-        robot_holds = wafer_module == module_count
-        total_process_work = 0.0
-        total_visits = 0
 
-        for wafer_index, (route_id, _) in enumerate(self.wafer_keys):
-            route = self.problem.routes[route_id]
-            completed_step = len(route.visits) + 1
-            route_process_times = [
-                visit.process_time or 0.0 for visit in route.visits
-            ]
-            total_process_work += sum(route_process_times)
-            total_visits += len(route.visits)
-            step = int(wafer_step[wafer_index])
-            if not 0 <= step <= completed_step:
-                raise ValueError(f"wafer_step[{wafer_index}] is outside its route")
+    entity_count, robot_count = graph.action_mask.shape
+    wafer_count = len(graph.nodes[WAFER].ids)
+    transport_count = entity_count * robot_count
+    action_count = transport_count + 1
+    action_kind = np.full(action_count, ADVANCE_ACTION, dtype=np.int64)
+    action_entity = np.zeros(action_count, dtype=np.int64)
+    action_robot = np.zeros(action_count, dtype=np.int64)
 
-            remaining = float(process_remaining[wafer_index])
-            if not np.isfinite(remaining) or remaining < 0:
-                raise ValueError("process_remaining must contain finite non-negative values")
+    if transport_count:
+        transport_actions = np.arange(transport_count, dtype=np.int64)
+        entities, robots = np.divmod(transport_actions, robot_count)
+        pick = entities < wafer_count
+        action_kind[:-1] = np.where(pick, PICK_ACTION, PLACE_ACTION)
+        action_entity[:-1] = np.where(pick, entities, entities - wafer_count)
+        action_robot[:-1] = robots
 
-            remaining_steps = max(0, completed_step - step)
-            next_process_time = (
-                route_process_times[step]
-                if step < len(route_process_times)
-                else 0.0
-            )
-            wafer_features[wafer_index] = (
-                step / completed_step,
-                remaining / self.time_scale,
-                float(remaining == 0.0),
-                float(robot_holds[wafer_index]),
-                float(step == completed_step),
-                remaining_steps / completed_step,
-                next_process_time / self.time_scale,
-                sum(route_process_times[step:]) / self.time_scale,
-            )
-            if wafer_module[wafer_index] < module_count:
-                wafer_locations[wafer_index, wafer_module[wafer_index]] = True
-
-            next_step = step + 1
-            if next_step <= len(route.visits):
-                targets = route.visits[next_step - 1].module_ids
-            elif next_step == completed_step:
-                targets = (self._lp_id,)
-            else:
-                targets = ()
-            for module_id in targets:
-                module_index = self._module_index[module_id]
-                candidate_modules[wafer_index, module_index] = True
-                candidate_process_times[
-                    wafer_index, module_index
-                ] = next_process_time / self.time_scale
-
-        occupancy = wafer_locations.sum(axis=0)
-        module_features = np.zeros((module_count, MODULE_FEATURE_DIM), dtype=np.float32)
-        for module_index, module_id in enumerate(self.module_ids):
-            module = self.problem.Modules[module_id]
-            type_index = {
-                ModuleType.LP: 0,
-                ModuleType.PM: 1,
-                ModuleType.LL: 2,
-            }[module.type]
-            capacity = module.capacity
-            available = capacity - occupancy[module_index]
-            module_features[module_index, type_index] = 1.0
-            module_features[module_index, 3:] = (
-                np.log1p(capacity),
-                occupancy[module_index] / capacity,
-                available / capacity,
-                float(available == 0),
-            )
-
-        robot_location = np.zeros(module_count, dtype=np.bool_)
-        if robot_module < module_count:
-            robot_location[robot_module] = True
-        robot = next(iter(self.problem.ClusterTool.values()))
-
-        return EncodedObservation(
-            global_features=np.asarray(
-                [
-                    np.log1p(wafer_count),
-                    np.log1p(module_count),
-                    np.log1p(len(self.problem.routes)),
-                    np.log1p(self.time_scale),
-                    total_process_work / self.time_scale,
-                    total_visits / wafer_count,
-                ],
-                dtype=np.float32,
-            ),
-            robot_features=np.asarray(
-                [
-                    robot_holds.any(),
-                    robot.pick_time / self.time_scale,
-                    robot.place_time / self.time_scale,
-                    float(robot.travel_times) / self.time_scale,
-                ],
-                dtype=np.float32,
-            ),
-            wafer_features=wafer_features,
-            module_features=module_features,
-            candidate_modules=candidate_modules,
-            candidate_process_times=candidate_process_times,
-            wafer_locations=wafer_locations,
-            robot_location=robot_location,
-            robot_holds=robot_holds,
-            action_mask=action_mask,
-        )
+    action_mask = np.concatenate(
+        (graph.action_mask.reshape(-1), np.asarray([graph.can_advance]))
+    )
+    return EncodedObservation(
+        graph=data,
+        action_mask=action_mask,
+        action_kind=action_kind,
+        action_entity=action_entity,
+        action_robot=action_robot,
+    )
 
 
 def collate_observations(
@@ -319,128 +291,50 @@ def collate_observations(
     *,
     device: torch.device | str | None = None,
 ) -> EntityBatch:
-    """Encode and pad observations from potentially different instances."""
+    """Build and batch graphs from potentially different problem instances."""
 
     if not encoders or len(encoders) != len(observations):
-        raise ValueError("encoders and observations must have the same non-zero length")
-
-    encoded = [encoder.encode(observation) for encoder, observation in zip(encoders, observations)]
+        raise ValueError(
+            "encoders and observations must have the same non-zero length"
+        )
+    encoded = [
+        encoder.encode(observation)
+        for encoder, observation in zip(encoders, observations)
+    ]
+    max_actions = max(item.action_mask.shape[0] for item in encoded)
     batch_size = len(encoded)
-    max_wafers = max(item.wafer_features.shape[0] for item in encoded)
-    max_modules = max(item.module_features.shape[0] for item in encoded)
+    action_mask = torch.zeros(batch_size, max_actions, dtype=torch.bool)
+    action_valid = torch.zeros_like(action_mask)
+    action_kind = torch.full(
+        (batch_size, max_actions), PAD_ACTION, dtype=torch.long
+    )
+    action_entity = torch.zeros(batch_size, max_actions, dtype=torch.long)
+    action_robot = torch.zeros_like(action_entity)
 
-    global_features = torch.zeros(
-        batch_size,
-        GLOBAL_FEATURE_DIM,
-        dtype=torch.float32,
-        device=device,
-    )
-    robot_features = torch.zeros(batch_size, ROBOT_FEATURE_DIM, dtype=torch.float32, device=device)
-    wafer_features = torch.zeros(
-        batch_size,
-        max_wafers,
-        WAFER_FEATURE_DIM,
-        dtype=torch.float32,
-        device=device,
-    )
-    module_features = torch.zeros(
-        batch_size,
-        max_modules,
-        MODULE_FEATURE_DIM,
-        dtype=torch.float32,
-        device=device,
-    )
-    candidate_modules = torch.zeros(
-        batch_size,
-        max_wafers,
-        max_modules,
-        dtype=torch.bool,
-        device=device,
-    )
-    candidate_process_times = torch.zeros(
-        batch_size,
-        max_wafers,
-        max_modules,
-        dtype=torch.float32,
-        device=device,
-    )
-    wafer_locations = torch.zeros_like(candidate_modules)
-    robot_location = torch.zeros(batch_size, max_modules, dtype=torch.bool, device=device)
-    robot_holds = torch.zeros(batch_size, max_wafers, dtype=torch.bool, device=device)
-    wafer_valid = torch.zeros_like(robot_holds)
-    module_valid = torch.zeros_like(robot_location)
-    action_mask = torch.zeros(
-        batch_size,
-        max_wafers + max_modules,
-        dtype=torch.bool,
-        device=device,
-    )
-
-    for batch_index, item in enumerate(encoded):
-        wafer_count = item.wafer_features.shape[0]
-        module_count = item.module_features.shape[0]
-
-        global_features[batch_index] = torch.as_tensor(
-            item.global_features,
-            device=device,
+    for index, item in enumerate(encoded):
+        action_count = item.action_mask.shape[0]
+        action_mask[index, :action_count] = torch.from_numpy(item.action_mask)
+        action_valid[index, :action_count] = True
+        action_kind[index, :action_count] = torch.from_numpy(item.action_kind)
+        action_entity[index, :action_count] = torch.from_numpy(
+            item.action_entity
         )
-        robot_features[batch_index] = torch.as_tensor(item.robot_features, device=device)
-        wafer_features[batch_index, :wafer_count] = torch.as_tensor(item.wafer_features, device=device)
-        module_features[batch_index, :module_count] = torch.as_tensor(item.module_features, device=device)
-        candidate_modules[batch_index, :wafer_count, :module_count] = torch.as_tensor(item.candidate_modules, device=device)
-        candidate_process_times[
-            batch_index, :wafer_count, :module_count
-        ] = torch.as_tensor(
-            item.candidate_process_times,
-            device=device,
+        action_robot[index, :action_count] = torch.from_numpy(
+            item.action_robot
         )
-        wafer_locations[batch_index, :wafer_count, :module_count] = torch.as_tensor(item.wafer_locations, device=device)
-        robot_location[batch_index, :module_count] = torch.as_tensor(item.robot_location, device=device)
-        robot_holds[batch_index, :wafer_count] = torch.as_tensor(item.robot_holds, device=device)
-        wafer_valid[batch_index, :wafer_count] = True
-        module_valid[batch_index, :module_count] = True
-
-        action_mask[batch_index, :wafer_count] = torch.as_tensor(item.action_mask[:wafer_count], device=device)
-        action_mask[batch_index, max_wafers : max_wafers + module_count] = torch.as_tensor(item.action_mask[wafer_count:], device=device)
 
     return EntityBatch(
-        global_features=global_features,
-        robot_features=robot_features,
-        wafer_features=wafer_features,
-        module_features=module_features,
-        candidate_modules=candidate_modules,
-        candidate_process_times=candidate_process_times,
-        wafer_locations=wafer_locations,
-        robot_location=robot_location,
-        robot_holds=robot_holds,
-        wafer_valid=wafer_valid,
-        module_valid=module_valid,
+        graph=Batch.from_data_list([item.graph for item in encoded]),
         action_mask=action_mask,
-    )
-
-
-class _FeatureEncoder(nn.Module):
-    def __init__(self, input_dim: int, model_dim: int) -> None:
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, model_dim),
-            nn.LayerNorm(model_dim),
-        )
-
-    def forward(self, features: Tensor) -> Tensor:
-        return self.layers(features)
+        action_valid=action_valid,
+        action_kind=action_kind,
+        action_entity=action_entity,
+        action_robot=action_robot,
+    ).to(device or "cpu")
 
 
 class ClusterActorCritic(nn.Module):
-    """Relation-aware entity-token Transformer actor-critic.
-
-    Token order is ``[GLOBAL], [ROBOT], [WAFER] * N, [MODULE] * M``.
-    Padded wafer and module slots receive the PAD type embedding and are
-    excluded as attention keys. No positional embedding is used, preserving
-    permutation equivariance within each entity type.
-    """
+    """HGT graph encoder with a Transformer action-query decoder."""
 
     def __init__(
         self,
@@ -449,209 +343,170 @@ class ClusterActorCritic(nn.Module):
         super().__init__()
         self.config = config or TransformerConfig()
         model_dim = self.config.model_dim
+        metadata = (list(NODE_TYPES), list(EDGE_TYPES))
 
-        self.global_encoder = _FeatureEncoder(GLOBAL_FEATURE_DIM, model_dim)
-        self.robot_encoder = _FeatureEncoder(ROBOT_FEATURE_DIM, model_dim)
-        self.wafer_encoder = _FeatureEncoder(WAFER_FEATURE_DIM, model_dim)
-        self.module_encoder = _FeatureEncoder(MODULE_FEATURE_DIM, model_dim)
-        self.type_embedding = nn.Embedding(TYPE_COUNT, model_dim)
-        self.global_token = nn.Parameter(torch.empty(model_dim))
-        self.pad_token = nn.Parameter(torch.empty(model_dim))
-        self.relation_bias = nn.Parameter(torch.zeros(RELATION_COUNT, self.config.num_heads))
-
-        self.layers = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=model_dim,
-                    nhead=self.config.num_heads,
-                    dim_feedforward=self.config.feedforward_dim,
-                    dropout=self.config.dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
+        self.node_encoders = nn.ModuleDict(
+            {
+                node_type: nn.Sequential(
+                    nn.Linear(feature_dim, model_dim),
+                    nn.GELU(),
+                    nn.LayerNorm(model_dim),
                 )
-                for _ in range(self.config.num_layers)
-            ]
+                for node_type, feature_dim in NODE_FEATURE_DIMS.items()
+            }
         )
-        self.final_norm = nn.LayerNorm(model_dim)
-        self.pick_head = nn.Linear(model_dim, 1)
-        self.place_head = nn.Linear(model_dim, 1)
+        self.hgt_layers = nn.ModuleList(
+            HGTConv(
+                model_dim,
+                model_dim,
+                metadata,
+                heads=self.config.num_heads,
+            )
+            for _ in range(self.config.hgt_layers)
+        )
+        self.hgt_norms = nn.ModuleList(
+            nn.ModuleDict(
+                {node_type: nn.LayerNorm(model_dim) for node_type in NODE_TYPES}
+            )
+            for _ in range(self.config.hgt_layers)
+        )
+        self.hgt_dropout = nn.Dropout(self.config.dropout)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=model_dim,
+            nhead=self.config.num_heads,
+            dim_feedforward=self.config.feedforward_dim,
+            dropout=self.config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=self.config.num_layers,
+            norm=nn.LayerNorm(model_dim),
+        )
+        self.action_type_embedding = nn.Embedding(
+            ACTION_TYPE_COUNT,
+            model_dim,
+        )
+        self.advance_query = nn.Parameter(torch.empty(model_dim))
+        self.actor_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, 1),
+        )
         self.value_head = nn.Sequential(
             nn.Linear(model_dim, model_dim),
             nn.GELU(),
             nn.Linear(model_dim, 1),
         )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.global_token, std=0.02)
-        nn.init.normal_(self.pad_token, std=0.02)
-        nn.init.normal_(self.type_embedding.weight, std=0.02)
-        nn.init.normal_(self.relation_bias, std=0.02)
+        nn.init.normal_(self.advance_query, std=0.02)
 
     def forward(self, batch: EntityBatch) -> PolicyValueOutput:
         self._validate_batch(batch)
-        tokens, token_valid = self._tokens(batch)
-        attention_bias = self._attention_bias(batch, token_valid, tokens.dtype)
+        x_dict = {
+            node_type: self.node_encoders[node_type](
+                batch.graph[node_type].x
+            )
+            for node_type in NODE_TYPES
+        }
+        for layer, norms in zip(self.hgt_layers, self.hgt_norms):
+            updated = layer(x_dict, batch.graph.edge_index_dict)
+            x_dict = {
+                node_type: norms[node_type](
+                    x_dict[node_type]
+                    + self.hgt_dropout(updated[node_type])
+                )
+                for node_type in NODE_TYPES
+            }
 
-        for layer in self.layers:
-            tokens = layer(tokens, src_mask=attention_bias)
-        tokens = self.final_norm(tokens)
-
-        wafer_count = batch.wafer_features.shape[1]
-        module_count = batch.module_features.shape[1]
-        wafer_states = tokens[:, 2 : 2 + wafer_count]
-        module_states = tokens[:, 2 + wafer_count : 2 + wafer_count + module_count]
-        logits = torch.cat(
-            (
-                self.pick_head(wafer_states).squeeze(-1),
-                self.place_head(module_states).squeeze(-1),
-            ),
-            dim=-1,
-        )
-        logits = logits.masked_fill(~batch.action_mask, -torch.inf)
-        value = self.value_head(tokens[:, 0]).squeeze(-1)
-        return PolicyValueOutput(logits=logits, value=value)
-
-    def _tokens(self, batch: EntityBatch) -> tuple[Tensor, Tensor]:
-        batch_size, wafer_count = batch.wafer_valid.shape
-        module_count = batch.module_valid.shape[1]
-        device = batch.wafer_features.device
-
-        global_token = (
-            self.global_encoder(batch.global_features)
-            + self.global_token
-        ).unsqueeze(1)
-        robot_token = self.robot_encoder(batch.robot_features).unsqueeze(1)
-        wafer_tokens = self.wafer_encoder(batch.wafer_features)
-        module_tokens = self.module_encoder(batch.module_features)
-
-        types = torch.full(
-            (batch_size, 2 + wafer_count + module_count),
-            PAD_TYPE,
-            dtype=torch.long,
-            device=device,
-        )
-        types[:, 0] = GLOBAL_TYPE
-        types[:, 1] = ROBOT_TYPE
-        types[:, 2 : 2 + wafer_count] = torch.where(
-            batch.wafer_valid,
-            WAFER_TYPE,
-            PAD_TYPE,
-        )
-        types[:, 2 + wafer_count :] = torch.where(
-            batch.module_valid,
-            MODULE_TYPE,
-            PAD_TYPE,
-        )
-        token_valid = torch.cat(
-            (
-                torch.ones(batch_size, 2, dtype=torch.bool, device=device),
-                batch.wafer_valid,
-                batch.module_valid,
-            ),
+        dense_nodes = {
+            node_type: to_dense_batch(
+                x_dict[node_type],
+                batch.graph[node_type].batch,
+                batch_size=batch.batch_size,
+            )
+            for node_type in NODE_TYPES
+        }
+        memory = torch.cat(
+            [dense_nodes[node_type][0] for node_type in NODE_TYPES],
             dim=1,
         )
+        memory_valid = torch.cat(
+            [dense_nodes[node_type][1] for node_type in NODE_TYPES],
+            dim=1,
+        )
+        queries = self._action_queries(batch, dense_nodes)
+        decoded = self.decoder(
+            queries,
+            memory,
+            tgt_key_padding_mask=~batch.action_valid,
+            memory_key_padding_mask=~memory_valid,
+        )
+        logits = self.actor_head(decoded).squeeze(-1)
+        logits = logits.masked_fill(~batch.action_mask, -torch.inf)
+        global_state = dense_nodes[GLOBAL][0][:, 0]
+        value = self.value_head(global_state).squeeze(-1)
+        return PolicyValueOutput(logits=logits, value=value)
 
-        tokens = torch.cat((global_token, robot_token, wafer_tokens, module_tokens), dim=1)
-        padding = self.pad_token.view(1, 1, -1)
-        tokens = torch.where(token_valid.unsqueeze(-1), tokens, padding)
-        return tokens + self.type_embedding(types), token_valid
-
-    def _attention_bias(
+    def _action_queries(
         self,
         batch: EntityBatch,
-        token_valid: Tensor,
-        dtype: torch.dtype,
+        dense_nodes: dict[str, tuple[Tensor, Tensor]],
     ) -> Tensor:
-        batch_size, wafer_count = batch.wafer_valid.shape
-        module_count = batch.module_valid.shape[1]
-        token_count = token_valid.shape[1]
-        wafer_slice = slice(2, 2 + wafer_count)
-        module_slice = slice(2 + wafer_count, token_count)
-
-        relations = torch.zeros(
-            batch_size,
-            RELATION_COUNT,
-            token_count,
-            token_count,
-            dtype=dtype,
-            device=token_valid.device,
+        batch_index = torch.arange(
+            batch.batch_size,
+            device=batch.action_mask.device,
+        )[:, None]
+        wafer = dense_nodes[WAFER][0][
+            batch_index,
+            batch.action_entity.clamp_max(dense_nodes[WAFER][0].shape[1] - 1),
+        ]
+        module = dense_nodes[MODULE][0][
+            batch_index,
+            batch.action_entity.clamp_max(dense_nodes[MODULE][0].shape[1] - 1),
+        ]
+        robot = dense_nodes[ROBOT][0][
+            batch_index,
+            batch.action_robot.clamp_max(dense_nodes[ROBOT][0].shape[1] - 1),
+        ]
+        global_state = dense_nodes[GLOBAL][0][:, :1].expand(
+            -1,
+            batch.action_mask.shape[1],
+            -1,
         )
-        candidate = batch.candidate_modules.to(dtype)
-        candidate_process_times = batch.candidate_process_times.to(dtype)
-        wafer_locations = batch.wafer_locations.to(dtype)
-        robot_location = batch.robot_location.to(dtype)
-        robot_holds = batch.robot_holds.to(dtype)
-
-        relations[:, CANDIDATE_RELATION, wafer_slice, module_slice] = candidate
-        relations[:, CANDIDATE_RELATION, module_slice, wafer_slice] = candidate.transpose(1, 2)
-        relations[:, WAFER_LOCATION_RELATION, wafer_slice, module_slice] = wafer_locations
-        relations[:, WAFER_LOCATION_RELATION, module_slice, wafer_slice] = wafer_locations.transpose(1, 2)
-        relations[:, ROBOT_LOCATION_RELATION, 1, module_slice] = robot_location
-        relations[:, ROBOT_LOCATION_RELATION, module_slice, 1] = robot_location
-        relations[:, ROBOT_HOLDS_RELATION, 1, wafer_slice] = robot_holds
-        relations[:, ROBOT_HOLDS_RELATION, wafer_slice, 1] = robot_holds
-        relations[
-            :, CANDIDATE_TIME_RELATION, wafer_slice, module_slice
-        ] = candidate_process_times
-        relations[
-            :, CANDIDATE_TIME_RELATION, module_slice, wafer_slice
-        ] = candidate_process_times.transpose(1, 2)
-
-        attention_bias = torch.einsum(
-            "brij,rh->bhij",
-            relations,
-            self.relation_bias.to(dtype),
+        pick = batch.action_kind == PICK_ACTION
+        place = batch.action_kind == PLACE_ACTION
+        advance = batch.action_kind == ADVANCE_ACTION
+        queries = torch.zeros_like(wafer)
+        queries = torch.where(pick[..., None], wafer + robot, queries)
+        queries = torch.where(place[..., None], module + robot, queries)
+        queries = torch.where(
+            advance[..., None],
+            global_state + self.advance_query,
+            queries,
         )
-        attention_bias = attention_bias.masked_fill(
-            ~token_valid[:, None, None, :],
-            -torch.inf,
-        )
-        return attention_bias.flatten(0, 1)
+        safe_kind = batch.action_kind.clamp_max(ADVANCE_ACTION)
+        queries = queries + self.action_type_embedding(safe_kind)
+        return queries.masked_fill(~batch.action_valid[..., None], 0.0)
 
     @staticmethod
     def _validate_batch(batch: EntityBatch) -> None:
-        batch_size, wafer_count, wafer_dim = batch.wafer_features.shape
-        if wafer_dim != WAFER_FEATURE_DIM:
-            raise ValueError("wafer_features has an invalid feature dimension")
-        if batch.global_features.shape != (
-            batch_size,
-            GLOBAL_FEATURE_DIM,
+        expected_shape = batch.action_mask.shape
+        if batch.action_mask.ndim != 2:
+            raise ValueError("action_mask must have shape [batch, action]")
+        for name in (
+            "action_valid",
+            "action_kind",
+            "action_entity",
+            "action_robot",
         ):
-            raise ValueError("global_features has an invalid shape")
-        if batch.robot_features.shape != (
-            batch_size,
-            ROBOT_FEATURE_DIM,
-        ):
-            raise ValueError("robot_features has an invalid shape")
-        if batch.module_features.ndim != 3:
-            raise ValueError("module_features must be a rank-3 tensor")
-        module_count = batch.module_features.shape[1]
-        if batch.module_features.shape != (
-            batch_size,
-            module_count,
-            MODULE_FEATURE_DIM,
-        ):
-            raise ValueError("module_features has an invalid feature dimension")
-
-        expected_shapes = {
-            "candidate_modules": (batch_size, wafer_count, module_count),
-            "candidate_process_times": (
-                batch_size,
-                wafer_count,
-                module_count,
-            ),
-            "wafer_locations": (batch_size, wafer_count, module_count),
-            "robot_location": (batch_size, module_count),
-            "robot_holds": (batch_size, wafer_count),
-            "wafer_valid": (batch_size, wafer_count),
-            "module_valid": (batch_size, module_count),
-            "action_mask": (
-                batch_size,
-                wafer_count + module_count,
-            ),
-        }
-        for name, shape in expected_shapes.items():
-            if getattr(batch, name).shape != shape:
+            if getattr(batch, name).shape != expected_shape:
                 raise ValueError(f"{name} has an invalid shape")
+        if torch.any(batch.action_mask & ~batch.action_valid):
+            raise ValueError("padded actions cannot be legal")
+        if set(batch.graph.node_types) != set(NODE_TYPES):
+            raise ValueError("graph has unexpected node types")
+        if set(batch.graph.edge_types) != set(EDGE_TYPES):
+            raise ValueError("graph has unexpected edge types")

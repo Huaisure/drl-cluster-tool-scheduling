@@ -11,7 +11,6 @@ from gymnasium import spaces
 
 from problem import (
     ClusterProblem,
-    ModuleType,
     TMArmType,
     WaferKey,
 )
@@ -63,13 +62,12 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self.problem = problem
 
         self._robot_ids = tuple(sorted(problem.ClusterTool))
-        self._lp_id = next(
-            module_id
-            for module_id, module in problem.Modules.items()
-            if module.type is ModuleType.LP
-        )
         snapshot = problem.initial_state.to_snapshot()
         self._wafer_keys = tuple(sorted(snapshot.wafers_by_key))
+        self._return_module_ids = tuple(
+            problem.return_module_id(snapshot.wafers_by_key[key])
+            for key in self._wafer_keys
+        )
         self._module_ids = tuple(sorted(problem.Modules))
         self._module_index = {
             module_id: index
@@ -159,6 +157,10 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         return self._module_ids
 
     @property
+    def return_module_ids(self) -> tuple[str, ...]:
+        return self._return_module_ids
+
+    @property
     def actions(self) -> tuple[Mapping[str, object], ...]:
         return tuple(MappingProxyType(action) for action in self._actions)
 
@@ -216,6 +218,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         if not self._action_mask()[action_index]:
             raise ValueError(f"action {action_index} is not allowed in the current state")
 
+        previous_time = self._time
         action_type, entity_index, robot_index = self._decode_action(action_index)
         if action_type == PICK:
             assert entity_index is not None and robot_index is not None
@@ -227,7 +230,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             self._advance()
 
         completed = self._complete()
-        reward = self._reward()
+        reward = self._reward(previous_time)
         info: dict[str, Any] = {"time": self._time}
         if completed:
             info.update(
@@ -239,10 +242,10 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         info["action_mask"] = observation["action_mask"]
         return observation, reward, completed, False, info
 
-    def _reward(self) -> float:
-        """Reward shaping is intentionally deferred to a later environment step."""
+    def _reward(self, previous_time: float) -> float:
+        """Charge elapsed physical time so an episode return is ``-makespan``."""
 
-        return 0.0
+        return previous_time - self._time
 
     def _observation(self) -> dict[str, Any]:
         robot_module = [robot.module_id for robot in self._robots]
@@ -396,7 +399,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         if next_step <= len(route.visits):
             return route.visits[next_step - 1].module_ids
         if next_step == len(route.visits) + 1:
-            return (self._lp_id,)
+            return (self._return_module_ids[wafer_index],)
         return ()
 
     def _can_achieve(self, robot_index: int, module_id: str | Iterable[str]) -> bool:
@@ -747,8 +750,12 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
     def _complete(self) -> bool:
         return all(
-            wafer.module_id == self._lp_id
+            wafer.module_id == return_module_id
             and wafer.step_index
             == len(self.problem.routes[key[0]].visits) + 1
-            for key, wafer in zip(self._wafer_keys, self._wafers)
+            for key, wafer, return_module_id in zip(
+                self._wafer_keys,
+                self._wafers,
+                self._return_module_ids,
+            )
         )

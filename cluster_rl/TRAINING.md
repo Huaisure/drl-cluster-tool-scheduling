@@ -1,49 +1,73 @@
-# PPO 训练
+# HGT + Transformer Decoder PPO 训练
 
-默认使用 `examples/scenarios/` 下的三个场景并行采样，训练实体 Token
-Transformer Actor-Critic。每个场景会先运行一次确定性的 first-legal
-参考调度，并使用以下归一化回报：
+模型以 `ClusterHeteroGraphBuilder` 生成的异构图作为唯一状态输入：
+
+1. HGT encoder 在 `global`、`wafer`、`route_step`、`module` 和 `robot`
+   节点及其异构关系上进行消息传递；
+2. Transformer decoder 为每个 `(wafer, robot)` Pick、`(module, robot)`
+   Place 和 `ADVANCE` 动作构造 query，并对 HGT 节点 memory 解码；
+3. Actor 输出与环境完全一致的
+   `((W + M) * R + 1)` 个 masked logits，Critic 从 global 节点输出状态价值。
+
+环境按物理时间增量返回奖励，因此成功 episode 的原始回报是 `-makespan`。
+PPO 使用 first-legal 调度的 makespan 进行归一化：
 
 ```text
-成功 episode 回报 = 1 - makespan / reference_makespan
+成功 episode 归一化回报 = 1 - makespan / reference_makespan
 ```
 
-参考策略的回报为 0，不同规模问题的回报处于相近范围。
+## 环境与启动
+
+PyTorch Geometric 安装在 Conda `rl` 环境中：
 
 ```bash
-python -m train --total-steps 100000
+conda activate rl
+python -m cluster_rl.train --total-steps 100000
 ```
 
-每次运行默认创建独立的时间戳目录：
+首次验证链路可以运行：
+
+```bash
+python -m cluster_rl.train \
+  --total-steps 384 \
+  --rollout-steps 128 \
+  --epochs 1 \
+  --hgt-layers 1 \
+  --num-layers 1 \
+  --model-dim 32 \
+  --feedforward-dim 64
+```
+
+`--hgt-layers` 控制 HGT encoder 深度，`--num-layers` 控制 Transformer
+decoder 深度。Apple Silicon 可添加 `--device mps`，NVIDIA GPU 可添加
+`--device cuda`；默认使用 CPU。
+
+## 输出与日志
+
+每次新训练默认创建独立时间戳目录：
 
 ```text
 runs/ppo_cluster_YYYYMMDD_HHMMSS/
 ├── checkpoint.pt
+├── config.json
+├── train.log
 ├── updates.csv
 ├── episodes.csv
 ├── evaluation.csv
 └── training_curves.png
 ```
 
-控制台会输出分场景 makespan、归一化回报、PPO 指标和最终对比表。训练曲线包括：
-
-- 各场景 makespan；
-- 各场景归一化回报；
-- Policy/Value loss；
-- Entropy 和 approximate KL。
-
-训练结束后会对三个场景执行 greedy rollout，并使用独立 Validator 检查动作序列。
+- `train.log` 保留完整控制台训练日志；
+- `updates.csv` 保存 PPO loss、entropy、KL、choice fraction 和梯度范数；
+- `episodes.csv` 保存分场景 makespan 与归一化回报；
+- `evaluation.csv` 保存训练结束后的 greedy rollout 结果；
+- `training_curves.png` 可视化 makespan、归一化回报、loss、entropy 和 KL；
+- greedy rollout 会通过独立 `ValidatorSuite` 检查动作序列。
 
 从 checkpoint 继续训练：
 
 ```bash
-python -m train \
+python -m cluster_rl.train \
   --resume runs/ppo_cluster_YYYYMMDD_HHMMSS/checkpoint.pt \
   --total-steps 200000
 ```
-
-由于网络输入和奖励定义已更新，旧版未归一化训练生成的 checkpoint
-不能继续使用，需要开始一次新的训练。
-
-Apple Silicon 可以添加 `--device mps`，NVIDIA GPU 可以添加
-`--device cuda`。默认使用 CPU，以获得最稳定的首次运行体验。

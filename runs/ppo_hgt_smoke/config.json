@@ -1,0 +1,31 @@
+{
+  "scenario_paths": [
+    "/Users/huaisure/workspace/cluster_tools_scheduling/rl/examples/scenarios/long_route_1w.json",
+    "/Users/huaisure/workspace/cluster_tools_scheduling/rl/examples/scenarios/mixed_3pm_20w.json",
+    "/Users/huaisure/workspace/cluster_tools_scheduling/rl/examples/scenarios/mixed_5pm_24w.json"
+  ],
+  "run_dir": "runs/ppo_hgt_smoke",
+  "checkpoint": "runs/ppo_hgt_smoke/checkpoint.pt",
+  "resume": null,
+  "total_steps": 1800,
+  "rollout_steps": 600,
+  "epochs": 1,
+  "minibatch_size": 256,
+  "learning_rate": 0.0003,
+  "gamma": 1.0,
+  "gae_lambda": 0.95,
+  "clip_coefficient": 0.2,
+  "value_coefficient": 0.5,
+  "entropy_coefficient": 0.01,
+  "max_grad_norm": 0.5,
+  "model_dim": 16,
+  "num_heads": 4,
+  "hgt_layers": 1,
+  "num_layers": 1,
+  "feedforward_dim": 32,
+  "seed": 0,
+  "device": "cpu",
+  "log_interval": 1,
+  "checkpoint_interval": 1,
+  "evaluate": true
+}

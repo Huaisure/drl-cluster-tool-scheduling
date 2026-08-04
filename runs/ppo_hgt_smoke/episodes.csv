@@ -1,0 +1,13 @@
+update,global_step,scenario,makespan,reference_makespan,normalized_cost,normalized_return,reward,success
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,mixed_3pm_20w,406.0,323.0,1.256965944272446,-0.2569659442724459,-406.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True
+1,1800,long_route_1w,61.0,61.0,1.0,0.0,-61.0,True

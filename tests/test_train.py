@@ -65,4 +65,8 @@ def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
     assert summary["checkpoint"] == str(checkpoint)
     assert checkpoint.is_file()
     assert (run_dir / "updates.csv").is_file()
+    assert (run_dir / "episodes.csv").is_file()
+    assert (run_dir / "evaluation.csv").is_file()
+    assert (run_dir / "config.json").is_file()
+    assert "Masked PPO training" in (run_dir / "train.log").read_text()
     assert (run_dir / "training_curves.png").is_file()

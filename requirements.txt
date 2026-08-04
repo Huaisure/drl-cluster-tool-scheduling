@@ -4,3 +4,4 @@ numpy>=1.26,<3
 pydantic>=2,<3
 pytest>=8,<10
 torch>=2,<3
+torch-geometric>=2.8,<3
