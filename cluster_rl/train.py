@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -21,7 +22,6 @@ from torch.distributions import Categorical
 from cluster_rl.cluster_env import ClusterEnv
 from examples.run_scenarios import (
     SCENARIO_DIR,
-    first_legal_action,
     network_greedy_selector,
     rollout,
 )
@@ -81,6 +81,7 @@ class PPOConfig:
     train_mode: Literal["scenarios", "generator"] = "scenarios"
     num_envs: int = 8
     generator_seed: int = 42
+    generator_max_attempts: int = 64
     difficulty_weights: dict[str, float] = field(
         default_factory=lambda: {
             "easy": 0.20,
@@ -127,6 +128,7 @@ class PPOConfig:
         }
         if self.train_mode == "generator":
             positive_integers["num_envs"] = self.num_envs
+            positive_integers["generator_max_attempts"] = self.generator_max_attempts
         for name, value in positive_integers.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -191,6 +193,7 @@ class EnvSlot:
     encoder: ClusterObservationEncoder
     observation: dict[str, Any]
     reference_makespan: float
+    problem_seed: int
     episode_index: int = 0
     episode_reward: float = 0.0
 
@@ -220,6 +223,7 @@ class GeneratorEnvFactory:
             seed=self.episode_seed(slot_index, episode_index),
             episode_index=episode_index,
             difficulty_weights=self.config.difficulty_weights,
+            max_attempts=self.config.generator_max_attempts,
         )
 
 
@@ -264,13 +268,69 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
+def _fifo_serial_action(
+    env: ClusterEnv,
+    observation: dict[str, Any],
+) -> int:
+    legal_actions = np.flatnonzero(observation["action_mask"])
+    if not len(legal_actions):
+        raise RuntimeError("FIFO serial reference reached a deadlock")
+
+    robot_count = len(env._robot_ids)
+    pick_action_count = len(env.wafer_keys) * robot_count
+    advance_action = env.action_space.n - 1
+    active_wafers = [
+        wafer_index
+        for wafer_index, wafer in enumerate(env._wafers)
+        if env._is_pick_reserved(wafer_index)
+        or wafer.module_id is None
+        or 0 < wafer.step_index < (
+            len(env.problem.routes[env.wafer_keys[wafer_index][0]].visits) + 1
+        )
+    ]
+    if active_wafers:
+        wafer_index = min(active_wafers)
+        wafer_pick_actions = legal_actions[
+            (legal_actions >= wafer_index * robot_count)
+            & (legal_actions < (wafer_index + 1) * robot_count)
+        ]
+        if len(wafer_pick_actions):
+            return int(wafer_pick_actions[0])
+
+        place_actions = legal_actions[
+            (legal_actions >= pick_action_count)
+            & (legal_actions < advance_action)
+        ]
+        if len(place_actions):
+            return int(place_actions[0])
+        if advance_action in legal_actions:
+            return advance_action
+        raise RuntimeError("FIFO serial reference cannot advance the active wafer")
+
+    pick_actions = legal_actions[legal_actions < pick_action_count]
+    if len(pick_actions):
+        return int(pick_actions[0])
+    if advance_action in legal_actions:
+        return advance_action
+    raise RuntimeError("FIFO serial reference has no legal Pick")
+
+
 def _first_legal_reference(problem: ClusterProblem, scenario: str) -> float:
     return rollout(
         ClusterEnv(problem),
         scenario,
-        "reference_first_legal",
-        first_legal_action,
+        "reference_fifo_serial",
+        _fifo_serial_action,
     ).makespan
+
+
+def _retry_seed(seed: int, attempt: int) -> int:
+    if attempt == 0:
+        return seed
+    digest = hashlib.sha256(
+        f"cluster-rl:{seed}:{attempt}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
 
 
 def make_env_slot(
@@ -279,27 +339,41 @@ def make_env_slot(
     seed: int,
     episode_index: int = 0,
     difficulty_weights: Mapping[str, float] | None = None,
+    max_attempts: int = 64,
 ) -> EnvSlot:
-    problem = generator.sample_curriculum(
-        seed=seed,
-        split="train",
-        weights=(
-            None
-            if difficulty_weights is None
-            else dict(difficulty_weights)
-        ),
-    )
-    scenario = str(problem.meta.get("name", f"generated_{seed}"))
-    env = ClusterEnv(problem)
-    encoder = ClusterObservationEncoder.from_env(env)
-    observation, _ = env.reset(seed=seed)
-    return EnvSlot(
-        env=env,
-        encoder=encoder,
-        observation=observation,
-        reference_makespan=_first_legal_reference(problem, scenario),
-        episode_index=episode_index,
-    )
+    last_error: RuntimeError | IndexError | None = None
+    for attempt in range(max_attempts):
+        problem_seed = _retry_seed(seed, attempt)
+        problem = generator.sample_curriculum(
+            seed=problem_seed,
+            split="train",
+            weights=(
+                None
+                if difficulty_weights is None
+                else dict(difficulty_weights)
+            ),
+        )
+        scenario = str(problem.meta.get("name", f"generated_{problem_seed}"))
+        try:
+            reference_makespan = _first_legal_reference(problem, scenario)
+        except (RuntimeError, IndexError) as exc:
+            last_error = exc
+            continue
+
+        env = ClusterEnv(problem)
+        encoder = ClusterObservationEncoder.from_env(env)
+        observation, _ = env.reset(seed=problem_seed)
+        return EnvSlot(
+            env=env,
+            encoder=encoder,
+            observation=observation,
+            reference_makespan=reference_makespan,
+            problem_seed=problem_seed,
+            episode_index=episode_index,
+        )
+    raise RuntimeError(
+        f"failed to generate a FIFO-compatible problem after {max_attempts} attempts"
+    ) from last_error
 
 
 def _reference_makespans(
@@ -328,6 +402,7 @@ def _fixed_env_slots(
                 encoder=ClusterObservationEncoder.from_env(env),
                 observation=env.reset(seed=seed + index)[0],
                 reference_makespan=reference,
+                problem_seed=seed + index,
             )
         )
     return slots
@@ -1277,6 +1352,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--generator-seed", type=int, default=42)
+    parser.add_argument("--generator-max-attempts", type=int, default=64)
     parser.add_argument("--validation-manifest", type=Path)
     parser.add_argument("--test-manifest", type=Path)
     parser.add_argument("--run-dir", type=Path)
@@ -1326,6 +1402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_mode=args.train_mode,
         num_envs=args.num_envs,
         generator_seed=args.generator_seed,
+        generator_max_attempts=args.generator_max_attempts,
         validation_manifest=args.validation_manifest,
         test_manifest=args.test_manifest,
         run_dir=run_dir,

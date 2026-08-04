@@ -155,6 +155,8 @@ def _decoded_result(
     total_reward: float,
     info: Mapping[str, object],
 ) -> _Evaluation:
+    if not info.get("is_success"):
+        return _failed_result(env, total_reward)
     return _Evaluation(
         cost=-total_reward,
         success=bool(info.get("is_success")),

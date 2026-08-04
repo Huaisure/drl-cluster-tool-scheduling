@@ -103,6 +103,68 @@ def test_advance_applies_pick_and_place_boundaries() -> None:
     assert not env._advance()
 
 
+def test_step_truncates_when_fifo_state_is_deadlocked() -> None:
+    problem = parse_problem(
+        {
+            "Modules": {
+                "LP": {"type": "LP"},
+                "PM1": {"type": "PM"},
+                "PM2": {"type": "PM"},
+            },
+            "ClusterTool": {
+                "TM1": {
+                    "module_ids": ["LP", "PM1", "PM2"],
+                    "arm_type": "single_arm",
+                    "travel_times": 1,
+                    "pick_time": 1,
+                    "place_time": 1,
+                }
+            },
+            "routes": {
+                "A": [
+                    {"module_id": "PM1", "process_time": 1},
+                    {"module_id": "PM2", "process_time": 0},
+                ],
+                "B": [
+                    {"module_id": "PM2", "process_time": 1},
+                    {"module_id": "PM1", "process_time": 0},
+                ],
+            },
+            "initial_state": {
+                "wafers": [
+                    {
+                        "route_id": "A",
+                        "wafer_index": "0",
+                        "step_index": 1,
+                        "location": {"kind": "module", "module_id": "PM1"},
+                        "process_end_time": 1,
+                    },
+                    {
+                        "route_id": "B",
+                        "wafer_index": "0",
+                        "step_index": 1,
+                        "location": {"kind": "module", "module_id": "PM2"},
+                        "process_end_time": 1,
+                    },
+                ]
+            },
+        }
+    )
+    env = ClusterEnv(problem)
+    observation, _ = env.reset()
+    advance_action = env.action_space.n - 1
+
+    assert observation["action_mask"].tolist() == [0] * advance_action + [1]
+
+    observation, _, terminated, truncated, info = env.step(advance_action)
+
+    assert not terminated
+    assert truncated
+    assert not observation["action_mask"].any()
+    assert info["is_success"] is False
+    assert info["reason"] == "deadlock"
+
+
 def test_observation_exposes_robot_holding_and_pending_operation() -> None:
     env = ClusterEnv(_problem())
     observation, _ = env.reset()

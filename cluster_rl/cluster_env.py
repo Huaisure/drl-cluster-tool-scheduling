@@ -239,8 +239,14 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             )
 
         observation = self._observation()
+        deadlocked = not completed and not observation["action_mask"].any()
+        if deadlocked:
+            info.update(
+                is_success=False,
+                reason="deadlock",
+            )
         info["action_mask"] = observation["action_mask"]
-        return observation, reward, completed, False, info
+        return observation, reward, completed, deadlocked, info
 
     def _reward(self, previous_time: float) -> float:
         """Charge elapsed physical time so an episode return is ``-makespan``."""

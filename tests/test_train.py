@@ -6,6 +6,7 @@ import json
 import pytest
 import torch
 
+from cluster_generator import ProblemGenerator
 from examples.run_scenarios import SCENARIO_DIR
 from cluster_rl.network import ClusterActorCritic, TransformerConfig
 from cluster_rl.train import (
@@ -14,6 +15,7 @@ from cluster_rl.train import (
     _advantages,
     _collect_rollout,
     _evaluation_problems,
+    _first_legal_reference,
     _manifest_problem_paths,
     _normalized_reward,
     train,
@@ -58,6 +60,13 @@ def test_normalized_reward_centers_reference_schedule_at_zero() -> None:
     ]
 
     assert sum(normalized) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("seed", [43, 49])
+def test_fifo_serial_reference_completes_previous_deadlock_seeds(seed: int) -> None:
+    problem = ProblemGenerator().sample_curriculum(seed=seed, split="train")
+
+    assert _first_legal_reference(problem, f"seed_{seed}") > 0
 
 
 def test_generator_factory_uses_disjoint_deterministic_episode_seeds() -> None:

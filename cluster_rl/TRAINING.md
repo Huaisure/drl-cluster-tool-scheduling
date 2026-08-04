@@ -39,7 +39,7 @@ python -m cluster_rl.train \
 
 每个环境槽位在 episode 结束后都会用新的确定性种子生成完整实例，并同步替换
 `ClusterEnv`、观察编码器和初始观察。训练参考值由 RL 环境的 FIFO-aware
-`first_legal` rollout 计算；工具包 manifest 中的启发式 actions 不作为 RL 基线。
+逐片串行 `first_legal` rollout 计算；工具包 manifest 中的启发式 actions 不作为RL基线。
 训练结束后的 greedy evaluation 只读取固定 validation/test manifest。
 
 首次验证链路可以运行：
