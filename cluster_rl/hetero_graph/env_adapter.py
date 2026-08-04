@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from cluster_rl.cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ADVANCE, PICK, PLACE, ClusterEnv
 
 from .builder import ClusterHeteroGraphBuilder, MODULE, WAFER
 from .schema import HeteroGraph
@@ -11,12 +11,14 @@ from .schema import HeteroGraph
 
 @dataclass(frozen=True, slots=True)
 class ActionRef:
-    """Semantic view of an integer environment action."""
+    """Semantic view of a flat environment action."""
 
-    kind: Literal["pick", "place"]
-    entity_type: str
-    entity_index: int
-    entity_id: object
+    kind: Literal["pick", "place", "advance"]
+    entity_type: str | None
+    entity_index: int | None
+    entity_id: object | None
+    robot_index: int | None
+    robot_id: str | None
 
 
 class GraphEnvAdapter:
@@ -43,7 +45,7 @@ class GraphEnvAdapter:
     def reset(self, **kwargs: Any) -> tuple[HeteroGraph, dict[str, Any]]:
         observation, info = self.env.reset(**kwargs)
         self.raw_observation = observation
-        return self.builder.build(observation, info), info
+        return self.builder.build(observation), info
 
     def step(
         self,
@@ -51,41 +53,68 @@ class GraphEnvAdapter:
     ) -> tuple[HeteroGraph, float, bool, bool, dict[str, Any]]:
         observation, reward, terminated, truncated, info = self.env.step(action)
         self.raw_observation = observation
-        graph = self.builder.build(observation, info)
+        graph = self.builder.build(observation)
         return graph, reward, terminated, truncated, info
 
     def decode_action(self, action: int) -> ActionRef:
-        """Map Env's integer action back to the graph entity it selects."""
+        """Map an Env action back to the selected entity and robot."""
 
         if not self.action_space.contains(action):
             raise ValueError(f"action {action!r} is outside the action space")
-        wafer_count = len(self.env.wafer_keys)
-        if action < wafer_count:
+        kind, entity_index, robot_index = self.env._decode_action(int(action))
+        if kind == ADVANCE:
+            return ActionRef(ADVANCE, None, None, None, None, None)
+
+        assert entity_index is not None and robot_index is not None
+        robot_id = self.builder.robot_ids[robot_index]
+        if kind == PICK:
             return ActionRef(
-                kind="pick",
+                kind=PICK,
                 entity_type=WAFER,
-                entity_index=action,
-                entity_id=self.env.wafer_keys[action],
+                entity_index=entity_index,
+                entity_id=self.env.wafer_keys[entity_index],
+                robot_index=robot_index,
+                robot_id=robot_id,
             )
 
-        module_index = action - wafer_count
         return ActionRef(
-            kind="place",
+            kind=PLACE,
             entity_type=MODULE,
-            entity_index=module_index,
-            entity_id=self.env.module_ids[module_index],
+            entity_index=entity_index,
+            entity_id=self.env.module_ids[entity_index],
+            robot_index=robot_index,
+            robot_id=robot_id,
         )
 
     def encode_action(
         self,
-        kind: Literal["pick", "place"],
-        entity_index: int,
+        kind: Literal["pick", "place", "advance"],
+        entity_index: int | None = None,
+        robot_index: int | None = None,
     ) -> int:
-        """Map a wafer/module node index to Env's integer action."""
+        """Map graph entity and robot indexes to an Env action."""
 
-        count = len(self.env.wafer_keys) if kind == "pick" else len(self.env.module_ids)
+        if kind == ADVANCE:
+            if entity_index is not None or robot_index is not None:
+                raise ValueError("advance does not select an entity or robot")
+            return int(self.action_space.n) - 1
+        if kind not in {PICK, PLACE}:
+            raise ValueError(f"unknown action kind: {kind!r}")
+        if entity_index is None or robot_index is None:
+            raise ValueError(f"{kind} requires entity_index and robot_index")
+
+        count = (
+            len(self.env.wafer_keys)
+            if kind == PICK
+            else len(self.env.module_ids)
+        )
         if not 0 <= entity_index < count:
             raise ValueError(f"{kind} entity_index is outside the graph")
-        if kind == "pick":
-            return entity_index
-        return len(self.env.wafer_keys) + entity_index
+        if not 0 <= robot_index < len(self.builder.robot_ids):
+            raise ValueError("robot_index is outside the graph")
+        entity_action = (
+            entity_index
+            if kind == PICK
+            else len(self.env.wafer_keys) + entity_index
+        )
+        return entity_action * len(self.builder.robot_ids) + robot_index

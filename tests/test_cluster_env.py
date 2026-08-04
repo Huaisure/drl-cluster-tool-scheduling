@@ -70,7 +70,12 @@ def _problem(**kwargs):
 
 
 def _place_action(env: ClusterEnv, module_id: str) -> int:
-    return len(env.wafer_keys) + env.module_ids.index(module_id)
+    entity_index = len(env.wafer_keys) + env.module_ids.index(module_id)
+    return entity_index * len(env._robot_ids)
+
+
+def _advance_action(env: ClusterEnv) -> int:
+    return int(env.action_space.n) - 1
 
 
 def test_reset_exposes_stable_spaces_and_only_pick_actions() -> None:
@@ -80,53 +85,53 @@ def test_reset_exposes_stable_spaces_and_only_pick_actions() -> None:
 
     assert env.wafer_keys == (("A", 0), ("A", 1))
     assert env.module_ids == ("LP", "PM1", "PM2")
-    assert env.action_space.n == len(env.wafer_keys) + len(env.module_ids)
+    assert env.action_space.n == len(env.wafer_keys) + len(env.module_ids) + 1
     assert env.observation_space.contains(observation)
     assert observation["action_mask"].shape == (env.action_space.n,)
-    assert observation["action_mask"].tolist() == [1, 1, 0, 0, 0]
-    assert observation["robot_module"] == len(env.module_ids)
+    assert observation["action_mask"].tolist() == [1, 0, 0, 0, 0, 0]
+    assert observation["robot_loc"].tolist() == [len(env.module_ids)]
     assert info == {"time": 0.0}
     assert env.actions == ()
 
 
-def test_pick_place_timing_wait_and_success_reward_match_makespan() -> None:
+def test_action_decode_and_explicit_advance_boundaries() -> None:
     problem = _problem(robot_position="PM2")
     env = ClusterEnv(problem)
     observation, _ = env.reset()
-    total_reward = 0.0
+
+    assert env._decode_action(0) == ("pick", 0, 0)
+    assert env._decode_action(_place_action(env, "PM1")) == (
+        "place",
+        env.module_ids.index("PM1"),
+        0,
+    )
+    assert env._decode_action(_advance_action(env)) == (
+        "advance",
+        None,
+        None,
+    )
 
     observation, reward, terminated, truncated, info = env.step(0)
-    total_reward += reward
     assert not terminated and not truncated
-    assert info["time"] == 3.0
-    assert observation["action_mask"].tolist() == [0, 0, 1, 1]
+    assert reward == 0.0
+    assert info["time"] == 0.0
+    assert np.flatnonzero(observation["action_mask"]).tolist() == [
+        _advance_action(env)
+    ]
     assert env.actions[0]["action_type"] == "pick"
     assert (env.actions[0]["start"], env.actions[0]["end"]) == (2.0, 3.0)
 
-    observation, reward, terminated, _, info = env.step(
-        _place_action(env, "PM1")
-    )
-    total_reward += reward
-    assert not terminated
-    assert info["time"] == 11.5
-    assert observation["action_mask"].tolist() == [1, 0, 0, 0]
-    assert env.actions[1]["action_type"] == "place"
-    assert (env.actions[1]["start"], env.actions[1]["end"]) == (5.0, 6.5)
+    observation, *_ = env.step(_advance_action(env))
+    assert info["time"] == 0.0
+    assert env._time == 2.0
+    assert env._robots[0].holding == [0]
+    assert np.flatnonzero(observation["action_mask"]).tolist() == [
+        _advance_action(env)
+    ]
 
-    _, reward, _, _, _ = env.step(0)
-    total_reward += reward
-    observation, reward, terminated, truncated, info = env.step(
-        _place_action(env, "LP")
-    )
-    total_reward += reward
-
-    assert terminated and not truncated
-    assert info == {"time": 16.0, "is_success": True, "reason": "completed"}
-    assert total_reward == -16.0
-    assert not observation["action_mask"].any()
-    assert ValidatorSuite(problem).validate(env.actions).ok
-    with pytest.raises(TypeError):
-        env.actions[0]["start"] = 0
+    observation, *_ = env.step(_advance_action(env))
+    assert env._time == 3.0
+    assert observation["action_mask"][_place_action(env, "PM1")]
 
 
 def test_invalid_action_raises_without_changing_state() -> None:
@@ -138,19 +143,9 @@ def test_invalid_action_raises_without_changing_state() -> None:
 
     after, _, _, _, info = env.step(0)
     assert env.actions[0]["start"] == 0.0
-    assert info["time"] == 1.0
+    assert info["time"] == 0.0
     assert before["wafer_step"].tolist() == after["wafer_step"].tolist()
-
-
-def test_capacity_and_remaining_process_time_are_derived() -> None:
-    env = ClusterEnv(_problem(wafer_routes=("A", "A")))
-    observation, _ = env.reset()
-
-    observation, *_ = env.step(0)
-    observation, *_ = env.step(_place_action(env, "PM1"))
-
-    assert observation["process_remaining"].tolist() == [5.0, 0.0]
-    assert observation["action_mask"].tolist() == [0, 1, 0, 0, 0]
+    assert len(env.actions) == 1
 
 
 def test_repeated_pm_route_can_release_then_reoccupy_the_same_module() -> None:
@@ -165,55 +160,34 @@ def test_repeated_pm_route_can_release_then_reoccupy_the_same_module() -> None:
     env = ClusterEnv(problem)
     observation, _ = env.reset()
 
-    for action in (
-        0,
-        _place_action(env, "PM1"),
-        0,
-        _place_action(env, "PM1"),
-        0,
-        _place_action(env, "LP"),
-    ):
+    transport_actions = iter(
+        (
+            0,
+            _place_action(env, "PM1"),
+            0,
+            _place_action(env, "PM1"),
+            0,
+            _place_action(env, "LP"),
+        )
+    )
+    next_transport = next(transport_actions)
+    terminated = False
+    for _ in range(30):
+        action = (
+            next_transport
+            if next_transport >= 0
+            and observation["action_mask"][next_transport]
+            else _advance_action(env)
+        )
         assert observation["action_mask"][action]
         observation, _, terminated, _, _ = env.step(action)
+        if action == next_transport:
+            next_transport = next(transport_actions, -1)
+        if terminated:
+            break
 
     assert terminated
     assert ValidatorSuite(problem).validate(env.actions).ok
-
-
-def test_crossing_routes_end_as_a_penalized_deadlock() -> None:
-    problem = _problem(
-        routes={
-            "A": [
-                {"module_id": "PM1", "process_time": 0},
-                {"module_id": "PM2", "process_time": 0},
-            ],
-            "B": [
-                {"module_id": "PM2", "process_time": 0},
-                {"module_id": "PM1", "process_time": 0},
-            ],
-        },
-        wafer_routes=("A", "B"),
-    )
-    env = ClusterEnv(problem)
-    observation, _ = env.reset()
-    total_reward = 0.0
-
-    for action in (
-        0,
-        _place_action(env, "PM1"),
-        1,
-        _place_action(env, "PM2"),
-    ):
-        assert observation["action_mask"][action]
-        observation, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-
-    assert terminated and not truncated
-    assert not info["is_success"]
-    assert info["reason"] == "deadlock"
-    assert total_reward == -info["failure_cost"]
-    assert total_reward < -info["time"]
-    assert not observation["action_mask"].any()
 
 
 def test_masked_random_episode_finishes_with_a_valid_schedule() -> None:
@@ -221,19 +195,17 @@ def test_masked_random_episode_finishes_with_a_valid_schedule() -> None:
     env = ClusterEnv(problem)
     observation, _ = env.reset(seed=11)
     rng = np.random.default_rng(11)
-    total_reward = 0.0
 
-    for _ in range(20):
+    for _ in range(100):
         legal_actions = np.flatnonzero(observation["action_mask"])
         action = int(rng.choice(legal_actions))
         observation, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
+        assert reward == 0.0
         if terminated or truncated:
             break
 
     assert terminated and not truncated
     assert info["is_success"]
-    assert total_reward == -info["time"]
     assert ValidatorSuite(problem).validate(env.actions).ok
 
 
@@ -250,59 +222,15 @@ def test_ignored_constraints_do_not_enter_environment_state() -> None:
 
     observation, _ = env.reset()
     assert set(observation) == {
-        "wafer_module",
+        "wafer_loc",
         "wafer_step",
         "process_remaining",
-        "robot_module",
+        "robot_loc",
+        "robot_holding",
+        "robot_phase",
+        "robot_operation_wafer",
+        "robot_operation_module",
+        "time_to_operation_start",
+        "time_to_operation_end",
         "action_mask",
     }
-
-
-@pytest.mark.parametrize(
-    ("change", "message"),
-    [
-        (
-            lambda raw: raw["ClusterTool"].update(
-                {
-                    "TM2": {
-                        "module_ids": ["LP"],
-                        "arm_type": "single_arm",
-                        "pick_time": 1,
-                        "place_time": 1,
-                    }
-                }
-            ),
-            "exactly one TM",
-        ),
-        (
-            lambda raw: raw["ClusterTool"]["TM1"].update(
-                {"arm_type": "dual_arm"}
-            ),
-            "single-arm",
-        ),
-        (
-            lambda raw: raw["Modules"].update({"LL1": {"type": "LL"}}),
-            "only LP and PM",
-        ),
-        (
-            lambda raw: raw["Modules"].update({"LP2": {"type": "LP"}}),
-            "exactly one LP",
-        ),
-        (
-            lambda raw: raw["ClusterTool"]["TM1"].update(
-                {"module_ids": ["LP", "PM1"]}
-            ),
-            "cannot reach modules",
-        ),
-        (
-            lambda raw: raw["initial_state"].update({"wafers": []}),
-            "at least one wafer",
-        ),
-    ],
-)
-def test_unsupported_problem_shapes_fail_fast(change, message: str) -> None:
-    raw = _raw_problem()
-    change(raw)
-
-    with pytest.raises(ValueError, match=message):
-        ClusterEnv(parse_problem(raw))

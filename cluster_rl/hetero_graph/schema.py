@@ -36,21 +36,12 @@ class EdgeStore:
     """Directed edges of one relation type."""
 
     edge_index: NDArray[np.int64]
-    features: NDArray[np.float32]
-    feature_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         edge_index = np.asarray(self.edge_index, dtype=np.int64)
-        features = np.asarray(self.features, dtype=np.float32)
         if edge_index.ndim != 2 or edge_index.shape[0] != 2:
             raise ValueError("edge_index must have shape [2, edge]")
-        if features.shape != (
-            edge_index.shape[1],
-            len(self.feature_names),
-        ):
-            raise ValueError("edge feature shape must match edges and feature_names")
         object.__setattr__(self, "edge_index", edge_index)
-        object.__setattr__(self, "features", features)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,17 +50,21 @@ class HeteroGraph:
 
     nodes: dict[str, NodeStore]
     edges: dict[EdgeType, EdgeStore]
-    graph_features: NDArray[np.float32]
-    graph_feature_names: tuple[str, ...]
     action_mask: NDArray[np.bool_]
+    can_advance: bool
 
     def __post_init__(self) -> None:
-        graph_features = np.asarray(self.graph_features, dtype=np.float32)
         action_mask = np.asarray(self.action_mask, dtype=np.bool_)
-        if graph_features.shape != (len(self.graph_feature_names),):
-            raise ValueError("graph feature shape must match graph_feature_names")
-        if action_mask.ndim != 1:
-            raise ValueError("action_mask must be one-dimensional")
+        wafer_nodes = self.nodes.get("wafer")
+        module_nodes = self.nodes.get("module")
+        robot_nodes = self.nodes.get("robot")
+        expected_action_shape = (
+            (len(wafer_nodes.ids) if wafer_nodes is not None else 0)
+            + (len(module_nodes.ids) if module_nodes is not None else 0),
+            len(robot_nodes.ids) if robot_nodes is not None else 0,
+        )
+        if action_mask.shape != expected_action_shape:
+            raise ValueError("action_mask must have shape [entity action, robot]")
 
         for (source_type, _, target_type), edge_store in self.edges.items():
             if source_type not in self.nodes or target_type not in self.nodes:
@@ -78,8 +73,16 @@ class HeteroGraph:
                 continue
             source_count = len(self.nodes[source_type].ids)
             target_count = len(self.nodes[target_type].ids)
-            if edge_store.edge_index[0].min() < 0 or edge_store.edge_index[0].max() >= source_count or edge_store.edge_index[1].min() < 0 or edge_store.edge_index[1].max() >= target_count:
+            invalid_source = (
+                edge_store.edge_index[0].min() < 0
+                or edge_store.edge_index[0].max() >= source_count
+            )
+            invalid_target = (
+                edge_store.edge_index[1].min() < 0
+                or edge_store.edge_index[1].max() >= target_count
+            )
+            if invalid_source or invalid_target:
                 raise ValueError("edge_index contains an invalid node index")
 
-        object.__setattr__(self, "graph_features", graph_features)
         object.__setattr__(self, "action_mask", action_mask)
+        object.__setattr__(self, "can_advance", bool(self.can_advance))

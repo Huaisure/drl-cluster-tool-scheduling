@@ -1,36 +1,78 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 
-from problem import ClusterProblem, ModuleType, TMArmType, WaferKey
+from cluster_rl.cluster_env import RobotPhase
+from problem import ClusterProblem, ModuleType, RouteVisit, TMArmType, WaferKey
 
+from .feature_schema import (
+    GLOBAL_FEATURE_NAMES,
+    MODULE_FEATURE_NAMES,
+    ROBOT_FEATURE_NAMES,
+    ROUTE_STEP_FEATURE_NAMES,
+    TIME_SCALE_SECONDS,
+    WAFER_FEATURE_NAMES,
+)
 from .schema import EdgeStore, EdgeType, HeteroGraph, NodeStore
 
+RouteStepKey: TypeAlias = tuple[str, int]
+
+GLOBAL = "global"
 WAFER = "wafer"
+ROUTE_STEP = "route_step"
 MODULE = "module"
 ROBOT = "robot"
 
 LOCATED_IN: EdgeType = (WAFER, "located_in", MODULE)
+CONTAINS: EdgeType = (MODULE, "contains", WAFER)
 HELD_BY: EdgeType = (WAFER, "held_by", ROBOT)
-CAN_MOVE_TO: EdgeType = (WAFER, "can_move_to", MODULE)
+HOLDS: EdgeType = (ROBOT, "holds", WAFER)
+AT_STEP: EdgeType = (WAFER, "at_step", ROUTE_STEP)
+CURRENT_FOR: EdgeType = (ROUTE_STEP, "current_for", WAFER)
+NEXT_STEP: EdgeType = (WAFER, "next_step", ROUTE_STEP)
+NEXT_FOR: EdgeType = (ROUTE_STEP, "next_for", WAFER)
+CAN_RUN_ON: EdgeType = (ROUTE_STEP, "can_run_on", MODULE)
+SUPPORTS_STEP: EdgeType = (MODULE, "supports_step", ROUTE_STEP)
+PRECEDES: EdgeType = (ROUTE_STEP, "precedes", ROUTE_STEP)
+FOLLOWS: EdgeType = (ROUTE_STEP, "follows", ROUTE_STEP)
 CAN_ACCESS: EdgeType = (ROBOT, "can_access", MODULE)
+ACCESSIBLE_BY: EdgeType = (MODULE, "accessible_by", ROBOT)
+LOCATED_AT: EdgeType = (ROBOT, "located_at", MODULE)
+HAS_ROBOT: EdgeType = (MODULE, "has_robot", ROBOT)
+OPERATES_ON: EdgeType = (ROBOT, "operates_on", WAFER)
+OPERATION_OF: EdgeType = (WAFER, "operation_of", ROBOT)
+OPERATION_AT: EdgeType = (ROBOT, "operation_at", MODULE)
+HAS_OPERATION: EdgeType = (MODULE, "has_operation", ROBOT)
 
 
-def _edge_index(edges: list[tuple[int, int]]) -> np.ndarray:
-    if not edges:
-        return np.empty((2, 0), dtype=np.int64)
-    return np.asarray(edges, dtype=np.int64).T
+def _edge_store(edges: list[tuple[int, int]]) -> EdgeStore:
+    edge_index = (
+        np.asarray(edges, dtype=np.int64).T
+        if edges
+        else np.empty((2, 0), dtype=np.int64)
+    )
+    return EdgeStore(edge_index=edge_index)
+
+
+def _reverse(edges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    return [(target, source) for source, target in edges]
 
 
 class ClusterHeteroGraphBuilder:
-    """Build a graph snapshot from one ``ClusterEnv`` observation.
+    """Build one heterogeneous graph from a ``ClusterEnv`` observation.
 
-    This class is the main extension point. The default features and relations
-    are intentionally small examples; replace the ``_build_*`` methods as the
-    graph design evolves.
+    Location indexes follow the environment contract:
+
+    - ``wafer_loc`` uses modules first, followed by robots;
+    - ``robot_loc`` uses module indexes and ``module_count`` for unknown;
+    - ``action_mask`` is flat in entity-major order and ends with ADVANCE;
+    - graph transport actions use shape ``[wafer_count + module_count, robot_count]``.
+
+    A route with ``N`` visits owns route-step nodes ``1..N+1``. The last node
+    is a synthetic zero-time step for the wafer's final return to LP.
     """
 
     def __init__(
@@ -42,15 +84,46 @@ class ClusterHeteroGraphBuilder:
         self.problem = problem
         self.wafer_keys = tuple(wafer_keys)
         self.module_ids = tuple(module_ids)
-        self.robot_ids = tuple(problem.ClusterTool)
-        self._module_index = {module_id: index for index, module_id in enumerate(self.module_ids)}
-        self._robot_index = {robot_id: index for index, robot_id in enumerate(self.robot_ids)}
-        self._lp_id = next(module_id for module_id in self.module_ids if problem.Modules[module_id].type is ModuleType.LP)
+        self.robot_ids = tuple(sorted(problem.ClusterTool))
+        self._max_arm_capacity = max(
+            1 if robot.arm_type is TMArmType.SINGLE_ARM else 2
+            for robot in problem.ClusterTool.values()
+        )
 
         if set(self.module_ids) != set(problem.Modules):
             raise ValueError("module_ids must match problem.Modules")
-        if set(self.wafer_keys) != set(problem.initial_state.to_snapshot().wafers_by_key):
+        if set(self.wafer_keys) != set(
+            problem.initial_state.to_snapshot().wafers_by_key
+        ):
             raise ValueError("wafer_keys must match the initial wafers")
+
+        self.route_step_ids: tuple[RouteStepKey, ...] = tuple(
+            (route_id, step)
+            for route_id in sorted(problem.routes)
+            for step in range(1, len(problem.routes[route_id].visits) + 2)
+        )
+        self._module_index = {
+            module_id: index
+            for index, module_id in enumerate(self.module_ids)
+        }
+        self._robot_index = {
+            robot_id: index
+            for index, robot_id in enumerate(self.robot_ids)
+        }
+        self._route_step_index = {
+            route_step: index
+            for index, route_step in enumerate(self.route_step_ids)
+        }
+        self._lp_id = next(
+            module_id
+            for module_id in self.module_ids
+            if problem.Modules[module_id].type is ModuleType.LP
+        )
+        self._total_process_time = sum(
+            visit.process_time or 0.0
+            for route_id, _ in self.wafer_keys
+            for visit in problem.routes[route_id].visits
+        )
 
     @classmethod
     def from_env(cls, env: Any) -> ClusterHeteroGraphBuilder:
@@ -59,191 +132,521 @@ class ClusterHeteroGraphBuilder:
     def build(
         self,
         observation: Mapping[str, Any],
-        info: Mapping[str, Any] | None = None,
     ) -> HeteroGraph:
-        """Create one graph for the current decision state."""
-
-        wafer_module = np.asarray(observation["wafer_module"], dtype=np.int64)
+        wafer_loc = np.asarray(observation["wafer_loc"], dtype=np.int64)
         wafer_step = np.asarray(observation["wafer_step"], dtype=np.int64)
-        process_remaining = np.asarray(observation["process_remaining"], dtype=np.float32)
-        action_mask = np.asarray(observation["action_mask"], dtype=np.bool_)
-        robot_module = int(observation["robot_module"])
-        self._validate_observation(
-            wafer_module,
-            wafer_step,
-            process_remaining,
-            action_mask,
-            robot_module,
+        process_remaining = np.asarray(
+            observation["process_remaining"], dtype=np.float32
+        )
+        robot_loc = np.asarray(observation["robot_loc"], dtype=np.int64)
+        robot_holding = np.asarray(
+            observation["robot_holding"], dtype=np.int64
+        )
+        robot_phase = np.asarray(
+            observation["robot_phase"], dtype=np.int64
+        )
+        operation_wafer = np.asarray(
+            observation["robot_operation_wafer"], dtype=np.int64
+        )
+        operation_module = np.asarray(
+            observation["robot_operation_module"], dtype=np.int64
+        )
+        time_to_operation_start = np.asarray(
+            observation["time_to_operation_start"], dtype=np.float32
+        )
+        time_to_operation_end = np.asarray(
+            observation["time_to_operation_end"], dtype=np.float32
+        )
+        flat_action_mask = np.asarray(
+            observation["action_mask"], dtype=np.bool_
         )
 
-        nodes = self._build_nodes(
-            wafer_module,
+        self._validate_observation(
+            wafer_loc,
             wafer_step,
             process_remaining,
+            robot_loc,
+            robot_holding,
+            robot_phase,
+            operation_wafer,
+            operation_module,
+            time_to_operation_start,
+            time_to_operation_end,
+            flat_action_mask,
         )
-        edges = self._build_edges(
-            wafer_module,
-            wafer_step,
-            robot_module,
+
+        transport_action_mask = flat_action_mask[:-1].reshape(
+            len(self.wafer_keys) + len(self.module_ids),
+            len(self.robot_ids),
         )
+
         return HeteroGraph(
-            nodes=nodes,
-            edges=edges,
-            graph_features=np.asarray(
-                [float((info or {}).get("time", 0.0))],
-                dtype=np.float32,
+            nodes=self._build_nodes(
+                wafer_loc,
+                wafer_step,
+                process_remaining,
+                robot_holding,
+                robot_phase,
+                operation_module,
+                time_to_operation_start,
+                time_to_operation_end,
             ),
-            graph_feature_names=("time",),
-            action_mask=action_mask,
+            edges=self._build_edges(
+                wafer_loc,
+                wafer_step,
+                robot_loc,
+                robot_holding,
+                operation_wafer,
+                operation_module,
+            ),
+            action_mask=transport_action_mask,
+            can_advance=bool(flat_action_mask[-1]),
         )
 
     def _build_nodes(
         self,
-        wafer_module: np.ndarray,
+        wafer_loc: np.ndarray,
         wafer_step: np.ndarray,
         process_remaining: np.ndarray,
+        robot_holding: np.ndarray,
+        robot_phase: np.ndarray,
+        operation_module: np.ndarray,
+        time_to_operation_start: np.ndarray,
+        time_to_operation_end: np.ndarray,
     ) -> dict[str, NodeStore]:
-        """Define node features here.
+        module_count = len(self.module_ids)
+        wafer_count = len(self.wafer_keys)
+        fifo_head = self._fifo_head_mask(wafer_loc, wafer_step)
+        holding_rank = np.zeros(wafer_count, dtype=np.float32)
+        for row in robot_holding:
+            for rank, wafer_index in enumerate(row, start=1):
+                if wafer_index < wafer_count:
+                    holding_rank[wafer_index] = rank
 
-        TODO: add the scheduling state needed by your model, such as remaining
-        route work, module cleaning state, load-lock state, or robot-arm state.
-        """
-
-        wafer_features = np.empty((len(self.wafer_keys), 3), dtype=np.float32)
+        wafer_features = np.empty(
+            (len(self.wafer_keys), len(WAFER_FEATURE_NAMES)),
+            dtype=np.float32,
+        )
         for index, (route_id, _) in enumerate(self.wafer_keys):
-            completed_step = len(self.problem.routes[route_id].visits) + 1
+            route = self.problem.routes[route_id]
+            process_times = tuple(
+                visit.process_time or 0.0 for visit in route.visits
+            )
+            completed_step = len(route.visits) + 1
+            step = int(wafer_step[index])
             wafer_features[index] = (
-                wafer_step[index] / completed_step,
-                process_remaining[index],
-                float(wafer_module[index] == len(self.module_ids)),
+                step / completed_step,
+                process_remaining[index] / TIME_SCALE_SECONDS,
+                float(process_remaining[index] == 0.0 and fifo_head[index]),
+                float(step == completed_step),
+                (completed_step - step) / completed_step,
+                sum(process_times[step:]) / TIME_SCALE_SECONDS,
+                holding_rank[index],
             )
 
-        module_features = np.empty((len(self.module_ids), 4), dtype=np.float32)
+        physical_occupancy = np.bincount(
+            wafer_loc[wafer_loc < module_count],
+            minlength=module_count,
+        )
+        place_reservations = np.zeros(module_count, dtype=np.int64)
+        for phase, module_index in zip(robot_phase, operation_module):
+            if module_index >= module_count:
+                continue
+            if phase == RobotPhase.PLACING:
+                physical_occupancy[module_index] += 1
+            elif phase == RobotPhase.TRAVEL_TO_PLACE:
+                place_reservations[module_index] += 1
+        committed_occupancy = physical_occupancy + place_reservations
+        module_features = np.empty(
+            (module_count, len(MODULE_FEATURE_NAMES)),
+            dtype=np.float32,
+        )
         for index, module_id in enumerate(self.module_ids):
             module = self.problem.Modules[module_id]
+            capacity = module.capacity
+            available = capacity - committed_occupancy[index]
             module_features[index] = (
-                module.capacity,
                 float(module.type is ModuleType.LP),
                 float(module.type is ModuleType.PM),
                 float(module.type is ModuleType.LL),
+                capacity,
+                physical_occupancy[index] / capacity,
+                available / capacity,
+                float(available <= 0),
             )
 
-        robot_features = np.empty((len(self.robot_ids), 3), dtype=np.float32)
+        held_count = np.sum(robot_holding < wafer_count, axis=1)
+        robot_features = np.empty(
+            (len(self.robot_ids), len(ROBOT_FEATURE_NAMES)),
+            dtype=np.float32,
+        )
         for index, robot_id in enumerate(self.robot_ids):
             robot = self.problem.ClusterTool[robot_id]
+            arm_capacity = (
+                1 if robot.arm_type is TMArmType.SINGLE_ARM else 2
+            )
+            available = arm_capacity - held_count[index]
             robot_features[index] = (
-                robot.pick_time,
-                robot.place_time,
-                float(robot.arm_type is TMArmType.SINGLE_ARM),
+                robot.pick_time / TIME_SCALE_SECONDS,
+                robot.place_time / TIME_SCALE_SECONDS,
+                robot.travel_times / TIME_SCALE_SECONDS,
+                arm_capacity,
+                held_count[index] / arm_capacity,
+                available / arm_capacity,
+                float(available == 0),
+                float(robot_phase[index] == RobotPhase.IDLE),
+                float(robot_phase[index] == RobotPhase.TRAVEL_TO_PICK),
+                float(robot_phase[index] == RobotPhase.PICKING),
+                float(robot_phase[index] == RobotPhase.TRAVEL_TO_PLACE),
+                float(robot_phase[index] == RobotPhase.PLACING),
+                time_to_operation_start[index] / TIME_SCALE_SECONDS,
+                time_to_operation_end[index] / TIME_SCALE_SECONDS,
             )
 
+        route_step_features = np.empty(
+            (len(self.route_step_ids), len(ROUTE_STEP_FEATURE_NAMES)),
+            dtype=np.float32,
+        )
+        for index, (route_id, step) in enumerate(self.route_step_ids):
+            route = self.problem.routes[route_id]
+            is_return_to_lp = step == len(route.visits) + 1
+            visit = None if is_return_to_lp else route.visits[step - 1]
+            residency_time = None if visit is None else self._residency_time(visit)
+            route_step_features[index] = (
+                (
+                    0.0
+                    if visit is None
+                    else (visit.process_time or 0.0) / TIME_SCALE_SECONDS
+                ),
+                (residency_time or 0.0) / TIME_SCALE_SECONDS,
+                float(residency_time is not None),
+                step / (len(route.visits) + 1),
+                float(is_return_to_lp),
+            )
+
+        completed_steps = 0
+        total_steps = 0
+        completed_wafers = 0
+        remaining_process_time = 0.0
+        for index, (route_id, _) in enumerate(self.wafer_keys):
+            route = self.problem.routes[route_id]
+            completed_step = len(route.visits) + 1
+            step = int(wafer_step[index])
+            completed_steps += step
+            total_steps += completed_step
+            completed_wafers += step == completed_step
+            remaining_process_time += process_remaining[index] + sum(
+                visit.process_time or 0.0 for visit in route.visits[step:]
+            )
+        global_features = np.asarray(
+            [
+                completed_wafers / len(self.wafer_keys),
+                completed_steps / total_steps,
+                (
+                    remaining_process_time / self._total_process_time
+                    if self._total_process_time > 0
+                    else 0.0
+                ),
+            ],
+            dtype=np.float32,
+        ).reshape(1, -1)
+
         return {
+            GLOBAL: NodeStore(
+                ids=("system",),
+                features=global_features,
+                feature_names=GLOBAL_FEATURE_NAMES,
+            ),
             WAFER: NodeStore(
                 ids=self.wafer_keys,
                 features=wafer_features,
-                feature_names=(
-                    "route_progress",
-                    "process_remaining",
-                    "on_robot",
-                ),
+                feature_names=WAFER_FEATURE_NAMES,
+            ),
+            ROUTE_STEP: NodeStore(
+                ids=self.route_step_ids,
+                features=route_step_features,
+                feature_names=ROUTE_STEP_FEATURE_NAMES,
             ),
             MODULE: NodeStore(
                 ids=self.module_ids,
                 features=module_features,
-                feature_names=("capacity", "is_lp", "is_pm", "is_ll"),
+                feature_names=MODULE_FEATURE_NAMES,
             ),
             ROBOT: NodeStore(
                 ids=self.robot_ids,
                 features=robot_features,
-                feature_names=("pick_time", "place_time", "is_single_arm"),
+                feature_names=ROBOT_FEATURE_NAMES,
             ),
         }
+
+    def _residency_time(self, visit: RouteVisit) -> float | None:
+        """Resolve a route-step residency limit from local and global rules."""
+
+        if visit.residency_time is not None:
+            return visit.residency_time
+        if self.problem.just_in_time is None:
+            return None
+
+        module_types = {
+            self.problem.Modules[module_id].type
+            for module_id in visit.module_ids
+        }
+        if module_types == {ModuleType.PM}:
+            value = self.problem.just_in_time.pm_residency_time
+            if value is not None:
+                return value
+        if module_types == {ModuleType.LL}:
+            value = self.problem.just_in_time.ll_residency_time
+            if value is not None:
+                return value
+        return self.problem.just_in_time.residency_time
+
+    def _fifo_head_mask(
+        self,
+        wafer_loc: np.ndarray,
+        wafer_step: np.ndarray,
+    ) -> np.ndarray:
+        """Mark the lowest-index unfinished wafer at each location."""
+
+        heads: dict[int, int] = {}
+        for index, (route_id, wafer_index) in enumerate(self.wafer_keys):
+            completed_step = len(self.problem.routes[route_id].visits) + 1
+            if wafer_step[index] == completed_step:
+                continue
+
+            location = int(wafer_loc[index])
+            current = heads.get(location)
+            if current is None:
+                heads[location] = index
+                continue
+
+            current_route_id, current_wafer_index = self.wafer_keys[current]
+            if (wafer_index, route_id) < (
+                current_wafer_index,
+                current_route_id,
+            ):
+                heads[location] = index
+
+        mask = np.zeros(len(self.wafer_keys), dtype=np.bool_)
+        mask[list(heads.values())] = True
+        return mask
 
     def _build_edges(
         self,
-        wafer_module: np.ndarray,
+        wafer_loc: np.ndarray,
         wafer_step: np.ndarray,
-        robot_module: int,
+        robot_loc: np.ndarray,
+        robot_holding: np.ndarray,
+        operation_wafer: np.ndarray,
+        operation_module: np.ndarray,
     ) -> dict[EdgeType, EdgeStore]:
-        """Define graph relations here.
-
-        Static relations come from ``problem``; dynamic relations come from
-        the current observation. Add reverse relations explicitly if the
-        selected GNN library does not add them for you.
-        """
-
+        module_count = len(self.module_ids)
+        wafer_count = len(self.wafer_keys)
         located_in: list[tuple[int, int]] = []
-        held_by: list[tuple[int, int]] = []
-        can_move_to: list[tuple[int, int]] = []
-        candidate_times: list[tuple[float]] = []
+        at_step: list[tuple[int, int]] = []
+        next_step: list[tuple[int, int]] = []
 
         for wafer_index, (route_id, _) in enumerate(self.wafer_keys):
-            if wafer_module[wafer_index] < len(self.module_ids):
-                located_in.append((wafer_index, int(wafer_module[wafer_index])))
-            else:
-                held_by.append((wafer_index, 0))
+            location = int(wafer_loc[wafer_index])
+            if location < module_count:
+                located_in.append((wafer_index, location))
 
+            step = int(wafer_step[wafer_index])
+            completed_step = len(self.problem.routes[route_id].visits) + 1
+            if step > 0:
+                at_step.append(
+                    (wafer_index, self._route_step_index[(route_id, step)])
+                )
+            if step < completed_step:
+                next_step.append(
+                    (
+                        wafer_index,
+                        self._route_step_index[(route_id, step + 1)],
+                    )
+                )
+
+        held_by = [
+            (int(wafer_index), robot_index)
+            for robot_index, row in enumerate(robot_holding)
+            for wafer_index in row
+            if wafer_index < wafer_count
+        ]
+        operates_on = [
+            (robot_index, int(wafer_index))
+            for robot_index, wafer_index in enumerate(operation_wafer)
+            if wafer_index < wafer_count
+        ]
+        operation_at = [
+            (robot_index, int(module_index))
+            for robot_index, module_index in enumerate(operation_module)
+            if module_index < module_count
+        ]
+
+        can_run_on: list[tuple[int, int]] = []
+        precedes: list[tuple[int, int]] = []
+        for route_step_index, (route_id, step) in enumerate(
+            self.route_step_ids
+        ):
             route = self.problem.routes[route_id]
-            next_step = int(wafer_step[wafer_index]) + 1
-            if next_step <= len(route.visits):
-                visit = route.visits[next_step - 1]
-                targets = visit.module_ids
-                process_time = visit.process_time or 0.0
-            elif next_step == len(route.visits) + 1:
-                targets = (self._lp_id,)
-                process_time = 0.0
-            else:
-                targets = ()
-                process_time = 0.0
+            targets = (
+                (self._lp_id,)
+                if step == len(route.visits) + 1
+                else route.visits[step - 1].module_ids
+            )
+            can_run_on.extend(
+                (route_step_index, self._module_index[module_id])
+                for module_id in targets
+            )
+            next_key = (route_id, step + 1)
+            if next_key in self._route_step_index:
+                precedes.append(
+                    (route_step_index, self._route_step_index[next_key])
+                )
 
-            for module_id in targets:
-                can_move_to.append((wafer_index, self._module_index[module_id]))
-                candidate_times.append((process_time,))
-
-        can_access = [(self._robot_index[robot_id], self._module_index[module_id]) for robot_id, robot in self.problem.ClusterTool.items() for module_id in robot.module_ids]
+        can_access = [
+            (self._robot_index[robot_id], self._module_index[module_id])
+            for robot_id, robot in self.problem.ClusterTool.items()
+            for module_id in robot.module_ids
+        ]
+        located_at = [
+            (robot_index, int(module_index))
+            for robot_index, module_index in enumerate(robot_loc)
+            if module_index < module_count
+        ]
 
         edges = {
-            LOCATED_IN: EdgeStore(
-                edge_index=_edge_index(located_in),
-                features=np.empty((len(located_in), 0), dtype=np.float32),
-            ),
-            HELD_BY: EdgeStore(
-                edge_index=_edge_index(held_by),
-                features=np.empty((len(held_by), 0), dtype=np.float32),
-            ),
-            CAN_MOVE_TO: EdgeStore(
-                edge_index=_edge_index(can_move_to),
-                features=np.asarray(candidate_times, dtype=np.float32).reshape(-1, 1),
-                feature_names=("process_time",),
-            ),
-            CAN_ACCESS: EdgeStore(
-                edge_index=_edge_index(can_access),
-                features=np.empty((len(can_access), 0), dtype=np.float32),
-            ),
+            LOCATED_IN: _edge_store(located_in),
+            CONTAINS: _edge_store(_reverse(located_in)),
+            HELD_BY: _edge_store(held_by),
+            HOLDS: _edge_store(_reverse(held_by)),
+            AT_STEP: _edge_store(at_step),
+            CURRENT_FOR: _edge_store(_reverse(at_step)),
+            NEXT_STEP: _edge_store(next_step),
+            NEXT_FOR: _edge_store(_reverse(next_step)),
+            CAN_RUN_ON: _edge_store(can_run_on),
+            SUPPORTS_STEP: _edge_store(_reverse(can_run_on)),
+            PRECEDES: _edge_store(precedes),
+            FOLLOWS: _edge_store(_reverse(precedes)),
+            CAN_ACCESS: _edge_store(can_access),
+            ACCESSIBLE_BY: _edge_store(_reverse(can_access)),
+            LOCATED_AT: _edge_store(located_at),
+            HAS_ROBOT: _edge_store(_reverse(located_at)),
+            OPERATES_ON: _edge_store(operates_on),
+            OPERATION_OF: _edge_store(_reverse(operates_on)),
+            OPERATION_AT: _edge_store(operation_at),
+            HAS_OPERATION: _edge_store(_reverse(operation_at)),
         }
-
-        if robot_module < len(self.module_ids):
-            edges[(ROBOT, "located_at", MODULE)] = EdgeStore(
-                edge_index=np.asarray([[0], [robot_module]], dtype=np.int64),
-                features=np.empty((1, 0), dtype=np.float32),
+        for node_type, count in (
+            (WAFER, len(self.wafer_keys)),
+            (ROUTE_STEP, len(self.route_step_ids)),
+            (MODULE, len(self.module_ids)),
+            (ROBOT, len(self.robot_ids)),
+        ):
+            from_global = [(0, index) for index in range(count)]
+            edges[(GLOBAL, "contextualizes", node_type)] = _edge_store(
+                from_global
+            )
+            edges[(node_type, "summarizes_into", GLOBAL)] = _edge_store(
+                _reverse(from_global)
             )
         return edges
 
     def _validate_observation(
         self,
-        wafer_module: np.ndarray,
+        wafer_loc: np.ndarray,
         wafer_step: np.ndarray,
         process_remaining: np.ndarray,
+        robot_loc: np.ndarray,
+        robot_holding: np.ndarray,
+        robot_phase: np.ndarray,
+        operation_wafer: np.ndarray,
+        operation_module: np.ndarray,
+        time_to_operation_start: np.ndarray,
+        time_to_operation_end: np.ndarray,
         action_mask: np.ndarray,
-        robot_module: int,
     ) -> None:
         wafer_count = len(self.wafer_keys)
         module_count = len(self.module_ids)
-        if wafer_module.shape != (wafer_count,) or wafer_step.shape != (wafer_count,) or process_remaining.shape != (wafer_count,):
+        robot_count = len(self.robot_ids)
+
+        if (
+            wafer_loc.shape != (wafer_count,)
+            or wafer_step.shape != (wafer_count,)
+            or process_remaining.shape != (wafer_count,)
+        ):
             raise ValueError("observation has invalid wafer array shapes")
-        if action_mask.shape != (wafer_count + module_count,):
-            raise ValueError("action_mask must follow [wafer, module] order")
-        if np.any((wafer_module < 0) | (wafer_module > module_count)):
-            raise ValueError("wafer_module contains an invalid index")
-        if not 0 <= robot_module <= module_count:
-            raise ValueError("robot_module contains an invalid index")
+        if robot_loc.shape != (robot_count,):
+            raise ValueError("robot_loc must contain one index per robot")
+        if robot_holding.shape != (robot_count, self._max_arm_capacity):
+            raise ValueError("robot_holding has an invalid shape")
+        robot_arrays = (
+            robot_phase,
+            operation_wafer,
+            operation_module,
+            time_to_operation_start,
+            time_to_operation_end,
+        )
+        if any(array.shape != (robot_count,) for array in robot_arrays):
+            raise ValueError("robot operation arrays must contain one value per robot")
+        expected_action_count = (
+            (wafer_count + module_count) * robot_count + 1
+        )
+        if action_mask.shape != (expected_action_count,):
+            raise ValueError(
+                "action_mask must be flat transport actions followed by ADVANCE"
+            )
+        if np.any((wafer_loc < 0) | (wafer_loc >= module_count + robot_count)):
+            raise ValueError("wafer_loc contains an invalid location index")
+        if np.any((robot_loc < 0) | (robot_loc > module_count)):
+            raise ValueError("robot_loc contains an invalid module index")
+        if np.any((robot_holding < 0) | (robot_holding > wafer_count)):
+            raise ValueError("robot_holding contains an invalid wafer index")
+        held_wafers = robot_holding[robot_holding < wafer_count]
+        if len(set(map(int, held_wafers))) != len(held_wafers):
+            raise ValueError("a wafer cannot be held more than once")
+        for robot_index, row in enumerate(robot_holding):
+            capacity = (
+                1
+                if self.problem.ClusterTool[
+                    self.robot_ids[robot_index]
+                ].arm_type is TMArmType.SINGLE_ARM
+                else 2
+            )
+            if np.count_nonzero(row < wafer_count) > capacity:
+                raise ValueError("robot_holding exceeds robot arm capacity")
+            if any(
+                row[index] == wafer_count and row[index + 1] < wafer_count
+                for index in range(len(row) - 1)
+            ):
+                raise ValueError("robot_holding must use a contiguous prefix")
+        if np.any((robot_phase < 0) | (robot_phase >= len(RobotPhase))):
+            raise ValueError("robot_phase contains an invalid phase")
+        if np.any((operation_wafer < 0) | (operation_wafer > wafer_count)):
+            raise ValueError("robot_operation_wafer contains an invalid index")
+        if np.any((operation_module < 0) | (operation_module > module_count)):
+            raise ValueError("robot_operation_module contains an invalid index")
+        operation_times = np.concatenate(
+            (time_to_operation_start, time_to_operation_end)
+        )
+        if np.any(~np.isfinite(operation_times)) or np.any(operation_times < 0):
+            raise ValueError("robot operation times must be finite and non-negative")
+        idle = robot_phase == RobotPhase.IDLE
+        if np.any(operation_wafer[idle] != wafer_count) or np.any(
+            operation_module[idle] != module_count
+        ):
+            raise ValueError("idle robots must use operation sentinels")
+        busy = ~idle
+        if np.any(operation_wafer[busy] >= wafer_count) or np.any(
+            operation_module[busy] >= module_count
+        ):
+            raise ValueError("busy robots must identify their operation entities")
+        if np.any(~np.isfinite(process_remaining)) or np.any(
+            process_remaining < 0
+        ):
+            raise ValueError(
+                "process_remaining must contain finite non-negative values"
+            )
+        for index, (route_id, _) in enumerate(self.wafer_keys):
+            completed_step = len(self.problem.routes[route_id].visits) + 1
+            if not 0 <= wafer_step[index] <= completed_step:
+                raise ValueError(f"wafer_step[{index}] is outside its route")
