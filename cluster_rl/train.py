@@ -11,7 +11,7 @@ import time
 import traceback
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from multiprocessing.connection import Connection
@@ -36,7 +36,6 @@ from cluster_rl.network import (
     EntityBatch,
     TransformerConfig,
     collate_encoded_observations,
-    collate_observations,
 )
 from cluster_generator import ProblemGenerator
 from problem import ClusterProblem, load_problem
@@ -120,6 +119,7 @@ class PPOConfig:
     feedforward_dim: int = 128
     seed: int = 0
     device: str = "cpu"
+    profile_timing: bool = False
     log_interval: int = 1
     checkpoint_interval: int = 25
     evaluate: bool = True
@@ -226,6 +226,37 @@ class ParallelStepResult:
     done: bool
     episode_stat: EpisodeStat | None
     slot_state: EnvSlotState
+
+
+class PhaseTimer:
+    """Collect synchronized wall times for one diagnostic PPO update."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.totals: dict[str, float] = defaultdict(float)
+        self.counts: dict[str, int] = defaultdict(int)
+
+    def add(self, name: str, seconds: float, count: int = 1) -> None:
+        self.totals[name] += seconds
+        self.counts[name] += count
+
+    @contextmanager
+    def measure(self, name: str):
+        self._synchronize()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._synchronize()
+            self.add(name, time.perf_counter() - started)
+
+    def _synchronize(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+
+def _measure(timer: PhaseTimer | None, name: str):
+    return nullcontext() if timer is None else timer.measure(name)
 
 
 class GeneratorEnvFactory:
@@ -552,8 +583,15 @@ def _step_env_slot(
     action: int,
     index: int,
     env_factory: GeneratorEnvFactory | None,
+    timings: dict[str, float] | None = None,
 ) -> tuple[EnvSlot, float, bool, EpisodeStat | None]:
+    step_started = time.perf_counter()
     observation, reward, terminated, truncated, info = slot.env.step(action)
+    if timings is not None:
+        name = "rollout.worker_env_step_cpu"
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - step_started
+        )
     done = terminated or truncated
     success = bool(info.get("is_success"))
     slot.episode_reward += reward
@@ -576,10 +614,22 @@ def _step_env_slot(
             success=success,
         )
         if env_factory is None:
+            reset_started = time.perf_counter()
             slot.observation, _ = slot.env.reset()
             slot.episode_reward = 0.0
+            if timings is not None:
+                name = "rollout.worker_reset_reference_cpu"
+                timings[name] = timings.get(name, 0.0) + (
+                    time.perf_counter() - reset_started
+                )
         else:
+            reset_started = time.perf_counter()
             slot = env_factory.make(index, slot.episode_index + 1)
+            if timings is not None:
+                name = "rollout.worker_reset_reference_cpu"
+                timings[name] = timings.get(name, 0.0) + (
+                    time.perf_counter() - reset_started
+                )
     else:
         slot.observation = observation
     return slot, normalized_reward, done, episode_stat
@@ -611,26 +661,37 @@ def _parallel_env_worker(
             if command != "step":
                 raise ValueError(f"unknown parallel environment command: {command}")
 
+            profile = bool(payload["profile"])
+            actions = payload["actions"]
+            worker_timings: dict[str, float] = {}
             results = []
-            for index, action in payload:
+            for index, action in actions:
                 slot, reward, done, episode_stat = _step_env_slot(
                     slots[index],
                     action,
                     index,
                     env_factory,
+                    worker_timings if profile else None,
                 )
                 slots[index] = slot
+                encode_started = time.perf_counter()
+                encoded = slot.encoder.encode(slot.observation)
+                if profile:
+                    name = "rollout.worker_encode_cpu"
+                    worker_timings[name] = worker_timings.get(name, 0.0) + (
+                        time.perf_counter() - encode_started
+                    )
                 results.append(
                     ParallelStepResult(
                         index=index,
-                        encoded=slot.encoder.encode(slot.observation),
+                        encoded=encoded,
                         normalized_reward=reward,
                         done=done,
                         episode_stat=episode_stat,
                         slot_state=_env_slot_state(slot),
                     )
                 )
-            connection.send(("ok", results))
+            connection.send(("ok", (results, worker_timings)))
     except (EOFError, KeyboardInterrupt):
         pass
     except BaseException:
@@ -716,20 +777,32 @@ class ParallelEnvPool:
     def step(
         self,
         actions: Sequence[int],
+        timer: PhaseTimer | None = None,
     ) -> tuple[list[float], list[bool], list[EpisodeStat]]:
         if len(actions) != len(self._encoded):
             raise ValueError("actions must contain one action per environment")
 
         for connection, indexes in zip(self._connections, self._indexes):
             connection.send(
-                ("step", [(index, int(actions[index])) for index in indexes])
+                (
+                    "step",
+                    {
+                        "actions": [
+                            (index, int(actions[index])) for index in indexes
+                        ],
+                        "profile": timer is not None,
+                    },
+                )
             )
 
         rewards = [0.0] * len(actions)
         dones = [False] * len(actions)
         episode_stats = []
         for connection in self._connections:
-            results: list[ParallelStepResult] = self._receive(connection)
+            results, worker_timings = self._receive(connection)
+            if timer is not None:
+                for name, seconds in worker_timings.items():
+                    timer.add(name, seconds)
             for result in results:
                 self._encoded[result.index] = result.encoded
                 self._states[result.index] = result.slot_state
@@ -763,6 +836,7 @@ def _collect_rollout(
     config: PPOConfig,
     device: torch.device,
     env_factory: GeneratorEnvFactory | None = None,
+    timer: PhaseTimer | None = None,
 ) -> tuple[RolloutBatch, list[EpisodeStat]]:
     state_steps = []
     action_steps = []
@@ -774,72 +848,88 @@ def _collect_rollout(
 
     model.eval()
     for _ in range(config.rollout_steps):
-        states = collate_observations(
-            [slot.encoder for slot in slots],
-            [slot.observation for slot in slots],
-            device=device,
-        )
-        with torch.inference_mode():
-            output = model(states)
-            distribution = Categorical(logits=output.logits)
-            model_actions = distribution.sample()
+        with _measure(timer, "rollout.encode_cpu"):
+            encoded = [
+                slot.encoder.encode(slot.observation)
+                for slot in slots
+            ]
+        with _measure(timer, "rollout.collate_h2d"):
+            states = collate_encoded_observations(encoded, device=device)
+        with _measure(timer, "rollout.policy_gpu"):
+            with torch.inference_mode():
+                output = model(states)
+                distribution = Categorical(logits=output.logits)
+                model_actions = distribution.sample()
 
-        env_actions = states.to_env_actions(model_actions).cpu().tolist()
+        with _measure(timer, "rollout.action_d2h"):
+            env_actions = states.to_env_actions(model_actions).cpu().tolist()
         normalized_rewards = []
         dones = []
-        for index, action in enumerate(env_actions):
-            slot, normalized_reward, done, episode_stat = _step_env_slot(
-                slots[index],
-                action,
-                index,
-                env_factory,
-            )
-            slots[index] = slot
-            normalized_rewards.append(normalized_reward)
-            dones.append(done)
-            if episode_stat is not None:
-                episode_stats.append(episode_stat)
+        step_timings: dict[str, float] = {}
+        with _measure(timer, "rollout.env_wait"):
+            for index, action in enumerate(env_actions):
+                slot, normalized_reward, done, episode_stat = _step_env_slot(
+                    slots[index],
+                    action,
+                    index,
+                    env_factory,
+                    step_timings if timer is not None else None,
+                )
+                slots[index] = slot
+                normalized_rewards.append(normalized_reward)
+                dones.append(done)
+                if episode_stat is not None:
+                    episode_stats.append(episode_stat)
+        if timer is not None:
+            for name, seconds in step_timings.items():
+                timer.add(name, seconds)
 
-        state_steps.append(states)
-        action_steps.append(model_actions)
-        log_probability_steps.append(
-            distribution.log_prob(model_actions)
-        )
-        value_steps.append(output.value)
-        reward_steps.append(
-            torch.tensor(
-                normalized_rewards,
-                dtype=torch.float32,
-                device=device,
+        with _measure(timer, "rollout.buffer"):
+            state_steps.append(states)
+            action_steps.append(model_actions)
+            log_probability_steps.append(
+                distribution.log_prob(model_actions)
             )
-        )
-        done_steps.append(
-            torch.tensor(dones, dtype=torch.bool, device=device)
-        )
-    with torch.inference_mode():
-        last_states = collate_observations(
-            [slot.encoder for slot in slots],
-            [slot.observation for slot in slots],
-            device=device,
-        )
-        last_values = model(last_states).value
+            value_steps.append(output.value)
+            reward_steps.append(
+                torch.tensor(
+                    normalized_rewards,
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            done_steps.append(
+                torch.tensor(dones, dtype=torch.bool, device=device)
+            )
+    with _measure(timer, "rollout.bootstrap"):
+        encoded = [
+            slot.encoder.encode(slot.observation)
+            for slot in slots
+        ]
+        with torch.inference_mode():
+            last_states = collate_encoded_observations(encoded, device=device)
+            last_values = model(last_states).value
 
-    rewards = torch.stack(reward_steps)
-    dones = torch.stack(done_steps)
-    values = torch.stack(value_steps)
-    advantages = _advantages(
-        rewards,
-        dones,
-        values,
-        last_values,
-        config.gamma,
-        config.gae_lambda,
-    )
-    returns = advantages + values
+    with _measure(timer, "rollout.gae"):
+        rewards = torch.stack(reward_steps)
+        dones = torch.stack(done_steps)
+        values = torch.stack(value_steps)
+        advantages = _advantages(
+            rewards,
+            dones,
+            values,
+            last_values,
+            config.gamma,
+            config.gae_lambda,
+        )
+        returns = advantages + values
+
+    with _measure(timer, "rollout.stack_graphs"):
+        rollout_states = _stack_entity_batches(state_steps)
 
     return (
         RolloutBatch(
-            states=_stack_entity_batches(state_steps),
+            states=rollout_states,
             actions=torch.stack(action_steps).flatten(),
             old_log_probabilities=torch.stack(
                 log_probability_steps
@@ -857,6 +947,7 @@ def _collect_parallel_rollout(
     env_pool: ParallelEnvPool,
     config: PPOConfig,
     device: torch.device,
+    timer: PhaseTimer | None = None,
 ) -> tuple[RolloutBatch, list[EpisodeStat]]:
     state_steps = []
     action_steps = []
@@ -868,59 +959,72 @@ def _collect_parallel_rollout(
 
     model.eval()
     for _ in range(config.rollout_steps):
-        states = collate_encoded_observations(
-            env_pool.encoded,
-            device=device,
-        )
-        with torch.inference_mode():
-            output = model(states)
-            distribution = Categorical(logits=output.logits)
-            model_actions = distribution.sample()
-
-        env_actions = states.to_env_actions(model_actions).cpu().tolist()
-        normalized_rewards, dones, completed = env_pool.step(env_actions)
-        episode_stats.extend(completed)
-
-        state_steps.append(states)
-        action_steps.append(model_actions)
-        log_probability_steps.append(
-            distribution.log_prob(model_actions)
-        )
-        value_steps.append(output.value)
-        reward_steps.append(
-            torch.tensor(
-                normalized_rewards,
-                dtype=torch.float32,
+        with _measure(timer, "rollout.collate_h2d"):
+            states = collate_encoded_observations(
+                env_pool.encoded,
                 device=device,
             )
-        )
-        done_steps.append(
-            torch.tensor(dones, dtype=torch.bool, device=device)
-        )
+        with _measure(timer, "rollout.policy_gpu"):
+            with torch.inference_mode():
+                output = model(states)
+                distribution = Categorical(logits=output.logits)
+                model_actions = distribution.sample()
 
-    with torch.inference_mode():
-        last_states = collate_encoded_observations(
-            env_pool.encoded,
-            device=device,
-        )
-        last_values = model(last_states).value
+        with _measure(timer, "rollout.action_d2h"):
+            env_actions = states.to_env_actions(model_actions).cpu().tolist()
+        with _measure(timer, "rollout.env_wait"):
+            normalized_rewards, dones, completed = env_pool.step(
+                env_actions,
+                timer,
+            )
+        episode_stats.extend(completed)
 
-    rewards = torch.stack(reward_steps)
-    dones = torch.stack(done_steps)
-    values = torch.stack(value_steps)
-    advantages = _advantages(
-        rewards,
-        dones,
-        values,
-        last_values,
-        config.gamma,
-        config.gae_lambda,
-    )
-    returns = advantages + values
+        with _measure(timer, "rollout.buffer"):
+            state_steps.append(states)
+            action_steps.append(model_actions)
+            log_probability_steps.append(
+                distribution.log_prob(model_actions)
+            )
+            value_steps.append(output.value)
+            reward_steps.append(
+                torch.tensor(
+                    normalized_rewards,
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            done_steps.append(
+                torch.tensor(dones, dtype=torch.bool, device=device)
+            )
+
+    with _measure(timer, "rollout.bootstrap"):
+        with torch.inference_mode():
+            last_states = collate_encoded_observations(
+                env_pool.encoded,
+                device=device,
+            )
+            last_values = model(last_states).value
+
+    with _measure(timer, "rollout.gae"):
+        rewards = torch.stack(reward_steps)
+        dones = torch.stack(done_steps)
+        values = torch.stack(value_steps)
+        advantages = _advantages(
+            rewards,
+            dones,
+            values,
+            last_values,
+            config.gamma,
+            config.gae_lambda,
+        )
+        returns = advantages + values
+
+    with _measure(timer, "rollout.stack_graphs"):
+        rollout_states = _stack_entity_batches(state_steps)
 
     return (
         RolloutBatch(
-            states=_stack_entity_batches(state_steps),
+            states=rollout_states,
             actions=torch.stack(action_steps).flatten(),
             old_log_probabilities=torch.stack(
                 log_probability_steps
@@ -938,12 +1042,14 @@ def _ppo_update(
     optimizer: torch.optim.Optimizer,
     rollout_batch: RolloutBatch,
     config: PPOConfig,
+    timer: PhaseTimer | None = None,
 ) -> dict[str, float]:
-    advantages = rollout_batch.advantages
-    advantages = (
-        advantages - advantages.mean()
-    ) / (advantages.std(unbiased=False) + 1e-8)
-    sample_count = advantages.shape[0]
+    with _measure(timer, "ppo.prepare"):
+        advantages = rollout_batch.advantages
+        advantages = (
+            advantages - advantages.mean()
+        ) / (advantages.std(unbiased=False) + 1e-8)
+        sample_count = advantages.shape[0]
     totals = {
         "policy_loss": 0.0,
         "value_loss": 0.0,
@@ -954,7 +1060,8 @@ def _ppo_update(
         "grad_norm": 0.0,
     }
     minibatch_count = 0
-    state_data_list = rollout_batch.states.graph.to_data_list()
+    with _measure(timer, "ppo.split_graph_batch"):
+        state_data_list = rollout_batch.states.graph.to_data_list()
 
     model.train()
     for _ in range(config.epochs):
@@ -966,99 +1073,104 @@ def _ppo_update(
             minibatch_indexes = indexes[
                 start : start + config.minibatch_size
             ]
-            states = _select_states(
-                rollout_batch.states,
-                minibatch_indexes,
-                state_data_list,
-            )
-            output = model(states)
-            distribution = Categorical(logits=output.logits)
-            new_log_probabilities = distribution.log_prob(
-                rollout_batch.actions[minibatch_indexes]
-            )
-            log_ratio = (
-                new_log_probabilities
-                - rollout_batch.old_log_probabilities[minibatch_indexes]
-            )
-            ratio = log_ratio.exp()
-            has_choice = states.action_mask.sum(dim=1) > 1
-            choice_fraction = has_choice.float().mean()
-
-            if has_choice.any():
-                minibatch_advantages = advantages[
-                    minibatch_indexes
-                ][has_choice]
-                choice_ratio = ratio[has_choice]
-                unclipped_policy_loss = (
-                    -minibatch_advantages * choice_ratio
+            with _measure(timer, "ppo.minibatch_rebatch"):
+                states = _select_states(
+                    rollout_batch.states,
+                    minibatch_indexes,
+                    state_data_list,
                 )
-                clipped_policy_loss = (
-                    -minibatch_advantages
-                    * choice_ratio.clamp(
-                        1.0 - config.clip_coefficient,
-                        1.0 + config.clip_coefficient,
-                    )
+            with _measure(timer, "ppo.forward_gpu"):
+                output = model(states)
+                distribution = Categorical(logits=output.logits)
+                new_log_probabilities = distribution.log_prob(
+                    rollout_batch.actions[minibatch_indexes]
                 )
-                policy_loss = torch.maximum(
-                    unclipped_policy_loss,
-                    clipped_policy_loss,
-                ).mean()
-                entropy = distribution.entropy()[has_choice].mean()
-            else:
-                policy_loss = output.value.sum() * 0.0
-                entropy = output.value.sum() * 0.0
+                log_ratio = (
+                    new_log_probabilities
+                    - rollout_batch.old_log_probabilities[minibatch_indexes]
+                )
+                ratio = log_ratio.exp()
+                has_choice = states.action_mask.sum(dim=1) > 1
+                choice_fraction = has_choice.float().mean()
 
-            old_values = rollout_batch.old_values[minibatch_indexes]
-            returns = rollout_batch.returns[minibatch_indexes]
-            clipped_values = old_values + (
-                output.value - old_values
-            ).clamp(
-                -config.clip_coefficient,
-                config.clip_coefficient,
-            )
-            value_loss = 0.5 * torch.maximum(
-                (output.value - returns).square(),
-                (clipped_values - returns).square(),
-            ).mean()
-            loss = (
-                policy_loss
-                + config.value_coefficient * value_loss
-                - config.entropy_coefficient * entropy
-            )
-
-            optimizer.zero_grad()
-            loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(
-                model.parameters(),
-                config.max_grad_norm,
-            )
-            optimizer.step()
-
-            with torch.no_grad():
+            with _measure(timer, "ppo.loss_gpu"):
                 if has_choice.any():
-                    choice_log_ratio = log_ratio[has_choice]
+                    minibatch_advantages = advantages[
+                        minibatch_indexes
+                    ][has_choice]
                     choice_ratio = ratio[has_choice]
-                    approx_kl = (
-                        (choice_ratio - 1.0) - choice_log_ratio
+                    unclipped_policy_loss = (
+                        -minibatch_advantages * choice_ratio
+                    )
+                    clipped_policy_loss = (
+                        -minibatch_advantages
+                        * choice_ratio.clamp(
+                            1.0 - config.clip_coefficient,
+                            1.0 + config.clip_coefficient,
+                        )
+                    )
+                    policy_loss = torch.maximum(
+                        unclipped_policy_loss,
+                        clipped_policy_loss,
                     ).mean()
-                    clip_fraction = (
-                        (choice_ratio - 1.0).abs()
-                        > config.clip_coefficient
-                    ).float().mean()
+                    entropy = distribution.entropy()[has_choice].mean()
                 else:
-                    approx_kl = torch.zeros((), device=ratio.device)
-                    clip_fraction = torch.zeros((), device=ratio.device)
-            metrics = {
-                "policy_loss": policy_loss,
-                "value_loss": value_loss,
-                "entropy": entropy,
-                "approx_kl": approx_kl,
-                "clip_fraction": clip_fraction,
-                "choice_fraction": choice_fraction,
-                "grad_norm": grad_norm,
-            }
-            for name, value in metrics.items():
-                totals[name] += value.detach().item()
+                    policy_loss = output.value.sum() * 0.0
+                    entropy = output.value.sum() * 0.0
+
+                old_values = rollout_batch.old_values[minibatch_indexes]
+                returns = rollout_batch.returns[minibatch_indexes]
+                clipped_values = old_values + (
+                    output.value - old_values
+                ).clamp(
+                    -config.clip_coefficient,
+                    config.clip_coefficient,
+                )
+                value_loss = 0.5 * torch.maximum(
+                    (output.value - returns).square(),
+                    (clipped_values - returns).square(),
+                ).mean()
+                loss = (
+                    policy_loss
+                    + config.value_coefficient * value_loss
+                    - config.entropy_coefficient * entropy
+                )
+
+            with _measure(timer, "ppo.backward_optimizer_gpu"):
+                optimizer.zero_grad()
+                loss.backward()
+                grad_norm = nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config.max_grad_norm,
+                )
+                optimizer.step()
+
+            with _measure(timer, "ppo.metrics_gpu"):
+                with torch.no_grad():
+                    if has_choice.any():
+                        choice_log_ratio = log_ratio[has_choice]
+                        choice_ratio = ratio[has_choice]
+                        approx_kl = (
+                            (choice_ratio - 1.0) - choice_log_ratio
+                        ).mean()
+                        clip_fraction = (
+                            (choice_ratio - 1.0).abs()
+                            > config.clip_coefficient
+                        ).float().mean()
+                    else:
+                        approx_kl = torch.zeros((), device=ratio.device)
+                        clip_fraction = torch.zeros((), device=ratio.device)
+                metrics = {
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
+                    "entropy": entropy,
+                    "approx_kl": approx_kl,
+                    "clip_fraction": clip_fraction,
+                    "choice_fraction": choice_fraction,
+                    "grad_norm": grad_norm,
+                }
+                for name, value in metrics.items():
+                    totals[name] += value.detach().item()
             minibatch_count += 1
 
     return {
@@ -1360,6 +1472,44 @@ def _print_update(
     )
 
 
+def _print_timing_profile(timer: PhaseTimer) -> None:
+    labels = (
+        ("rollout.encode_cpu", "rollout graph encode (serial)"),
+        ("rollout.collate_h2d", "rollout collate + CPU->GPU"),
+        ("rollout.policy_gpu", "rollout policy inference"),
+        ("rollout.action_d2h", "rollout action GPU->CPU"),
+        ("rollout.env_wait", "rollout environment/IPC wait"),
+        ("rollout.worker_env_step_cpu", "worker env.step CPU-sum"),
+        (
+            "rollout.worker_reset_reference_cpu",
+            "worker generation/reference CPU-sum",
+        ),
+        ("rollout.worker_encode_cpu", "worker graph encode CPU-sum"),
+        ("rollout.buffer", "rollout buffer writes"),
+        ("rollout.bootstrap", "rollout bootstrap value"),
+        ("rollout.gae", "rollout GAE"),
+        ("rollout.stack_graphs", "rollout final graph stacking"),
+        ("ppo.prepare", "PPO advantage preparation"),
+        ("ppo.split_graph_batch", "PPO split graph batch once"),
+        ("ppo.minibatch_rebatch", "PPO minibatch graph rebatch"),
+        ("ppo.forward_gpu", "PPO model forward"),
+        ("ppo.loss_gpu", "PPO loss construction"),
+        ("ppo.backward_optimizer_gpu", "PPO backward + optimizer"),
+        ("ppo.metrics_gpu", "PPO metrics + scalar sync"),
+    )
+    print("  timing profile (CUDA-synchronized diagnostic):")
+    for name, label in labels:
+        if name not in timer.totals:
+            continue
+        seconds = timer.totals[name]
+        count = timer.counts[name]
+        average_ms = 1000.0 * seconds / count
+        print(
+            f"    {label:<39} {seconds:>9.3f}s  "
+            f"calls={count:<5d} avg={average_ms:>8.2f}ms"
+        )
+
+
 def _evaluation(
     model: ClusterActorCritic,
     envs: list[ClusterEnv],
@@ -1546,6 +1696,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
 
     try:
         for update in range(first_update, last_update + 1):
+            timer = PhaseTimer(device) if config.profile_timing else None
             rollout_started = time.perf_counter()
             if env_pool is None:
                 rollout_batch, episode_stats = _collect_rollout(
@@ -1554,6 +1705,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
                     config,
                     device,
                     env_factory,
+                    timer,
                 )
             else:
                 rollout_batch, episode_stats = _collect_parallel_rollout(
@@ -1561,6 +1713,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
                     env_pool,
                     config,
                     device,
+                    timer,
                 )
             rollout_seconds = time.perf_counter() - rollout_started
             ppo_started = time.perf_counter()
@@ -1569,6 +1722,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
                 optimizer,
                 rollout_batch,
                 config,
+                timer,
             )
             ppo_seconds = time.perf_counter() - ppo_started
             global_step += steps_per_update
@@ -1602,6 +1756,8 @@ def _train(config: PPOConfig) -> dict[str, object]:
                     rollout_seconds=rollout_seconds,
                     ppo_seconds=ppo_seconds,
                 )
+                if timer is not None:
+                    _print_timing_profile(timer)
 
             if (
                 update % config.checkpoint_interval == 0
@@ -1743,6 +1899,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("cpu", "cuda", "mps", "auto"),
         default="cpu",
     )
+    parser.add_argument(
+        "--profile-timing",
+        action="store_true",
+        help="synchronize CUDA and print a detailed per-update timing profile",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--checkpoint-interval", type=int, default=25)
     parser.add_argument("--no-eval", action="store_true")
@@ -1790,6 +1951,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         feedforward_dim=args.feedforward_dim,
         seed=args.seed,
         device=args.device,
+        profile_timing=args.profile_timing,
         log_interval=args.log_interval,
         checkpoint_interval=args.checkpoint_interval,
         evaluate=not args.no_eval,
