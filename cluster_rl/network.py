@@ -93,9 +93,17 @@ class EntityBatch:
         self._validate_actions(model_actions, "model_actions")
         return model_actions.to(self.action_mask.device)
 
-    def index_select(self, indexes: Tensor) -> EntityBatch:
+    def index_select(
+        self,
+        indexes: Tensor,
+        *,
+        data_list: Sequence[HeteroData] | None = None,
+    ) -> EntityBatch:
         indexes = indexes.to(self.action_mask.device, dtype=torch.long)
-        data_list = self.graph.to_data_list()
+        if data_list is None:
+            data_list = self.graph.to_data_list()
+        if len(data_list) != self.batch_size:
+            raise ValueError("data_list must contain one graph per batch item")
         selected_graphs = [data_list[index] for index in indexes.cpu().tolist()]
         return EntityBatch(
             graph=Batch.from_data_list(selected_graphs).to(self.action_mask.device),
@@ -301,6 +309,19 @@ def collate_observations(
         encoder.encode(observation)
         for encoder, observation in zip(encoders, observations)
     ]
+    return collate_encoded_observations(encoded, device=device)
+
+
+def collate_encoded_observations(
+    encoded: Sequence[EncodedObservation],
+    *,
+    device: torch.device | str | None = None,
+) -> EntityBatch:
+    """Batch observations already encoded by CPU environment workers."""
+
+    if not encoded:
+        raise ValueError("encoded must not be empty")
+
     max_actions = max(item.action_mask.shape[0] for item in encoded)
     batch_size = len(encoded)
     action_mask = torch.zeros(batch_size, max_actions, dtype=torch.bool)

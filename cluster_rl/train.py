@@ -5,12 +5,16 @@ import csv
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import sys
+import time
+import traceback
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,8 +32,10 @@ from examples.run_scenarios import (
 from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
+    EncodedObservation,
     EntityBatch,
     TransformerConfig,
+    collate_encoded_observations,
     collate_observations,
 )
 from cluster_generator import ProblemGenerator
@@ -80,6 +86,7 @@ class PPOConfig:
     scenario_paths: tuple[Path, ...] = ()
     train_mode: Literal["scenarios", "generator"] = "scenarios"
     num_envs: int = 8
+    cpu_workers: int = 0
     generator_seed: int = 42
     generator_max_attempts: int = 64
     difficulty_weights: dict[str, float] = field(
@@ -136,6 +143,12 @@ class PPOConfig:
             raise ValueError("at least one scenario is required")
         if self.train_mode not in ("scenarios", "generator"):
             raise ValueError("train_mode must be 'scenarios' or 'generator'")
+        if self.cpu_workers < 0:
+            raise ValueError("cpu_workers must be non-negative")
+        if self.cpu_workers and self.train_mode != "generator":
+            raise ValueError("cpu_workers are only supported in generator mode")
+        if self.cpu_workers > self.num_envs:
+            raise ValueError("cpu_workers must not exceed num_envs")
         if self.train_mode == "generator":
             expected_difficulties = {"easy", "medium", "hard", "edge"}
             if set(self.difficulty_weights) != expected_difficulties:
@@ -196,6 +209,23 @@ class EnvSlot:
     problem_seed: int
     episode_index: int = 0
     episode_reward: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class EnvSlotState:
+    reference_makespan: float
+    problem_seed: int
+    episode_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelStepResult:
+    index: int
+    encoded: EncodedObservation
+    normalized_reward: float
+    done: bool
+    episode_stat: EpisodeStat | None
+    slot_state: EnvSlotState
 
 
 class GeneratorEnvFactory:
@@ -462,8 +492,12 @@ def _stack_entity_batches(batches: list[EntityBatch]) -> EntityBatch:
     return EntityBatch.concatenate(batches)
 
 
-def _select_states(states: EntityBatch, indexes: Tensor) -> EntityBatch:
-    return states.index_select(indexes)
+def _select_states(
+    states: EntityBatch,
+    indexes: Tensor,
+    data_list: Sequence[Any] | None = None,
+) -> EntityBatch:
+    return states.index_select(indexes, data_list=data_list)
 
 
 def _advantages(
@@ -505,6 +539,224 @@ def _normalized_reward(
     return reward / reference_makespan + float(success)
 
 
+def _env_slot_state(slot: EnvSlot) -> EnvSlotState:
+    return EnvSlotState(
+        reference_makespan=slot.reference_makespan,
+        problem_seed=slot.problem_seed,
+        episode_index=slot.episode_index,
+    )
+
+
+def _step_env_slot(
+    slot: EnvSlot,
+    action: int,
+    index: int,
+    env_factory: GeneratorEnvFactory | None,
+) -> tuple[EnvSlot, float, bool, EpisodeStat | None]:
+    observation, reward, terminated, truncated, info = slot.env.step(action)
+    done = terminated or truncated
+    success = bool(info.get("is_success"))
+    slot.episode_reward += reward
+    normalized_reward = _normalized_reward(
+        reward,
+        slot.reference_makespan,
+        done and success,
+    )
+    episode_stat = None
+
+    if done:
+        episode_stat = EpisodeStat(
+            scenario=str(slot.env.problem.meta.get("name", f"env_{index}")),
+            makespan=float(info["time"]),
+            reference_makespan=slot.reference_makespan,
+            normalized_return=(
+                slot.episode_reward / slot.reference_makespan + float(success)
+            ),
+            reward=slot.episode_reward,
+            success=success,
+        )
+        if env_factory is None:
+            slot.observation, _ = slot.env.reset()
+            slot.episode_reward = 0.0
+        else:
+            slot = env_factory.make(index, slot.episode_index + 1)
+    else:
+        slot.observation = observation
+    return slot, normalized_reward, done, episode_stat
+
+
+def _parallel_env_worker(
+    connection: Connection,
+    config: PPOConfig,
+    indexed_slots: list[tuple[int, EnvSlot]],
+) -> None:
+    try:
+        torch.set_num_threads(1)
+        slots = dict(indexed_slots)
+        env_factory = GeneratorEnvFactory(config)
+        initial = [
+            (
+                index,
+                slot.encoder.encode(slot.observation),
+                _env_slot_state(slot),
+            )
+            for index, slot in slots.items()
+        ]
+        connection.send(("ok", initial))
+
+        while True:
+            command, payload = connection.recv()
+            if command == "close":
+                break
+            if command != "step":
+                raise ValueError(f"unknown parallel environment command: {command}")
+
+            results = []
+            for index, action in payload:
+                slot, reward, done, episode_stat = _step_env_slot(
+                    slots[index],
+                    action,
+                    index,
+                    env_factory,
+                )
+                slots[index] = slot
+                results.append(
+                    ParallelStepResult(
+                        index=index,
+                        encoded=slot.encoder.encode(slot.observation),
+                        normalized_reward=reward,
+                        done=done,
+                        episode_stat=episode_stat,
+                        slot_state=_env_slot_state(slot),
+                    )
+                )
+            connection.send(("ok", results))
+    except (EOFError, KeyboardInterrupt):
+        pass
+    except BaseException:
+        try:
+            connection.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+class ParallelEnvPool:
+    """Keep independent generator environments in persistent CPU processes."""
+
+    def __init__(
+        self,
+        slots: list[EnvSlot],
+        config: PPOConfig,
+    ) -> None:
+        worker_count = min(config.cpu_workers, len(slots))
+        if worker_count <= 0:
+            raise ValueError("parallel environment pool requires cpu_workers")
+
+        context = mp.get_context("spawn")
+        self._connections: list[Connection] = []
+        self._processes: list[mp.Process] = []
+        self._indexes = [
+            list(range(offset, len(slots), worker_count))
+            for offset in range(worker_count)
+        ]
+        self._encoded: list[EncodedObservation | None] = [None] * len(slots)
+        self._states: list[EnvSlotState | None] = [None] * len(slots)
+        self._closed = False
+
+        try:
+            for worker_index, indexes in enumerate(self._indexes):
+                parent, child = context.Pipe()
+                process = context.Process(
+                    target=_parallel_env_worker,
+                    args=(
+                        child,
+                        config,
+                        [(index, slots[index]) for index in indexes],
+                    ),
+                    name=f"cluster-env-{worker_index}",
+                )
+                process.daemon = True
+                process.start()
+                child.close()
+                self._connections.append(parent)
+                self._processes.append(process)
+
+            for connection in self._connections:
+                for index, encoded, state in self._receive(connection):
+                    self._encoded[index] = encoded
+                    self._states[index] = state
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _receive(connection: Connection) -> Any:
+        try:
+            status, payload = connection.recv()
+        except EOFError as exc:
+            raise RuntimeError("parallel environment worker exited unexpectedly") from exc
+        if status == "error":
+            raise RuntimeError(f"parallel environment worker failed:\n{payload}")
+        return payload
+
+    @property
+    def encoded(self) -> list[EncodedObservation]:
+        if any(item is None for item in self._encoded):
+            raise RuntimeError("parallel environment pool has incomplete observations")
+        return [item for item in self._encoded if item is not None]
+
+    @property
+    def states(self) -> list[EnvSlotState]:
+        if any(item is None for item in self._states):
+            raise RuntimeError("parallel environment pool has incomplete states")
+        return [item for item in self._states if item is not None]
+
+    def step(
+        self,
+        actions: Sequence[int],
+    ) -> tuple[list[float], list[bool], list[EpisodeStat]]:
+        if len(actions) != len(self._encoded):
+            raise ValueError("actions must contain one action per environment")
+
+        for connection, indexes in zip(self._connections, self._indexes):
+            connection.send(
+                ("step", [(index, int(actions[index])) for index in indexes])
+            )
+
+        rewards = [0.0] * len(actions)
+        dones = [False] * len(actions)
+        episode_stats = []
+        for connection in self._connections:
+            results: list[ParallelStepResult] = self._receive(connection)
+            for result in results:
+                self._encoded[result.index] = result.encoded
+                self._states[result.index] = result.slot_state
+                rewards[result.index] = result.normalized_reward
+                dones[result.index] = result.done
+                if result.episode_stat is not None:
+                    episode_stats.append(result.episode_stat)
+        return rewards, dones, episode_stats
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for connection in self._connections:
+            try:
+                connection.send(("close", None))
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        for connection in self._connections:
+            connection.close()
+        for process in self._processes:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+
+
 def _collect_rollout(
     model: ClusterActorCritic,
     slots: list[EnvSlot],
@@ -535,48 +787,18 @@ def _collect_rollout(
         env_actions = states.to_env_actions(model_actions).cpu().tolist()
         normalized_rewards = []
         dones = []
-        for index, (slot, action) in enumerate(zip(slots, env_actions)):
-            observation, reward, terminated, truncated, info = slot.env.step(
-                action
+        for index, action in enumerate(env_actions):
+            slot, normalized_reward, done, episode_stat = _step_env_slot(
+                slots[index],
+                action,
+                index,
+                env_factory,
             )
-            done = terminated or truncated
-            success = bool(info.get("is_success"))
-            slot.episode_reward += reward
-            normalized_reward = _normalized_reward(
-                reward,
-                slot.reference_makespan,
-                done and success,
-            )
+            slots[index] = slot
             normalized_rewards.append(normalized_reward)
             dones.append(done)
-
-            if done:
-                normalized_return = (
-                    slot.episode_reward / slot.reference_makespan
-                    + float(success)
-                )
-                episode_stats.append(
-                    EpisodeStat(
-                        scenario=str(
-                            slot.env.problem.meta.get("name", f"env_{index}")
-                        ),
-                        makespan=float(info["time"]),
-                        reference_makespan=slot.reference_makespan,
-                        normalized_return=normalized_return,
-                        reward=slot.episode_reward,
-                        success=success,
-                    )
-                )
-                if env_factory is None:
-                    slot.observation, _ = slot.env.reset()
-                    slot.episode_reward = 0.0
-                else:
-                    slots[index] = env_factory.make(
-                        index,
-                        slot.episode_index + 1,
-                    )
-            else:
-                slot.observation = observation
+            if episode_stat is not None:
+                episode_stats.append(episode_stat)
 
         state_steps.append(states)
         action_steps.append(model_actions)
@@ -630,6 +852,87 @@ def _collect_rollout(
     )
 
 
+def _collect_parallel_rollout(
+    model: ClusterActorCritic,
+    env_pool: ParallelEnvPool,
+    config: PPOConfig,
+    device: torch.device,
+) -> tuple[RolloutBatch, list[EpisodeStat]]:
+    state_steps = []
+    action_steps = []
+    log_probability_steps = []
+    value_steps = []
+    reward_steps = []
+    done_steps = []
+    episode_stats = []
+
+    model.eval()
+    for _ in range(config.rollout_steps):
+        states = collate_encoded_observations(
+            env_pool.encoded,
+            device=device,
+        )
+        with torch.inference_mode():
+            output = model(states)
+            distribution = Categorical(logits=output.logits)
+            model_actions = distribution.sample()
+
+        env_actions = states.to_env_actions(model_actions).cpu().tolist()
+        normalized_rewards, dones, completed = env_pool.step(env_actions)
+        episode_stats.extend(completed)
+
+        state_steps.append(states)
+        action_steps.append(model_actions)
+        log_probability_steps.append(
+            distribution.log_prob(model_actions)
+        )
+        value_steps.append(output.value)
+        reward_steps.append(
+            torch.tensor(
+                normalized_rewards,
+                dtype=torch.float32,
+                device=device,
+            )
+        )
+        done_steps.append(
+            torch.tensor(dones, dtype=torch.bool, device=device)
+        )
+
+    with torch.inference_mode():
+        last_states = collate_encoded_observations(
+            env_pool.encoded,
+            device=device,
+        )
+        last_values = model(last_states).value
+
+    rewards = torch.stack(reward_steps)
+    dones = torch.stack(done_steps)
+    values = torch.stack(value_steps)
+    advantages = _advantages(
+        rewards,
+        dones,
+        values,
+        last_values,
+        config.gamma,
+        config.gae_lambda,
+    )
+    returns = advantages + values
+
+    return (
+        RolloutBatch(
+            states=_stack_entity_batches(state_steps),
+            actions=torch.stack(action_steps).flatten(),
+            old_log_probabilities=torch.stack(
+                log_probability_steps
+            ).flatten(),
+            old_values=values.flatten(),
+            advantages=advantages.flatten(),
+            returns=returns.flatten(),
+        ),
+        episode_stats,
+    )
+
+
 def _ppo_update(
     model: ClusterActorCritic,
     optimizer: torch.optim.Optimizer,
@@ -651,6 +954,7 @@ def _ppo_update(
         "grad_norm": 0.0,
     }
     minibatch_count = 0
+    state_data_list = rollout_batch.states.graph.to_data_list()
 
     model.train()
     for _ in range(config.epochs):
@@ -665,6 +969,7 @@ def _ppo_update(
             states = _select_states(
                 rollout_batch.states,
                 minibatch_indexes,
+                state_data_list,
             )
             output = model(states)
             distribution = Categorical(logits=output.logits)
@@ -1008,6 +1313,9 @@ def _print_update(
     row: dict[str, object],
     stats: list[EpisodeStat],
     last_update: int,
+    *,
+    rollout_seconds: float,
+    ppo_seconds: float,
 ) -> None:
     success = row["success_rate"]
     success_text = (
@@ -1045,6 +1353,10 @@ def _print_update(
         f"entropy={float(row['entropy']):.4f}  "
         f"KL={float(row['approx_kl']):.2e}  "
         f"choice={100 * float(row['choice_fraction']):.1f}%"
+    )
+    print(
+        f"  timing: rollout={rollout_seconds:.2f}s  "
+        f"PPO={ppo_seconds:.2f}s  total={rollout_seconds + ppo_seconds:.2f}s"
     )
 
 
@@ -1215,6 +1527,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
     print("Masked PPO training")
     print(
         f"device={device}  mode={config.train_mode}  envs={len(slots)}  "
+        f"cpu_workers={config.cpu_workers}  "
         f"target_steps={config.total_steps}  run_dir={config.run_dir}"
     )
     print("Reference makespans:")
@@ -1225,73 +1538,117 @@ def _train(config: PPOConfig) -> dict[str, object]:
         )
     print("=" * 78)
 
-    for update in range(first_update, last_update + 1):
-        rollout_batch, episode_stats = _collect_rollout(
-            model,
-            slots,
-            config,
-            device,
-            env_factory,
-        )
-        metrics = _ppo_update(
-            model,
-            optimizer,
-            rollout_batch,
-            config,
-        )
-        global_step += steps_per_update
-        update_row = _update_row(
-            metrics,
-            episode_stats,
-            update,
-            global_step,
-        )
-        _append_csv(
-            config.run_dir / "updates.csv",
-            UPDATE_FIELDS,
-            update_row,
-        )
-        for episode_row in _episode_rows(
-            episode_stats,
-            update,
-            global_step,
-        ):
-            _append_csv(
-                config.run_dir / "episodes.csv",
-                EPISODE_FIELDS,
-                episode_row,
+    env_pool = (
+        ParallelEnvPool(slots, config)
+        if config.cpu_workers
+        else None
+    )
+
+    try:
+        for update in range(first_update, last_update + 1):
+            rollout_started = time.perf_counter()
+            if env_pool is None:
+                rollout_batch, episode_stats = _collect_rollout(
+                    model,
+                    slots,
+                    config,
+                    device,
+                    env_factory,
+                )
+            else:
+                rollout_batch, episode_stats = _collect_parallel_rollout(
+                    model,
+                    env_pool,
+                    config,
+                    device,
+                )
+            rollout_seconds = time.perf_counter() - rollout_started
+            ppo_started = time.perf_counter()
+            metrics = _ppo_update(
+                model,
+                optimizer,
+                rollout_batch,
+                config,
             )
+            ppo_seconds = time.perf_counter() - ppo_started
+            global_step += steps_per_update
+            update_row = _update_row(
+                metrics,
+                episode_stats,
+                update,
+                global_step,
+            )
+            _append_csv(
+                config.run_dir / "updates.csv",
+                UPDATE_FIELDS,
+                update_row,
+            )
+            for episode_row in _episode_rows(
+                episode_stats,
+                update,
+                global_step,
+            ):
+                _append_csv(
+                    config.run_dir / "episodes.csv",
+                    EPISODE_FIELDS,
+                    episode_row,
+                )
 
-        if update % config.log_interval == 0 or update == last_update:
-            _print_update(update_row, episode_stats, last_update)
+            if update % config.log_interval == 0 or update == last_update:
+                _print_update(
+                    update_row,
+                    episode_stats,
+                    last_update,
+                    rollout_seconds=rollout_seconds,
+                    ppo_seconds=ppo_seconds,
+                )
 
-        if (
-            update % config.checkpoint_interval == 0
-            or update == last_update
-        ):
+            if (
+                update % config.checkpoint_interval == 0
+                or update == last_update
+            ):
+                slot_states = (
+                    [_env_slot_state(slot) for slot in slots]
+                    if env_pool is None
+                    else env_pool.states
+                )
+                _save_checkpoint(
+                    model,
+                    optimizer,
+                    config,
+                    [state.reference_makespan for state in slot_states],
+                    [state.episode_index for state in slot_states],
+                    global_step,
+                    update,
+                )
+                _plot_training_curves(config.run_dir)
+
+        if update_count == 0:
+            slot_states = (
+                [_env_slot_state(slot) for slot in slots]
+                if env_pool is None
+                else env_pool.states
+            )
             _save_checkpoint(
                 model,
                 optimizer,
                 config,
-                [slot.reference_makespan for slot in slots],
-                [slot.episode_index for slot in slots],
+                [state.reference_makespan for state in slot_states],
+                [state.episode_index for state in slot_states],
                 global_step,
-                update,
+                first_update - 1,
             )
-            _plot_training_curves(config.run_dir)
+            if _read_csv(config.run_dir / "updates.csv"):
+                _plot_training_curves(config.run_dir)
+    finally:
+        if env_pool is not None:
+            env_pool.close()
 
-    if update_count == 0:
-        _save_checkpoint(
-            model,
-            optimizer,
-            config,
-            [slot.reference_makespan for slot in slots],
-            [slot.episode_index for slot in slots],
-            global_step,
-            first_update - 1,
-        )
-        if _read_csv(config.run_dir / "updates.csv"):
-            _plot_training_curves(config.run_dir)
+    final_slot_states = (
+        [_env_slot_state(slot) for slot in slots]
+        if env_pool is None
+        else env_pool.states
+    )
 
     if config.evaluate:
         evaluation_cases = _evaluation_problems(config)
@@ -1329,7 +1686,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
         "global_step": global_step,
         "updates": update_count,
         "reference_makespans": [
-            slot.reference_makespan for slot in slots
+            state.reference_makespan for state in final_slot_states
         ],
         "evaluation": evaluation,
     }
@@ -1351,6 +1708,12 @@ def _parser() -> argparse.ArgumentParser:
         default="scenarios",
     )
     parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=0,
+        help="persistent CPU environment workers; 0 keeps serial rollout",
+    )
     parser.add_argument("--generator-seed", type=int, default=42)
     parser.add_argument("--generator-max-attempts", type=int, default=64)
     parser.add_argument("--validation-manifest", type=Path)
@@ -1401,6 +1764,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         scenario_paths=tuple(args.scenarios),
         train_mode=args.train_mode,
         num_envs=args.num_envs,
+        cpu_workers=args.cpu_workers,
         generator_seed=args.generator_seed,
         generator_max_attempts=args.generator_max_attempts,
         validation_manifest=args.validation_manifest,

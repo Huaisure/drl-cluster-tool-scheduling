@@ -31,6 +31,7 @@ python -m pip install -e ../cluster-tool-validator
 python -m cluster_rl.train \
   --train-mode generator \
   --num-envs 8 \
+  --cpu-workers 8 \
   --generator-seed 42 \
   --validation-manifest datasets/validation/manifest.json \
   --test-manifest datasets/test/manifest.json \
@@ -61,6 +62,12 @@ python -m cluster_rl.train \
 `--hgt-layers` 控制 HGT encoder 深度，`--num-layers` 控制 Transformer
 decoder 深度。Apple Silicon 可添加 `--device mps`，NVIDIA GPU 可添加
 `--device cuda`；默认使用 CPU。
+
+生成模式可通过 `--cpu-workers N` 启用持久化CPU进程。每个worker持有一组独立环境，
+并行执行环境推进、异构图编码，以及episode结束后的新问题与FIFO-aware参考调度生成；
+主进程只负责批处理和模型计算。`N`不能超过`--num-envs`，默认值0保留串行行为。
+在Slurm中应确保`--cpus-per-task`至少覆盖worker数量，并为主进程额外预留一个CPU核。
+每个update日志分别输出`rollout`和`PPO`耗时，便于判断瓶颈位于环境侧还是模型更新侧。
 
 ## 输出与日志
 

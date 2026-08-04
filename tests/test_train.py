@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+import pickle
+from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,6 +13,7 @@ from examples.run_scenarios import SCENARIO_DIR
 from cluster_rl.network import ClusterActorCritic, TransformerConfig
 from cluster_rl.train import (
     GeneratorEnvFactory,
+    ParallelEnvPool,
     PPOConfig,
     _advantages,
     _collect_rollout,
@@ -18,6 +21,7 @@ from cluster_rl.train import (
     _first_legal_reference,
     _manifest_problem_paths,
     _normalized_reward,
+    _step_env_slot,
     train,
 )
 from tests.test_cluster_env import _problem
@@ -60,6 +64,22 @@ def test_normalized_reward_centers_reference_schedule_at_zero() -> None:
     ]
 
     assert sum(normalized) == pytest.approx(0.0)
+
+
+def test_cpu_workers_require_generator_slots() -> None:
+    with pytest.raises(ValueError, match="only supported in generator mode"):
+        PPOConfig(
+            scenario_paths=(SCENARIO_DIR / "long_route_1w.json",),
+            cpu_workers=1,
+        )
+
+    with pytest.raises(ValueError, match="must not exceed num_envs"):
+        PPOConfig(
+            train_mode="generator",
+            num_envs=1,
+            cpu_workers=2,
+            evaluate=False,
+        )
 
 
 @pytest.mark.parametrize("seed", [43, 49])
@@ -124,6 +144,73 @@ def test_rollout_replaces_completed_generator_slot() -> None:
     assert len(stats) == 1
     assert slots[0].episode_index == 1
     assert [call[0] for call in generator.calls] == [5, 6]
+
+
+def test_parallel_env_pool_advances_and_replaces_completed_slot() -> None:
+    generator = _ProblemGeneratorStub()
+    config = PPOConfig(
+        train_mode="generator",
+        num_envs=1,
+        cpu_workers=1,
+        generator_seed=5,
+        evaluate=False,
+    )
+    slot = GeneratorEnvFactory(config, generator=generator).make(0)
+    pool = ParallelEnvPool([slot], config)
+
+    try:
+        completed = []
+        for _ in range(100):
+            action = int(np.flatnonzero(pool.encoded[0].action_mask)[0])
+            _, _, stats = pool.step([action])
+            completed.extend(stats)
+            if completed:
+                break
+    finally:
+        pool.close()
+
+    assert len(completed) == 1
+    assert pool.states[0].episode_index == 1
+
+
+def test_parallel_env_pool_matches_serial_transition() -> None:
+    generator = _ProblemGeneratorStub()
+    config = PPOConfig(
+        train_mode="generator",
+        num_envs=1,
+        cpu_workers=1,
+        generator_seed=5,
+        evaluate=False,
+    )
+    slot = GeneratorEnvFactory(config, generator=generator).make(0)
+    serial_slot = pickle.loads(pickle.dumps(slot))
+    action = int(np.flatnonzero(slot.observation["action_mask"])[0])
+    pool = ParallelEnvPool([slot], config)
+
+    try:
+        parallel_rewards, parallel_dones, _ = pool.step([action])
+        serial_slot, serial_reward, serial_done, _ = _step_env_slot(
+            serial_slot,
+            action,
+            0,
+            None,
+        )
+        serial_encoded = serial_slot.encoder.encode(serial_slot.observation)
+        parallel_encoded = pool.encoded[0]
+    finally:
+        pool.close()
+
+    assert parallel_rewards == pytest.approx([serial_reward])
+    assert parallel_dones == [serial_done]
+    np.testing.assert_array_equal(
+        parallel_encoded.action_mask,
+        serial_encoded.action_mask,
+    )
+    for node_type in serial_encoded.graph.node_types:
+        torch.testing.assert_close(
+            parallel_encoded.graph[node_type].x,
+            serial_encoded.graph[node_type].x,
+        )
 
 
 def test_manifest_problem_paths_load_only_materialized_local_files(
