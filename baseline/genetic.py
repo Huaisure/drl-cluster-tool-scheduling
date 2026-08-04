@@ -110,23 +110,66 @@ def solve(
 def _decode(env: ClusterEnv, chromosome: np.ndarray) -> _Evaluation:
     observation, _ = env.reset()
     total_reward = 0.0
+    advance_action = env.action_space.n - 1
 
     for gene in chromosome:
-        legal_actions = np.flatnonzero(observation["action_mask"])
+        while True:
+            legal_actions = np.flatnonzero(observation["action_mask"])
+            transfer_actions = legal_actions[legal_actions != advance_action]
+            if len(transfer_actions):
+                break
+            if not len(legal_actions):
+                return _failed_result(env, total_reward)
+            observation, reward, terminated, truncated, info = env.step(
+                advance_action
+            )
+            total_reward += reward
+            if terminated or truncated:
+                return _decoded_result(env, total_reward, info)
+
+        legal_actions = transfer_actions
         action_index = min(int(gene * len(legal_actions)), len(legal_actions) - 1)
         observation, reward, terminated, truncated, info = env.step(
             int(legal_actions[action_index])
         )
         total_reward += reward
         if terminated or truncated:
-            return _Evaluation(
-                cost=-total_reward,
-                success=bool(info.get("is_success")),
-                makespan=float(info["time"]),
-                actions=env.actions,
-            )
+            return _decoded_result(env, total_reward, info)
 
-    raise RuntimeError("Chromosome ended before the environment terminated")
+    while np.array_equal(
+        np.flatnonzero(observation["action_mask"]),
+        np.asarray([advance_action]),
+    ):
+        observation, reward, terminated, truncated, info = env.step(
+            advance_action
+        )
+        total_reward += reward
+        if terminated or truncated:
+            return _decoded_result(env, total_reward, info)
+
+    return _failed_result(env, total_reward)
+
+
+def _decoded_result(
+    env: ClusterEnv,
+    total_reward: float,
+    info: Mapping[str, object],
+) -> _Evaluation:
+    return _Evaluation(
+        cost=-total_reward,
+        success=bool(info.get("is_success")),
+        makespan=float(info["time"]),
+        actions=env.actions,
+    )
+
+
+def _failed_result(env: ClusterEnv, total_reward: float) -> _Evaluation:
+    return _Evaluation(
+        cost=1e12 - total_reward,
+        success=False,
+        makespan=-total_reward,
+        actions=env.actions,
+    )
 
 
 def _select_parent(

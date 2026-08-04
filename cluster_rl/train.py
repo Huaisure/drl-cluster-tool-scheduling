@@ -6,12 +6,12 @@ import json
 import math
 import sys
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ from cluster_rl.network import (
     TransformerConfig,
     collate_observations,
 )
+from cluster_generator import ProblemGenerator
 from problem import ClusterProblem, load_problem
 
 
@@ -63,6 +64,7 @@ EPISODE_FIELDS = (
     "success",
 )
 EVALUATION_FIELDS = (
+    "split",
     "scenario",
     "reference_makespan",
     "makespan",
@@ -75,7 +77,20 @@ EVALUATION_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class PPOConfig:
-    scenario_paths: tuple[Path, ...]
+    scenario_paths: tuple[Path, ...] = ()
+    train_mode: Literal["scenarios", "generator"] = "scenarios"
+    num_envs: int = 8
+    generator_seed: int = 42
+    difficulty_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "easy": 0.20,
+            "medium": 0.50,
+            "hard": 0.25,
+            "edge": 0.05,
+        }
+    )
+    validation_manifest: Path | None = None
+    test_manifest: Path | None = None
     run_dir: Path = Path("runs/ppo_cluster")
     checkpoint: Path = Path("runs/ppo_cluster/checkpoint.pt")
     resume: Path | None = None
@@ -110,11 +125,36 @@ class PPOConfig:
             "log_interval": self.log_interval,
             "checkpoint_interval": self.checkpoint_interval,
         }
+        if self.train_mode == "generator":
+            positive_integers["num_envs"] = self.num_envs
         for name, value in positive_integers.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
-        if not self.scenario_paths:
+        if self.train_mode == "scenarios" and not self.scenario_paths:
             raise ValueError("at least one scenario is required")
+        if self.train_mode not in ("scenarios", "generator"):
+            raise ValueError("train_mode must be 'scenarios' or 'generator'")
+        if self.train_mode == "generator":
+            expected_difficulties = {"easy", "medium", "hard", "edge"}
+            if set(self.difficulty_weights) != expected_difficulties:
+                raise ValueError(
+                    "difficulty_weights must contain easy, medium, hard, and edge"
+                )
+            if any(
+                not math.isfinite(weight) or weight < 0
+                for weight in self.difficulty_weights.values()
+            ) or sum(self.difficulty_weights.values()) <= 0:
+                raise ValueError(
+                    "difficulty_weights must be finite, non-negative, and have a positive sum"
+                )
+            if (
+                self.evaluate
+                and self.validation_manifest is None
+                and self.test_manifest is None
+            ):
+                raise ValueError(
+                    "generator training evaluation requires a validation or test manifest"
+                )
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.gamma <= 1.0:
@@ -143,6 +183,44 @@ class EpisodeStat:
     normalized_return: float
     reward: float
     success: bool
+
+
+@dataclass(slots=True)
+class EnvSlot:
+    env: ClusterEnv
+    encoder: ClusterObservationEncoder
+    observation: dict[str, Any]
+    reference_makespan: float
+    episode_index: int = 0
+    episode_reward: float = 0.0
+
+
+class GeneratorEnvFactory:
+    """Create deterministic online-training environment slots."""
+
+    def __init__(
+        self,
+        config: PPOConfig,
+        *,
+        generator: ProblemGenerator | None = None,
+    ) -> None:
+        self.config = config
+        self.generator = generator or ProblemGenerator()
+
+    def episode_seed(self, slot_index: int, episode_index: int) -> int:
+        return (
+            self.config.generator_seed
+            + slot_index
+            + episode_index * self.config.num_envs
+        )
+
+    def make(self, slot_index: int, episode_index: int = 0) -> EnvSlot:
+        return make_env_slot(
+            self.generator,
+            seed=self.episode_seed(slot_index, episode_index),
+            episode_index=episode_index,
+            difficulty_weights=self.config.difficulty_weights,
+        )
 
 
 class _Tee:
@@ -186,20 +264,123 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
+def _first_legal_reference(problem: ClusterProblem, scenario: str) -> float:
+    return rollout(
+        ClusterEnv(problem),
+        scenario,
+        "reference_first_legal",
+        first_legal_action,
+    ).makespan
+
+
+def make_env_slot(
+    generator: ProblemGenerator,
+    *,
+    seed: int,
+    episode_index: int = 0,
+    difficulty_weights: Mapping[str, float] | None = None,
+) -> EnvSlot:
+    problem = generator.sample_curriculum(
+        seed=seed,
+        split="train",
+        weights=(
+            None
+            if difficulty_weights is None
+            else dict(difficulty_weights)
+        ),
+    )
+    scenario = str(problem.meta.get("name", f"generated_{seed}"))
+    env = ClusterEnv(problem)
+    encoder = ClusterObservationEncoder.from_env(env)
+    observation, _ = env.reset(seed=seed)
+    return EnvSlot(
+        env=env,
+        encoder=encoder,
+        observation=observation,
+        reference_makespan=_first_legal_reference(problem, scenario),
+        episode_index=episode_index,
+    )
+
+
 def _reference_makespans(
     problems: list[ClusterProblem],
 ) -> list[float]:
-    references = []
-    for index, problem in enumerate(problems):
-        scenario = str(problem.meta.get("name", f"env_{index}"))
-        result = rollout(
-            ClusterEnv(problem),
-            scenario,
-            "reference_first_legal",
-            first_legal_action,
+    return [
+        _first_legal_reference(
+            problem,
+            str(problem.meta.get("name", f"env_{index}")),
         )
-        references.append(result.makespan)
-    return references
+        for index, problem in enumerate(problems)
+    ]
+
+
+def _fixed_env_slots(
+    problems: list[ClusterProblem],
+    references: list[float],
+    seed: int,
+) -> list[EnvSlot]:
+    slots = []
+    for index, (problem, reference) in enumerate(zip(problems, references)):
+        env = ClusterEnv(problem)
+        slots.append(
+            EnvSlot(
+                env=env,
+                encoder=ClusterObservationEncoder.from_env(env),
+                observation=env.reset(seed=seed + index)[0],
+                reference_makespan=reference,
+            )
+        )
+    return slots
+
+
+def _manifest_problem_paths(manifest_path: Path) -> tuple[Path, ...]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read evaluation manifest: {manifest_path}") from exc
+    if manifest.get("generator", {}).get("mode") != "ppo":
+        raise ValueError(f"not a PPO dataset manifest: {manifest_path}")
+
+    paths = []
+    dataset_dir = manifest_path.parent.resolve()
+    for entry in manifest.get("instances", []):
+        problem_file = entry.get("problem_file")
+        if not isinstance(problem_file, str):
+            raise ValueError(
+                f"evaluation manifest contains an unmaterialized problem: {manifest_path}"
+            )
+        problem_path = (dataset_dir / problem_file).resolve()
+        if problem_path.parent != dataset_dir:
+            raise ValueError(
+                f"evaluation manifest contains an unsafe problem path: {problem_file}"
+            )
+        paths.append(problem_path)
+    if not paths:
+        raise ValueError(f"evaluation manifest has no instances: {manifest_path}")
+    return tuple(paths)
+
+
+def _evaluation_problems(
+    config: PPOConfig,
+) -> list[tuple[str, ClusterProblem]]:
+    manifests = tuple(
+        (split, path)
+        for split, path in (
+            ("validation", config.validation_manifest),
+            ("test", config.test_manifest),
+        )
+        if path is not None
+    )
+    if manifests:
+        return [
+            (split, load_problem(problem_path))
+            for split, manifest_path in manifests
+            for problem_path in _manifest_problem_paths(manifest_path)
+        ]
+    return [
+        ("scenario", load_problem(path))
+        for path in config.scenario_paths
+    ]
 
 
 def _stack_entity_batches(batches: list[EntityBatch]) -> EntityBatch:
@@ -251,14 +432,11 @@ def _normalized_reward(
 
 def _collect_rollout(
     model: ClusterActorCritic,
-    envs: list[ClusterEnv],
-    encoders: list[ClusterObservationEncoder],
-    references: list[float],
-    observations: list[dict[str, Any]],
-    episode_rewards: list[float],
+    slots: list[EnvSlot],
     config: PPOConfig,
     device: torch.device,
-) -> tuple[RolloutBatch, list[dict[str, Any]], list[EpisodeStat]]:
+    env_factory: GeneratorEnvFactory | None = None,
+) -> tuple[RolloutBatch, list[EpisodeStat]]:
     state_steps = []
     action_steps = []
     log_probability_steps = []
@@ -270,8 +448,8 @@ def _collect_rollout(
     model.eval()
     for _ in range(config.rollout_steps):
         states = collate_observations(
-            encoders,
-            observations,
+            [slot.encoder for slot in slots],
+            [slot.observation for slot in slots],
             device=device,
         )
         with torch.inference_mode():
@@ -280,19 +458,18 @@ def _collect_rollout(
             model_actions = distribution.sample()
 
         env_actions = states.to_env_actions(model_actions).cpu().tolist()
-        next_observations = []
         normalized_rewards = []
         dones = []
-        for index, (env, action) in enumerate(zip(envs, env_actions)):
-            observation, reward, terminated, truncated, info = env.step(
+        for index, (slot, action) in enumerate(zip(slots, env_actions)):
+            observation, reward, terminated, truncated, info = slot.env.step(
                 action
             )
             done = terminated or truncated
             success = bool(info.get("is_success"))
-            episode_rewards[index] += reward
+            slot.episode_reward += reward
             normalized_reward = _normalized_reward(
                 reward,
-                references[index],
+                slot.reference_makespan,
                 done and success,
             )
             normalized_rewards.append(normalized_reward)
@@ -300,24 +477,31 @@ def _collect_rollout(
 
             if done:
                 normalized_return = (
-                    episode_rewards[index] / references[index]
+                    slot.episode_reward / slot.reference_makespan
                     + float(success)
                 )
                 episode_stats.append(
                     EpisodeStat(
                         scenario=str(
-                            env.problem.meta.get("name", f"env_{index}")
+                            slot.env.problem.meta.get("name", f"env_{index}")
                         ),
                         makespan=float(info["time"]),
-                        reference_makespan=references[index],
+                        reference_makespan=slot.reference_makespan,
                         normalized_return=normalized_return,
-                        reward=episode_rewards[index],
+                        reward=slot.episode_reward,
                         success=success,
                     )
                 )
-                observation, _ = env.reset()
-                episode_rewards[index] = 0.0
-            next_observations.append(observation)
+                if env_factory is None:
+                    slot.observation, _ = slot.env.reset()
+                    slot.episode_reward = 0.0
+                else:
+                    slots[index] = env_factory.make(
+                        index,
+                        slot.episode_index + 1,
+                    )
+            else:
+                slot.observation = observation
 
         state_steps.append(states)
         action_steps.append(model_actions)
@@ -335,12 +519,10 @@ def _collect_rollout(
         done_steps.append(
             torch.tensor(dones, dtype=torch.bool, device=device)
         )
-        observations = next_observations
-
     with torch.inference_mode():
         last_states = collate_observations(
-            encoders,
-            observations,
+            [slot.encoder for slot in slots],
+            [slot.observation for slot in slots],
             device=device,
         )
         last_values = model(last_states).value
@@ -369,7 +551,6 @@ def _collect_rollout(
             advantages=advantages.flatten(),
             returns=returns.flatten(),
         ),
-        observations,
         episode_stats,
     )
 
@@ -511,7 +692,13 @@ def _serialize_config(config: PPOConfig) -> dict[str, object]:
     serialized["scenario_paths"] = [
         str(path) for path in config.scenario_paths
     ]
-    for name in ("run_dir", "checkpoint", "resume"):
+    for name in (
+        "run_dir",
+        "checkpoint",
+        "resume",
+        "validation_manifest",
+        "test_manifest",
+    ):
         value = getattr(config, name)
         serialized[name] = None if value is None else str(value)
     return serialized
@@ -522,6 +709,7 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     config: PPOConfig,
     references: list[float],
+    episode_indexes: list[int],
     global_step: int,
     update: int,
 ) -> None:
@@ -536,6 +724,7 @@ def _save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "config": _serialize_config(config),
             "reference_makespans": references,
+            "episode_indexes": episode_indexes,
             "global_step": global_step,
             "update": update,
         },
@@ -788,10 +977,12 @@ def _evaluation(
     model: ClusterActorCritic,
     envs: list[ClusterEnv],
     references: list[float],
+    splits: list[str] | None = None,
 ) -> list[dict[str, object]]:
     model.eval()
     results = []
-    for env, reference in zip(envs, references):
+    evaluation_splits = splits or ["scenario"] * len(envs)
+    for split, env, reference in zip(evaluation_splits, envs, references):
         scenario = str(env.problem.meta.get("name", "scenario"))
         result = rollout(
             env,
@@ -801,6 +992,7 @@ def _evaluation(
         )
         results.append(
             {
+                "split": split,
                 "scenario": scenario,
                 "reference_makespan": reference,
                 "makespan": result.makespan,
@@ -819,13 +1011,14 @@ def _print_evaluation(results: list[dict[str, object]]) -> None:
     print("\nFinal greedy evaluation")
     print("-" * 78)
     print(
-        f"{'Scenario':<24} {'Reference':>10} {'Model':>10} "
+        f"{'Split':<12} {'Scenario':<20} {'Reference':>10} {'Model':>10} "
         f"{'Gain':>10} {'Valid':>8}"
     )
     print("-" * 78)
     for result in results:
         print(
-            f"{str(result['scenario']):<24} "
+            f"{str(result['split']):<12} "
+            f"{str(result['scenario']):<20} "
             f"{float(result['reference_makespan']):>10.1f} "
             f"{float(result['makespan']):>10.1f} "
             f"{100 * float(result['relative_gain']):>9.2f}% "
@@ -871,15 +1064,23 @@ def _train(config: PPOConfig) -> dict[str, object]:
     torch.manual_seed(config.seed)
     device = _resolve_device(config.device)
 
-    problems = [load_problem(path) for path in config.scenario_paths]
-    references = _reference_makespans(problems)
-    envs = [ClusterEnv(problem) for problem in problems]
-    encoders = [ClusterObservationEncoder.from_env(env) for env in envs]
-    observations = [
-        env.reset(seed=config.seed + index)[0]
-        for index, env in enumerate(envs)
-    ]
-    episode_rewards = [0.0] * len(envs)
+    env_factory = (
+        GeneratorEnvFactory(config)
+        if config.train_mode == "generator"
+        else None
+    )
+    if env_factory is None:
+        problems = [load_problem(path) for path in config.scenario_paths]
+        slots = _fixed_env_slots(
+            problems,
+            _reference_makespans(problems),
+            config.seed,
+        )
+    else:
+        slots = [
+            env_factory.make(index)
+            for index in range(config.num_envs)
+        ]
 
     model_config = TransformerConfig(
         model_dim=config.model_dim,
@@ -910,7 +1111,18 @@ def _train(config: PPOConfig) -> dict[str, object]:
                 "start a new training run"
             )
         saved_references = checkpoint.get("reference_makespans")
-        if saved_references != references:
+        if env_factory is not None:
+            saved_episode_indexes = checkpoint.get("episode_indexes")
+            if (
+                isinstance(saved_episode_indexes, list)
+                and len(saved_episode_indexes) == len(slots)
+            ):
+                slots = [
+                    env_factory.make(index, int(episode_index) + 1)
+                    for index, episode_index in enumerate(saved_episode_indexes)
+                ]
+        references = [slot.reference_makespan for slot in slots]
+        if config.train_mode == "scenarios" and saved_references != references:
             raise ValueError(
                 "checkpoint reference makespans do not match the scenarios"
             )
@@ -919,7 +1131,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
         global_step = int(checkpoint["global_step"])
         first_update = int(checkpoint["update"]) + 1
 
-    steps_per_update = config.rollout_steps * len(envs)
+    steps_per_update = config.rollout_steps * len(slots)
     remaining_steps = max(0, config.total_steps - global_step)
     update_count = math.ceil(remaining_steps / steps_per_update)
     last_update = first_update + update_count - 1
@@ -927,27 +1139,24 @@ def _train(config: PPOConfig) -> dict[str, object]:
     print("=" * 78)
     print("Masked PPO training")
     print(
-        f"device={device}  scenarios={len(envs)}  "
+        f"device={device}  mode={config.train_mode}  envs={len(slots)}  "
         f"target_steps={config.total_steps}  run_dir={config.run_dir}"
     )
     print("Reference makespans:")
-    for problem, reference in zip(problems, references):
+    for slot in slots:
         print(
-            f"  - {problem.meta.get('name', 'scenario')}: "
-            f"{reference:.1f}"
+            f"  - {slot.env.problem.meta.get('name', 'scenario')}: "
+            f"{slot.reference_makespan:.1f}"
         )
     print("=" * 78)
 
     for update in range(first_update, last_update + 1):
-        rollout_batch, observations, episode_stats = _collect_rollout(
+        rollout_batch, episode_stats = _collect_rollout(
             model,
-            envs,
-            encoders,
-            references,
-            observations,
-            episode_rewards,
+            slots,
             config,
             device,
+            env_factory,
         )
         metrics = _ppo_update(
             model,
@@ -989,7 +1198,8 @@ def _train(config: PPOConfig) -> dict[str, object]:
                 model,
                 optimizer,
                 config,
-                references,
+                [slot.reference_makespan for slot in slots],
+                [slot.episode_index for slot in slots],
                 global_step,
                 update,
             )
@@ -1000,18 +1210,26 @@ def _train(config: PPOConfig) -> dict[str, object]:
             model,
             optimizer,
             config,
-            references,
+            [slot.reference_makespan for slot in slots],
+            [slot.episode_index for slot in slots],
             global_step,
             first_update - 1,
         )
         if _read_csv(config.run_dir / "updates.csv"):
             _plot_training_curves(config.run_dir)
 
-    evaluation = (
-        _evaluation(model, envs, references)
-        if config.evaluate
-        else []
-    )
+    if config.evaluate:
+        evaluation_cases = _evaluation_problems(config)
+        evaluation_problems = [problem for _, problem in evaluation_cases]
+        evaluation_references = _reference_makespans(evaluation_problems)
+        evaluation = _evaluation(
+            model,
+            [ClusterEnv(problem) for problem in evaluation_problems],
+            evaluation_references,
+            [split for split, _ in evaluation_cases],
+        )
+    else:
+        evaluation = []
     for result in evaluation:
         _append_csv(
             config.run_dir / "evaluation.csv",
@@ -1035,7 +1253,9 @@ def _train(config: PPOConfig) -> dict[str, object]:
         "device": str(device),
         "global_step": global_step,
         "updates": update_count,
-        "reference_makespans": references,
+        "reference_makespans": [
+            slot.reference_makespan for slot in slots
+        ],
         "evaluation": evaluation,
     }
 
@@ -1050,6 +1270,15 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=_default_scenarios(),
     )
+    parser.add_argument(
+        "--train-mode",
+        choices=("scenarios", "generator"),
+        default="scenarios",
+    )
+    parser.add_argument("--num-envs", type=int, default=8)
+    parser.add_argument("--generator-seed", type=int, default=42)
+    parser.add_argument("--validation-manifest", type=Path)
+    parser.add_argument("--test-manifest", type=Path)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -1094,6 +1323,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config = PPOConfig(
         scenario_paths=tuple(args.scenarios),
+        train_mode=args.train_mode,
+        num_envs=args.num_envs,
+        generator_seed=args.generator_seed,
+        validation_manifest=args.validation_manifest,
+        test_manifest=args.test_manifest,
         run_dir=run_dir,
         checkpoint=checkpoint,
         resume=args.resume,

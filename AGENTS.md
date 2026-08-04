@@ -12,9 +12,12 @@
 
 ## 项目组成
 
-problem/ 内部为具体的问题定义，用于加载实例，获取信息
+cluster_rl/ 包含环境、异构图网络和PPO训练代码
 
-validator/ 为验证器，给定问题实例和动作序列，用于验证动作序列是否合法
+examples/ 和 tests/ 分别包含固定示例与RL测试
+
+问题Schema、Validator、ClusterEngine和Generator由相邻的
+`cluster-tool-validator` 工具包统一维护，本仓库通过依赖使用，不再保留副本。
 
 ## 核心任务
 

@@ -5,3 +5,4 @@ pydantic>=2,<3
 pytest>=8,<10
 torch>=2,<3
 torch-geometric>=2.8,<3
+cluster-tool-toolkit @ git+ssh://git@github.com/Huaisure/cluster-tool-validator.git@v0.2.0

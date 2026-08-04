@@ -18,17 +18,37 @@ PPO 使用 first-legal 调度的 makespan 进行归一化：
 
 ## 环境与启动
 
-PyTorch Geometric 安装在 Conda `rl` 环境中：
+本地开发先安装相邻的统一工具包：
 
 ```bash
 conda activate rl
-python -m cluster_rl.train --total-steps 100000
+python -m pip install -e ../cluster-tool-validator
 ```
+
+在线生成训练需要提供固定的验证集和测试集 manifest：
+
+```bash
+python -m cluster_rl.train \
+  --train-mode generator \
+  --num-envs 8 \
+  --generator-seed 42 \
+  --validation-manifest datasets/validation/manifest.json \
+  --test-manifest datasets/test/manifest.json \
+  --total-steps 100000
+```
+
+每个环境槽位在 episode 结束后都会用新的确定性种子生成完整实例，并同步替换
+`ClusterEnv`、观察编码器和初始观察。训练参考值由 RL 环境的 FIFO-aware
+`first_legal` rollout 计算；工具包 manifest 中的启发式 actions 不作为 RL 基线。
+训练结束后的 greedy evaluation 只读取固定 validation/test manifest。
 
 首次验证链路可以运行：
 
 ```bash
 python -m cluster_rl.train \
+  --train-mode generator \
+  --num-envs 2 \
+  --validation-manifest datasets/validation/manifest.json \
   --total-steps 384 \
   --rollout-steps 128 \
   --epochs 1 \
