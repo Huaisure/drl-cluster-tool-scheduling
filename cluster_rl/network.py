@@ -60,7 +60,7 @@ class EncodedObservation:
 class EntityBatch:
     """Batched heterogeneous graphs and padded action queries."""
 
-    graph: Batch
+    graph: HeteroData
     action_mask: Tensor
     action_valid: Tensor
     action_kind: Tensor
@@ -92,78 +92,6 @@ class EntityBatch:
 
         self._validate_actions(model_actions, "model_actions")
         return model_actions.to(self.action_mask.device)
-
-    def index_select(
-        self,
-        indexes: Tensor,
-        *,
-        data_list: Sequence[HeteroData] | None = None,
-    ) -> EntityBatch:
-        indexes = indexes.to(self.action_mask.device, dtype=torch.long)
-        if data_list is None:
-            data_list = self.graph.to_data_list()
-        if len(data_list) != self.batch_size:
-            raise ValueError("data_list must contain one graph per batch item")
-        selected_graphs = [data_list[index] for index in indexes.cpu().tolist()]
-        return EntityBatch(
-            graph=Batch.from_data_list(selected_graphs).to(self.action_mask.device),
-            action_mask=self.action_mask.index_select(0, indexes),
-            action_valid=self.action_valid.index_select(0, indexes),
-            action_kind=self.action_kind.index_select(0, indexes),
-            action_entity=self.action_entity.index_select(0, indexes),
-            action_robot=self.action_robot.index_select(0, indexes),
-        )
-
-    @classmethod
-    def concatenate(cls, batches: Sequence[EntityBatch]) -> EntityBatch:
-        if not batches:
-            raise ValueError("batches must not be empty")
-
-        device = batches[0].action_mask.device
-        if any(batch.action_mask.device != device for batch in batches):
-            raise ValueError("all batches must be on the same device")
-
-        graphs = [
-            graph
-            for batch in batches
-            for graph in batch.graph.to_data_list()
-        ]
-        max_actions = max(batch.action_mask.shape[1] for batch in batches)
-        batch_size = sum(batch.batch_size for batch in batches)
-        action_mask = torch.zeros(
-            batch_size, max_actions, dtype=torch.bool, device=device
-        )
-        action_valid = torch.zeros_like(action_mask)
-        action_kind = torch.full(
-            (batch_size, max_actions),
-            PAD_ACTION,
-            dtype=torch.long,
-            device=device,
-        )
-        action_entity = torch.zeros(
-            batch_size, max_actions, dtype=torch.long, device=device
-        )
-        action_robot = torch.zeros_like(action_entity)
-
-        offset = 0
-        for batch in batches:
-            end = offset + batch.batch_size
-            width = batch.action_mask.shape[1]
-            action_mask[offset:end, :width] = batch.action_mask
-            action_valid[offset:end, :width] = batch.action_valid
-            action_kind[offset:end, :width] = batch.action_kind
-            action_entity[offset:end, :width] = batch.action_entity
-            action_robot[offset:end, :width] = batch.action_robot
-            offset = end
-
-        return cls(
-            graph=Batch.from_data_list(graphs).to(device),
-            action_mask=action_mask,
-            action_valid=action_valid,
-            action_kind=action_kind,
-            action_entity=action_entity,
-            action_robot=action_robot,
-        )
 
     def _validate_actions(self, actions: Tensor, name: str) -> None:
         if actions.shape != (self.batch_size,):
@@ -322,6 +250,70 @@ def collate_encoded_observations(
     if not encoded:
         raise ValueError("encoded must not be empty")
 
+    graph = Batch.from_data_list([item.graph for item in encoded])
+    return _collate_encoded_batch(encoded, graph, device)
+
+
+def collate_encoded_observations_fast(
+    encoded: Sequence[EncodedObservation],
+    *,
+    device: torch.device | str | None = None,
+) -> EntityBatch:
+    """Batch the fixed training graph schema without PyG slice metadata."""
+
+    if not encoded:
+        raise ValueError("encoded must not be empty")
+
+    batch_size = len(encoded)
+    graph = HeteroData()
+    node_ptrs: dict[str, Tensor] = {}
+
+    for node_type in NODE_TYPES:
+        features = [item.graph[node_type].x for item in encoded]
+        counts = torch.tensor(
+            [feature.shape[0] for feature in features],
+            dtype=torch.long,
+        )
+        ptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+        graph[node_type].x = torch.cat(features, dim=0)
+        graph[node_type].batch = torch.repeat_interleave(
+            torch.arange(batch_size), counts
+        )
+        graph[node_type].ptr = ptr
+        graph[node_type].num_nodes = ptr[-1].item()
+        node_ptrs[node_type] = ptr
+
+    for edge_type in EDGE_TYPES:
+        source_type, _, target_type = edge_type
+        edges = [item.graph[edge_type].edge_index for item in encoded]
+        counts = torch.tensor(
+            [edge.shape[1] for edge in edges],
+            dtype=torch.long,
+        )
+        edge_index = torch.cat(edges, dim=1)
+        if edge_index.numel():
+            edge_index = edge_index + torch.stack(
+                (
+                    torch.repeat_interleave(
+                        node_ptrs[source_type][:-1], counts
+                    ),
+                    torch.repeat_interleave(
+                        node_ptrs[target_type][:-1], counts
+                    ),
+                )
+            )
+        graph[edge_type].edge_index = edge_index
+
+    return _collate_encoded_batch(encoded, graph, device)
+
+
+def _collate_encoded_batch(
+    encoded: Sequence[EncodedObservation],
+    graph: HeteroData,
+    device: torch.device | str | None,
+) -> EntityBatch:
+    """Pad action descriptions and attach them to an already batched graph."""
+
     max_actions = max(item.action_mask.shape[0] for item in encoded)
     batch_size = len(encoded)
     action_mask = torch.zeros(batch_size, max_actions, dtype=torch.bool)
@@ -345,7 +337,7 @@ def collate_encoded_observations(
         )
 
     return EntityBatch(
-        graph=Batch.from_data_list([item.graph for item in encoded]),
+        graph=graph,
         action_mask=action_mask,
         action_valid=action_valid,
         action_kind=action_kind,

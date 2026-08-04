@@ -31,7 +31,7 @@ python -m pip install -e ../cluster-tool-validator
 python -m cluster_rl.train \
   --train-mode generator \
   --num-envs 8 \
-  --cpu-workers 8 \
+  --cpu-workers 0 \
   --generator-seed 42 \
   --validation-manifest datasets/validation/manifest.json \
   --test-manifest datasets/test/manifest.json \
@@ -63,15 +63,14 @@ python -m cluster_rl.train \
 decoder 深度。Apple Silicon 可添加 `--device mps`，NVIDIA GPU 可添加
 `--device cuda`；默认使用 CPU。
 
-生成模式可通过 `--cpu-workers N` 启用持久化CPU进程。每个worker持有一组独立环境，
-并行执行环境推进、异构图编码，以及episode结束后的新问题与FIFO-aware参考调度生成；
-主进程只负责批处理和模型计算。`N`不能超过`--num-envs`，默认值0保留串行行为。
-在Slurm中应确保`--cpus-per-task`至少覆盖worker数量，并为主进程额外预留一个CPU核。
+生成模式可通过 `--cpu-workers N` 启用持久化环境进程，但小图逐步跨进程传输的IPC
+开销可能高于并行收益，默认和推荐值均为0。PPO使用针对固定异构图schema的专用
+minibatch拼接路径，避免通用PyG Batch的额外拆装。
 每个update日志分别输出`rollout`和`PPO`耗时，便于判断瓶颈位于环境侧还是模型更新侧。
 
 需要进一步定位时可添加`--profile-timing`。该模式会打印图编码、主进程拼批与传输、
-策略推理、环境/IPC等待、worker内部环境推进/参考调度/图编码，以及PPO拆图、minibatch
-重组、前向和反向的耗时。为获得准确GPU计时，它会在各阶段同步CUDA，因此只应用于
+策略推理、环境/IPC等待、worker内部环境推进/参考调度/图编码，以及PPO minibatch
+拼接、前向和反向的耗时。为获得准确GPU计时，它会在各阶段同步CUDA，因此只应用于
 一到两个诊断update，不要用于正式长时间训练。
 
 ## 输出与日志

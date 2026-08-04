@@ -33,9 +33,8 @@ from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
     EncodedObservation,
-    EntityBatch,
     TransformerConfig,
-    collate_encoded_observations,
+    collate_encoded_observations_fast,
 )
 from cluster_generator import ProblemGenerator
 from problem import ClusterProblem, load_problem
@@ -182,7 +181,7 @@ class PPOConfig:
 
 @dataclass(frozen=True, slots=True)
 class RolloutBatch:
-    states: EntityBatch
+    states: tuple[EncodedObservation, ...]
     actions: Tensor
     old_log_probabilities: Tensor
     old_values: Tensor
@@ -519,16 +518,10 @@ def _evaluation_problems(
     ]
 
 
-def _stack_entity_batches(batches: list[EntityBatch]) -> EntityBatch:
-    return EntityBatch.concatenate(batches)
-
-
-def _select_states(
-    states: EntityBatch,
-    indexes: Tensor,
-    data_list: Sequence[Any] | None = None,
-) -> EntityBatch:
-    return states.index_select(indexes, data_list=data_list)
+def _flatten_encoded_steps(
+    steps: Sequence[Sequence[EncodedObservation]],
+) -> tuple[EncodedObservation, ...]:
+    return tuple(encoded for step in steps for encoded in step)
 
 
 def _advantages(
@@ -854,7 +847,7 @@ def _collect_rollout(
                 for slot in slots
             ]
         with _measure(timer, "rollout.collate_h2d"):
-            states = collate_encoded_observations(encoded, device=device)
+            states = collate_encoded_observations_fast(encoded, device=device)
         with _measure(timer, "rollout.policy_gpu"):
             with torch.inference_mode():
                 output = model(states)
@@ -885,7 +878,7 @@ def _collect_rollout(
                 timer.add(name, seconds)
 
         with _measure(timer, "rollout.buffer"):
-            state_steps.append(states)
+            state_steps.append(tuple(encoded))
             action_steps.append(model_actions)
             log_probability_steps.append(
                 distribution.log_prob(model_actions)
@@ -907,7 +900,10 @@ def _collect_rollout(
             for slot in slots
         ]
         with torch.inference_mode():
-            last_states = collate_encoded_observations(encoded, device=device)
+            last_states = collate_encoded_observations_fast(
+                encoded,
+                device=device,
+            )
             last_values = model(last_states).value
 
     with _measure(timer, "rollout.gae"):
@@ -924,8 +920,8 @@ def _collect_rollout(
         )
         returns = advantages + values
 
-    with _measure(timer, "rollout.stack_graphs"):
-        rollout_states = _stack_entity_batches(state_steps)
+    with _measure(timer, "rollout.flatten_states"):
+        rollout_states = _flatten_encoded_steps(state_steps)
 
     return (
         RolloutBatch(
@@ -959,9 +955,10 @@ def _collect_parallel_rollout(
 
     model.eval()
     for _ in range(config.rollout_steps):
+        encoded = env_pool.encoded
         with _measure(timer, "rollout.collate_h2d"):
-            states = collate_encoded_observations(
-                env_pool.encoded,
+            states = collate_encoded_observations_fast(
+                encoded,
                 device=device,
             )
         with _measure(timer, "rollout.policy_gpu"):
@@ -980,7 +977,7 @@ def _collect_parallel_rollout(
         episode_stats.extend(completed)
 
         with _measure(timer, "rollout.buffer"):
-            state_steps.append(states)
+            state_steps.append(tuple(encoded))
             action_steps.append(model_actions)
             log_probability_steps.append(
                 distribution.log_prob(model_actions)
@@ -999,7 +996,7 @@ def _collect_parallel_rollout(
 
     with _measure(timer, "rollout.bootstrap"):
         with torch.inference_mode():
-            last_states = collate_encoded_observations(
+            last_states = collate_encoded_observations_fast(
                 env_pool.encoded,
                 device=device,
             )
@@ -1019,8 +1016,8 @@ def _collect_parallel_rollout(
         )
         returns = advantages + values
 
-    with _measure(timer, "rollout.stack_graphs"):
-        rollout_states = _stack_entity_batches(state_steps)
+    with _measure(timer, "rollout.flatten_states"):
+        rollout_states = _flatten_encoded_steps(state_steps)
 
     return (
         RolloutBatch(
@@ -1060,24 +1057,25 @@ def _ppo_update(
         "grad_norm": 0.0,
     }
     minibatch_count = 0
-    with _measure(timer, "ppo.split_graph_batch"):
-        state_data_list = rollout_batch.states.graph.to_data_list()
 
     model.train()
     for _ in range(config.epochs):
-        indexes = torch.randperm(
-            sample_count,
-            device=rollout_batch.actions.device,
-        )
+        indexes = torch.randperm(sample_count)
         for start in range(0, sample_count, config.minibatch_size):
-            minibatch_indexes = indexes[
+            cpu_indexes = indexes[
                 start : start + config.minibatch_size
             ]
             with _measure(timer, "ppo.minibatch_rebatch"):
-                states = _select_states(
-                    rollout_batch.states,
-                    minibatch_indexes,
-                    state_data_list,
+                minibatch_states = [
+                    rollout_batch.states[index]
+                    for index in cpu_indexes.tolist()
+                ]
+                states = collate_encoded_observations_fast(
+                    minibatch_states,
+                    device=rollout_batch.actions.device,
+                )
+                minibatch_indexes = cpu_indexes.to(
+                    rollout_batch.actions.device
                 )
             with _measure(timer, "ppo.forward_gpu"):
                 output = model(states)
@@ -1488,10 +1486,9 @@ def _print_timing_profile(timer: PhaseTimer) -> None:
         ("rollout.buffer", "rollout buffer writes"),
         ("rollout.bootstrap", "rollout bootstrap value"),
         ("rollout.gae", "rollout GAE"),
-        ("rollout.stack_graphs", "rollout final graph stacking"),
+        ("rollout.flatten_states", "rollout flatten CPU graph list"),
         ("ppo.prepare", "PPO advantage preparation"),
-        ("ppo.split_graph_batch", "PPO split graph batch once"),
-        ("ppo.minibatch_rebatch", "PPO minibatch graph rebatch"),
+        ("ppo.minibatch_rebatch", "PPO minibatch fast rebatch + H2D"),
         ("ppo.forward_gpu", "PPO model forward"),
         ("ppo.loss_gpu", "PPO loss construction"),
         ("ppo.backward_optimizer_gpu", "PPO backward + optimizer"),

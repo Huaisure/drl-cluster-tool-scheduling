@@ -11,6 +11,8 @@ from cluster_rl.network import (
     ClusterActorCritic,
     ClusterObservationEncoder,
     TransformerConfig,
+    collate_encoded_observations,
+    collate_encoded_observations_fast,
     collate_observations,
 )
 from problem import load_problem, parse_problem
@@ -76,6 +78,52 @@ def test_forward_masks_illegal_and_padded_actions() -> None:
     assert torch.isfinite(output.logits[batch.action_mask]).all()
     assert torch.isneginf(output.logits[~batch.action_mask]).all()
     assert torch.isfinite(output.value).all()
+
+
+def test_fast_collate_matches_generic_pyg_batch() -> None:
+    first_env, first_observation = _env("long_route_1w.json")
+    second_env, second_observation = _env("mixed_3pm_20w.json")
+    encoded = [
+        ClusterObservationEncoder.from_env(env).encode(observation)
+        for env, observation in (
+            (first_env, first_observation),
+            (second_env, second_observation),
+        )
+    ]
+
+    generic = collate_encoded_observations(encoded)
+    fast = collate_encoded_observations_fast(encoded)
+
+    for name in (
+        "action_mask",
+        "action_valid",
+        "action_kind",
+        "action_entity",
+        "action_robot",
+    ):
+        assert torch.equal(getattr(fast, name), getattr(generic, name))
+    for node_type in generic.graph.node_types:
+        assert torch.equal(fast.graph[node_type].x, generic.graph[node_type].x)
+        assert torch.equal(
+            fast.graph[node_type].batch,
+            generic.graph[node_type].batch,
+        )
+        assert torch.equal(
+            fast.graph[node_type].ptr,
+            generic.graph[node_type].ptr,
+        )
+    for edge_type in generic.graph.edge_types:
+        assert torch.equal(
+            fast.graph[edge_type].edge_index,
+            generic.graph[edge_type].edge_index,
+        )
+
+    model = _model().eval()
+    with torch.no_grad():
+        generic_output = model(generic)
+        fast_output = model(fast)
+    assert torch.equal(fast_output.logits, generic_output.logits)
+    assert torch.equal(fast_output.value, generic_output.value)
 
 
 def test_action_indexes_are_identical_between_model_and_environment() -> None:

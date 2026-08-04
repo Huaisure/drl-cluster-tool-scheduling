@@ -133,7 +133,7 @@ def test_rollout_replaces_completed_generator_slot() -> None:
         )
     )
 
-    _, stats = _collect_rollout(
+    rollout_batch, stats = _collect_rollout(
         model,
         slots,
         config,
@@ -142,6 +142,12 @@ def test_rollout_replaces_completed_generator_slot() -> None:
     )
 
     assert len(stats) == 1
+    assert len(rollout_batch.states) == config.rollout_steps
+    for encoded, action in zip(
+        rollout_batch.states,
+        rollout_batch.actions.tolist(),
+    ):
+        assert encoded.action_mask[action]
     assert slots[0].episode_index == 1
     assert [call[0] for call in generator.calls] == [5, 6]
 
