@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import pickle
 from pathlib import Path
@@ -20,6 +21,7 @@ from cluster_rl.train import (
     _evaluation_problems,
     _first_legal_reference,
     _manifest_problem_paths,
+    _normalize_choice_advantages,
     _normalized_reward,
     _step_env_slot,
     train,
@@ -54,6 +56,32 @@ def test_advantages_stop_bootstrapping_at_episode_end() -> None:
         result,
         torch.tensor([[3.0], [2.0], [7.0]]),
     )
+
+
+def test_actor_advantages_are_normalized_over_choice_states_only() -> None:
+    advantages = torch.tensor([100.0, 1.0, 3.0, -100.0])
+    choice_mask = torch.tensor([False, True, True, False])
+
+    result = _normalize_choice_advantages(advantages, choice_mask)
+
+    torch.testing.assert_close(result, torch.tensor([0.0, -1.0, 1.0, 0.0]))
+
+
+def test_ppo_defaults_use_long_horizon_gae_and_kl_limit() -> None:
+    config = PPOConfig(
+        scenario_paths=(SCENARIO_DIR / "long_route_1w.json",),
+        evaluate=False,
+    )
+
+    assert config.gae_lambda == 0.99
+    assert config.target_kl == 0.02
+
+    with pytest.raises(ValueError, match="target_kl must be positive"):
+        PPOConfig(
+            scenario_paths=(SCENARIO_DIR / "long_route_1w.json",),
+            target_kl=0.0,
+            evaluate=False,
+        )
 
 
 def test_normalized_reward_has_bounded_telescoping_time_cost() -> None:
@@ -309,10 +337,11 @@ def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
         scenario_paths=tuple(sorted(SCENARIO_DIR.glob("*.json"))),
         run_dir=run_dir,
         checkpoint=checkpoint,
-        total_steps=12,
-        rollout_steps=4,
-        epochs=1,
+        total_steps=36,
+        rollout_steps=12,
+        epochs=4,
         minibatch_size=12,
+        target_kl=1e-12,
         model_dim=16,
         num_heads=4,
         num_layers=1,
@@ -323,7 +352,7 @@ def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
 
     summary = train(config)
 
-    assert summary["global_step"] == 12
+    assert summary["global_step"] == 36
     assert summary["updates"] == 1
     assert summary["checkpoint"] == str(checkpoint)
     assert checkpoint.is_file()
@@ -331,5 +360,8 @@ def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
     assert (run_dir / "episodes.csv").is_file()
     assert (run_dir / "evaluation.csv").is_file()
     assert (run_dir / "config.json").is_file()
+    with (run_dir / "updates.csv").open(newline="", encoding="utf-8") as stream:
+        update_row = next(csv.DictReader(stream))
+    assert 1 <= float(update_row["ppo_epochs"]) < config.epochs
     assert "Masked PPO training" in (run_dir / "train.log").read_text()
     assert (run_dir / "training_curves.png").is_file()

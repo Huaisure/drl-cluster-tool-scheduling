@@ -40,7 +40,7 @@ from cluster_generator import ProblemGenerator
 from problem import ClusterProblem, load_problem
 
 
-CHECKPOINT_VERSION = 5
+CHECKPOINT_VERSION = 6
 TIME_COST_WEIGHT = 0.5
 DEADLOCK_PENALTY = 1.0
 DEADLOCK_PROGRESS_WEIGHT = 0.5
@@ -55,6 +55,7 @@ UPDATE_FIELDS = (
     "value_loss",
     "entropy",
     "approx_kl",
+    "ppo_epochs",
     "clip_fraction",
     "choice_fraction",
     "grad_norm",
@@ -109,8 +110,9 @@ class PPOConfig:
     minibatch_size: int = 128
     learning_rate: float = 3e-4
     gamma: float = 1.0
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.99
     clip_coefficient: float = 0.2
+    target_kl: float = 0.02
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
     max_grad_norm: float = 0.5
@@ -180,6 +182,8 @@ class PPOConfig:
             raise ValueError("gae_lambda must be in [0, 1]")
         if not 0.0 < self.clip_coefficient < 1.0:
             raise ValueError("clip_coefficient must be in (0, 1)")
+        if self.target_kl <= 0:
+            raise ValueError("target_kl must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,6 +561,21 @@ def _advantages(
         )
         result[step] = advantage
     return result
+
+
+def _normalize_choice_advantages(
+    advantages: Tensor,
+    choice_mask: Tensor,
+) -> Tensor:
+    """Normalize Actor advantages over states with an actual action choice."""
+
+    normalized = torch.zeros_like(advantages)
+    if choice_mask.any():
+        choice_advantages = advantages[choice_mask]
+        normalized[choice_mask] = (
+            choice_advantages - choice_advantages.mean()
+        ) / (choice_advantages.std(unbiased=False) + 1e-8)
+    return normalized
 
 
 def _normalized_reward(
@@ -1090,10 +1109,15 @@ def _ppo_update(
     timer: PhaseTimer | None = None,
 ) -> dict[str, float]:
     with _measure(timer, "ppo.prepare"):
-        advantages = rollout_batch.advantages
-        advantages = (
-            advantages - advantages.mean()
-        ) / (advantages.std(unbiased=False) + 1e-8)
+        choice_mask = torch.as_tensor(
+            [state.action_mask.sum() > 1 for state in rollout_batch.states],
+            dtype=torch.bool,
+            device=rollout_batch.advantages.device,
+        )
+        advantages = _normalize_choice_advantages(
+            rollout_batch.advantages,
+            choice_mask,
+        )
         sample_count = advantages.shape[0]
     totals = {
         "policy_loss": 0.0,
@@ -1105,9 +1129,12 @@ def _ppo_update(
         "grad_norm": 0.0,
     }
     minibatch_count = 0
+    epochs_completed = 0
 
     model.train()
     for _ in range(config.epochs):
+        epoch_kl = 0.0
+        epoch_choice_batches = 0
         indexes = torch.randperm(sample_count)
         for start in range(0, sample_count, config.minibatch_size):
             cpu_indexes = indexes[
@@ -1217,12 +1244,24 @@ def _ppo_update(
                 }
                 for name, value in metrics.items():
                     totals[name] += value.detach().item()
+                if has_choice.any():
+                    epoch_kl += approx_kl.detach().item()
+                    epoch_choice_batches += 1
             minibatch_count += 1
 
-    return {
+        epochs_completed += 1
+        if (
+            epoch_choice_batches
+            and epoch_kl / epoch_choice_batches > config.target_kl
+        ):
+            break
+
+    metrics = {
         name: value / minibatch_count
         for name, value in totals.items()
     }
+    metrics["ppo_epochs"] = float(epochs_completed)
+    return metrics
 
 
 def _serialize_config(config: PPOConfig) -> dict[str, object]:
@@ -1510,6 +1549,7 @@ def _print_update(
         f"value={float(row['value_loss']):.5f}  "
         f"entropy={float(row['entropy']):.4f}  "
         f"KL={float(row['approx_kl']):.2e}  "
+        f"epochs={int(float(row['ppo_epochs']))}  "
         f"choice={100 * float(row['choice_fraction']):.1f}%"
     )
     print(
@@ -1928,8 +1968,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--minibatch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=1.0)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--gae-lambda", type=float, default=0.99)
     parser.add_argument("--clip-coefficient", type=float, default=0.2)
+    parser.add_argument("--target-kl", type=float, default=0.02)
     parser.add_argument("--value-coefficient", type=float, default=0.5)
     parser.add_argument("--entropy-coefficient", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -1986,6 +2027,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_coefficient=args.clip_coefficient,
+        target_kl=args.target_kl,
         value_coefficient=args.value_coefficient,
         entropy_coefficient=args.entropy_coefficient,
         max_grad_norm=args.max_grad_norm,

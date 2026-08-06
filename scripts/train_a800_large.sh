@@ -60,6 +60,8 @@ exec python -u -m cluster_rl.train \
   --num-layers 3 \
   --feedforward-dim 512 \
   --learning-rate 1e-4 \
+  --gae-lambda 0.99 \
+  --target-kl 0.02 \
   --seed 42 \
   --log-interval 1 \
   --checkpoint-interval 5
