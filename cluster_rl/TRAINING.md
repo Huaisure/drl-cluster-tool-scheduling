@@ -95,6 +95,20 @@ runs/ppo_cluster_YYYYMMDD_HHMMSS/
 - `training_curves.png` 可视化 makespan、归一化回报、loss、entropy 和 KL；
 - greedy rollout 会通过独立 `ValidatorSuite` 检查动作序列。
 
+A800正式大规模训练可在已分配的Slurm节点中启动：
+
+```bash
+chmod +x scripts/train_a800_large.sh
+./scripts/train_a800_large.sh
+```
+
+脚本默认训练500万步，可通过环境变量覆盖训练量和输出目录，例如：
+
+```bash
+TOTAL_STEPS=2000000 RUN_DIR=runs/my_large_run \
+  ./scripts/train_a800_large.sh
+```
+
 从 checkpoint 继续训练：
 
 ```bash

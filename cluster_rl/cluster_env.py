@@ -138,6 +138,8 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
                     shape=(robot_count,),
                     dtype=np.float32,
                 ),
+                "legal_action_mask": spaces.MultiBinary(int(self.action_space.n)),
+                "deadlock_safe_mask": spaces.MultiBinary(int(self.action_space.n)),
                 "action_mask": spaces.MultiBinary(int(self.action_space.n)),
             }
         )
@@ -239,13 +241,15 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             )
 
         observation = self._observation()
-        deadlocked = not completed and not observation["action_mask"].any()
+        deadlocked = not completed and not observation["legal_action_mask"].any()
         if deadlocked:
             info.update(
                 is_success=False,
                 reason="deadlock",
             )
         info["action_mask"] = observation["action_mask"]
+        info["legal_action_mask"] = observation["legal_action_mask"]
+        info["deadlock_safe_mask"] = observation["deadlock_safe_mask"]
         return observation, reward, completed, deadlocked, info
 
     def _reward(self, previous_time: float) -> float:
@@ -255,6 +259,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
     def _observation(self) -> dict[str, Any]:
         robot_module = [robot.module_id for robot in self._robots]
+        legal_action_mask, deadlock_safe_mask, action_mask = self._action_masks()
         return {
             "wafer_loc": np.asarray(
                 [
@@ -285,7 +290,9 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
                 dtype=np.int64,
             ),
             **self._robot_operation_observation(),
-            "action_mask": self._action_mask(),
+            "legal_action_mask": legal_action_mask,
+            "deadlock_safe_mask": deadlock_safe_mask,
+            "action_mask": action_mask,
         }
 
     def _robot_operation_observation(self) -> dict[str, np.ndarray]:
@@ -354,7 +361,45 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         }
 
     def _action_mask(self) -> np.ndarray:
-        """Return the flat mask matching the entity-major action encoding."""
+        """Return physical legality after applying the cheap deadlock shield."""
+
+        return self._action_masks()[2]
+
+    def _action_masks(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return physical, deadlock-safety, and combined action masks."""
+
+        legal_mask = self._legal_action_mask()
+        safe_mask = np.ones(self.action_space.n, dtype=np.int8)
+        if not self._pending_queue:
+            wafer_count = len(self._wafer_keys)
+            robot_count = len(self._robot_ids)
+            for wafer_index in range(wafer_count):
+                for robot_index in range(robot_count):
+                    action = wafer_index * robot_count + robot_index
+                    if legal_mask[action] and self._pick_creates_closed_wait_cycle(
+                        wafer_index,
+                        robot_index,
+                    ):
+                        safe_mask[action] = 0
+
+            for module_index in range(len(self._module_ids)):
+                entity_index = wafer_count + module_index
+                for robot_index in range(robot_count):
+                    action = entity_index * robot_count + robot_index
+                    if legal_mask[action] and self._place_creates_closed_wait_cycle(
+                        module_index,
+                        robot_index,
+                    ):
+                        safe_mask[action] = 0
+
+        action_mask = legal_mask & safe_mask
+        if legal_mask.any() and not action_mask.any():
+            safe_mask[legal_mask.astype(bool)] = 1
+            action_mask = legal_mask.copy()
+        return legal_mask, safe_mask, action_mask
+
+    def _legal_action_mask(self) -> np.ndarray:
+        """Return the flat physical-legality mask before safety filtering."""
 
         mask = np.zeros(self.action_space.n, dtype=np.int8)
         if self._complete():
@@ -375,6 +420,124 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
         mask[-1] = self._next_event_time() is not None
         return mask
+
+    def _place_creates_closed_wait_cycle(
+        self,
+        module_index: int,
+        robot_index: int,
+    ) -> bool:
+        """Check whether one Place closes a FIFO resource-wait cycle.
+
+        This shield intentionally models only module occupancy and FIFO heads. It
+        is cheap enough for rollout collection and catches the common ring
+        deadlock without pretending to solve the full residual scheduling
+        problem.
+        """
+
+        wafer_index = self._place_candidate(module_index, robot_index)
+        if wafer_index is None:
+            return False
+
+        return self._move_creates_closed_wait_cycle(wafer_index, module_index)
+
+    def _pick_creates_closed_wait_cycle(
+        self,
+        wafer_index: int,
+        robot_index: int,
+    ) -> bool:
+        """Check whether every destination after one Pick closes a wait cycle."""
+
+        destinations = [
+            self._module_index[target_module_id]
+            for target_module_id in self._targets(wafer_index)
+            if self._can_achieve(robot_index, target_module_id)
+            and self._has_capacity_after_pick(
+                self._module_index[target_module_id],
+                wafer_index,
+            )
+        ]
+        return bool(destinations) and all(
+            self._move_creates_closed_wait_cycle(wafer_index, module_index)
+            for module_index in destinations
+        )
+
+    def _move_creates_closed_wait_cycle(
+        self,
+        wafer_index: int,
+        module_index: int,
+    ) -> bool:
+        """Check the module wait graph after moving a wafer to one target."""
+
+        module_locations = [wafer.module_id for wafer in self._wafers]
+        step_indexes = [wafer.step_index for wafer in self._wafers]
+        placed_module_id = self._module_ids[module_index]
+        module_locations[wafer_index] = placed_module_id
+        step_indexes[wafer_index] += 1
+
+        occupancy = {
+            module_id: sum(location == module_id for location in module_locations)
+            for module_id in self._module_ids
+        }
+        wait_graph = {module_id: set() for module_id in self._module_ids}
+
+        for source_module_id in self._module_ids:
+            candidates = [
+                index
+                for index, location in enumerate(module_locations)
+                if location == source_module_id
+                and step_indexes[index]
+                < len(self.problem.routes[self._wafer_keys[index][0]].visits) + 1
+            ]
+            if not candidates:
+                continue
+
+            head = min(
+                candidates,
+                key=lambda index: (
+                    self._wafer_keys[index][1],
+                    self._wafer_keys[index][0],
+                ),
+            )
+            targets = self._targets_for_step(head, step_indexes[head])
+            full_targets = {
+                target
+                for target in targets
+                if occupancy[target] - int(target == source_module_id)
+                >= self.problem.Modules[target].capacity
+            }
+            if targets and len(full_targets) == len(targets):
+                wait_graph[source_module_id].update(full_targets)
+
+        reachable = self._reachable_modules(wait_graph, placed_module_id)
+        reverse_graph = {module_id: set() for module_id in self._module_ids}
+        for source, targets in wait_graph.items():
+            for target in targets:
+                reverse_graph[target].add(source)
+        component = reachable & self._reachable_modules(
+            reverse_graph,
+            placed_module_id,
+        )
+        has_cycle = len(component) > 1 or placed_module_id in wait_graph[
+            placed_module_id
+        ]
+        return has_cycle and all(
+            wait_graph[module_id] <= component for module_id in component
+        )
+
+    @staticmethod
+    def _reachable_modules(
+        graph: Mapping[str, set[str]],
+        start: str,
+    ) -> set[str]:
+        reachable: set[str] = set()
+        pending = [start]
+        while pending:
+            module_id = pending.pop()
+            if module_id in reachable:
+                continue
+            reachable.add(module_id)
+            pending.extend(graph[module_id] - reachable)
+        return reachable
 
     def _decode_action(
         self,
@@ -399,9 +562,20 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
     def _targets(self, wafer_index: int) -> tuple[str, ...]:
         """返回wafer index对应的下一个步骤的module ids，可能有多个module，返回对应的元组"""
-        wafer = self._wafers[wafer_index]
+        return self._targets_for_step(
+            wafer_index,
+            self._wafers[wafer_index].step_index,
+        )
+
+    def _targets_for_step(
+        self,
+        wafer_index: int,
+        step_index: int,
+    ) -> tuple[str, ...]:
+        """Return targets following an explicit current step index."""
+
         route = self.problem.routes[self._wafer_keys[wafer_index][0]]
-        next_step = wafer.step_index + 1
+        next_step = step_index + 1
         if next_step <= len(route.visits):
             return route.visits[next_step - 1].module_ids
         if next_step == len(route.visits) + 1:

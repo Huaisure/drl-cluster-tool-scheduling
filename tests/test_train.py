@@ -56,14 +56,66 @@ def test_advantages_stop_bootstrapping_at_episode_end() -> None:
     )
 
 
-def test_normalized_reward_centers_reference_schedule_at_zero() -> None:
+def test_normalized_reward_has_bounded_telescoping_time_cost() -> None:
     raw_rewards = [-40.0, -60.0, -45.0]
+    current_times = [40.0, 100.0, 145.0]
     normalized = [
-        _normalized_reward(reward, 145.0, index == 2)
+        _normalized_reward(
+            reward,
+            145.0,
+            index == 2,
+            current_time=current_times[index],
+            deadlocked=False,
+            completed_step_ratio=1.0 if index == 2 else 0.0,
+        )
         for index, reward in enumerate(raw_rewards)
     ]
 
-    assert sum(normalized) == pytest.approx(0.0)
+    assert sum(normalized) == pytest.approx(0.75)
+
+
+def test_normalized_reward_strictly_separates_success_and_deadlock() -> None:
+    success = _normalized_reward(
+        -1000.0,
+        100.0,
+        True,
+        current_time=1000.0,
+        deadlocked=False,
+        completed_step_ratio=1.0,
+    )
+    deadlock = _normalized_reward(
+        0.0,
+        100.0,
+        False,
+        current_time=0.0,
+        deadlocked=True,
+        completed_step_ratio=1.0,
+    )
+
+    assert success > 0.5
+    assert deadlock == -1.0
+    assert success > deadlock
+
+
+def test_deadlock_reward_prefers_more_completed_route_steps() -> None:
+    early = _normalized_reward(
+        -100.0,
+        100.0,
+        False,
+        current_time=100.0,
+        deadlocked=True,
+        completed_step_ratio=0.2,
+    )
+    late = _normalized_reward(
+        -100.0,
+        100.0,
+        False,
+        current_time=100.0,
+        deadlocked=True,
+        completed_step_ratio=0.8,
+    )
+
+    assert late > early
 
 
 def test_cpu_workers_require_generator_slots() -> None:

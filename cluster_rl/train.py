@@ -40,7 +40,10 @@ from cluster_generator import ProblemGenerator
 from problem import ClusterProblem, load_problem
 
 
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
+TIME_COST_WEIGHT = 0.5
+DEADLOCK_PENALTY = 1.0
+DEADLOCK_PROGRESS_WEIGHT = 0.5
 UPDATE_FIELDS = (
     "update",
     "global_step",
@@ -208,6 +211,7 @@ class EnvSlot:
     problem_seed: int
     episode_index: int = 0
     episode_reward: float = 0.0
+    episode_normalized_return: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,8 +563,49 @@ def _normalized_reward(
     reward: float,
     reference_makespan: float,
     success: bool,
+    *,
+    current_time: float,
+    deadlocked: bool,
+    completed_step_ratio: float,
 ) -> float:
-    return reward / reference_makespan + float(success)
+    """Shape raw elapsed-time reward while separating success and deadlock.
+
+    The bounded time term telescopes over an episode. A completed episode is
+    always positive, while a deadlocked episode is at most ``-1``.
+    """
+
+    if reference_makespan <= 0:
+        raise ValueError("reference_makespan must be positive")
+    previous_time = max(0.0, current_time + reward)
+
+    def bounded_cost(time_value: float) -> float:
+        return time_value / (reference_makespan + time_value)
+
+    shaped = -TIME_COST_WEIGHT * (
+        bounded_cost(current_time) - bounded_cost(previous_time)
+    )
+    if success:
+        return shaped + 1.0
+    if deadlocked:
+        progress = min(1.0, max(0.0, completed_step_ratio))
+        return (
+            shaped
+            - DEADLOCK_PENALTY
+            - DEADLOCK_PROGRESS_WEIGHT * (1.0 - progress)
+        )
+    return shaped
+
+
+def _completed_step_ratio(
+    env: ClusterEnv,
+    observation: Mapping[str, Any],
+) -> float:
+    completed_steps = float(np.asarray(observation["wafer_step"]).sum())
+    total_steps = sum(
+        len(env.problem.routes[route_id].visits) + 1
+        for route_id, _ in env.wafer_keys
+    )
+    return completed_steps / total_steps if total_steps else 1.0
 
 
 def _env_slot_state(slot: EnvSlot) -> EnvSlotState:
@@ -592,7 +637,11 @@ def _step_env_slot(
         reward,
         slot.reference_makespan,
         done and success,
+        current_time=float(info["time"]),
+        deadlocked=done and not success,
+        completed_step_ratio=_completed_step_ratio(slot.env, observation),
     )
+    slot.episode_normalized_return += normalized_reward
     episode_stat = None
 
     if done:
@@ -600,9 +649,7 @@ def _step_env_slot(
             scenario=str(slot.env.problem.meta.get("name", f"env_{index}")),
             makespan=float(info["time"]),
             reference_makespan=slot.reference_makespan,
-            normalized_return=(
-                slot.episode_reward / slot.reference_makespan + float(success)
-            ),
+            normalized_return=slot.episode_normalized_return,
             reward=slot.episode_reward,
             success=success,
         )
@@ -610,6 +657,7 @@ def _step_env_slot(
             reset_started = time.perf_counter()
             slot.observation, _ = slot.env.reset()
             slot.episode_reward = 0.0
+            slot.episode_normalized_return = 0.0
             if timings is not None:
                 name = "rollout.worker_reset_reference_cpu"
                 timings[name] = timings.get(name, 0.0) + (

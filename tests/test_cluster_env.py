@@ -234,8 +234,78 @@ def test_ignored_constraints_do_not_enter_environment_state() -> None:
         "robot_operation_module",
         "time_to_operation_start",
         "time_to_operation_end",
+        "legal_action_mask",
+        "deadlock_safe_mask",
         "action_mask",
     }
+
+
+def test_place_mask_blocks_a_closed_module_wait_cycle() -> None:
+    raw = _raw_problem(
+        routes={
+            "A": [
+                {"module_ids": ["PM1", "PM2"], "process_time": 0},
+                {"module_id": "PM3", "process_time": 0},
+            ],
+            "B": [
+                {"module_id": "PM3", "process_time": 0},
+                {"module_id": "PM1", "process_time": 0},
+            ],
+        },
+        wafer_routes=("A", "B"),
+    )
+    raw["Modules"]["PM3"] = {"type": "PM"}
+    raw["ClusterTool"]["TM1"]["module_ids"].append("PM3")
+    env = ClusterEnv(parse_problem(raw))
+    env.reset()
+
+    env._wafers[0].module_id = None
+    env._wafers[0].robot_id = "TM1"
+    env._robots[0].holding = [0]
+    env._wafers[1].module_id = "PM3"
+    env._wafers[1].step_index = 1
+
+    observation = env._observation()
+    place_pm1 = _place_action(env, "PM1")
+    place_pm2 = _place_action(env, "PM2")
+
+    assert observation["legal_action_mask"][place_pm1]
+    assert observation["legal_action_mask"][place_pm2]
+    assert not observation["deadlock_safe_mask"][place_pm1]
+    assert observation["deadlock_safe_mask"][place_pm2]
+    assert not observation["action_mask"][place_pm1]
+    assert observation["action_mask"][place_pm2]
+
+
+def test_pick_mask_blocks_a_wafer_when_its_only_destination_closes_a_cycle() -> None:
+    raw = _raw_problem(
+        routes={
+            "A": [
+                {"module_id": "PM1", "process_time": 0},
+                {"module_id": "PM3", "process_time": 0},
+            ],
+            "B": [
+                {"module_id": "PM3", "process_time": 0},
+                {"module_id": "PM1", "process_time": 0},
+            ],
+        },
+        wafer_routes=("A", "B"),
+    )
+    raw["Modules"]["PM3"] = {"type": "PM"}
+    raw["ClusterTool"]["TM1"]["module_ids"].append("PM3")
+    env = ClusterEnv(parse_problem(raw))
+    env.reset()
+    env._wafers[1].module_id = "PM3"
+    env._wafers[1].step_index = 1
+
+    observation = env._observation()
+
+    assert observation["legal_action_mask"][0]
+    assert observation["legal_action_mask"][1]
+    assert not observation["deadlock_safe_mask"][0]
+    assert observation["deadlock_safe_mask"][1]
+    assert not observation["action_mask"][0]
+    assert observation["action_mask"][1]
 
 
 def test_multiple_lps_have_independent_fifo_heads_and_return_targets() -> None:
