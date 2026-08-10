@@ -17,8 +17,9 @@ class ActionRef:
     entity_type: str | None
     entity_index: int | None
     entity_id: object | None
-    robot_index: int | None
-    robot_id: str | None
+    target_type: str | None
+    target_index: int | None
+    target_id: object | None
 
 
 class GraphEnvAdapter:
@@ -63,58 +64,63 @@ class GraphEnvAdapter:
             raise ValueError(f"action {action!r} is outside the action space")
         kind, entity_index, robot_index = self.env._decode_action(int(action))
         if kind == ADVANCE:
-            return ActionRef(ADVANCE, None, None, None, None, None)
+            return ActionRef(ADVANCE, None, None, None, None, None, None)
 
         assert entity_index is not None and robot_index is not None
-        robot_id = self.builder.robot_ids[robot_index]
         if kind == PICK:
             return ActionRef(
                 kind=PICK,
                 entity_type=WAFER,
                 entity_index=entity_index,
                 entity_id=self.env.wafer_keys[entity_index],
-                robot_index=robot_index,
-                robot_id=robot_id,
+                target_type="robot",
+                target_index=robot_index,
+                target_id=self.builder.robot_ids[robot_index],
             )
 
         return ActionRef(
             kind=PLACE,
-            entity_type=MODULE,
+            entity_type=WAFER,
             entity_index=entity_index,
-            entity_id=self.env.module_ids[entity_index],
-            robot_index=robot_index,
-            robot_id=robot_id,
+            entity_id=self.env.wafer_keys[entity_index],
+            target_type=MODULE,
+            target_index=robot_index,
+            target_id=self.env.module_ids[robot_index],
         )
 
     def encode_action(
         self,
         kind: Literal["pick", "place", "advance"],
         entity_index: int | None = None,
-        robot_index: int | None = None,
+        target_index: int | None = None,
     ) -> int:
         """Map graph entity and robot indexes to an Env action."""
 
         if kind == ADVANCE:
-            if entity_index is not None or robot_index is not None:
+            if entity_index is not None or target_index is not None:
                 raise ValueError("advance does not select an entity or robot")
             return int(self.action_space.n) - 1
         if kind not in {PICK, PLACE}:
             raise ValueError(f"unknown action kind: {kind!r}")
-        if entity_index is None or robot_index is None:
-            raise ValueError(f"{kind} requires entity_index and robot_index")
+        if entity_index is None or target_index is None:
+            raise ValueError(f"{kind} requires entity_index and target_index")
 
         count = (
             len(self.env.wafer_keys)
-            if kind == PICK
-            else len(self.env.module_ids)
         )
         if not 0 <= entity_index < count:
             raise ValueError(f"{kind} entity_index is outside the graph")
-        if not 0 <= robot_index < len(self.builder.robot_ids):
-            raise ValueError("robot_index is outside the graph")
-        entity_action = (
-            entity_index
+        target_count = (
+            len(self.builder.robot_ids)
             if kind == PICK
-            else len(self.env.wafer_keys) + entity_index
+            else len(self.env.module_ids)
         )
-        return entity_action * len(self.builder.robot_ids) + robot_index
+        if not 0 <= target_index < target_count:
+            raise ValueError("target_index is outside the graph")
+        if kind == PICK:
+            return entity_index * len(self.builder.robot_ids) + target_index
+        return (
+            len(self.env.wafer_keys) * len(self.builder.robot_ids)
+            + entity_index * len(self.env.module_ids)
+            + target_index
+        )

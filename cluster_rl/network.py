@@ -47,13 +47,17 @@ NODE_FEATURE_DIMS = {
 
 @dataclass(frozen=True)
 class EncodedObservation:
-    """One graph state and its environment-aligned action description."""
+    """One graph state and its compact legal-action description."""
 
     graph: HeteroData
-    action_mask: np.ndarray
+    env_action_indices: np.ndarray
     action_kind: np.ndarray
     action_entity: np.ndarray
-    action_robot: np.ndarray
+    action_target: np.ndarray
+
+    @property
+    def action_count(self) -> int:
+        return int(self.env_action_indices.shape[0])
 
 
 @dataclass(frozen=True)
@@ -61,47 +65,67 @@ class EntityBatch:
     """Batched heterogeneous graphs and padded action queries."""
 
     graph: HeteroData
-    action_mask: Tensor
     action_valid: Tensor
+    env_action_indices: Tensor
     action_kind: Tensor
     action_entity: Tensor
-    action_robot: Tensor
+    action_target: Tensor
 
     @property
     def batch_size(self) -> int:
-        return int(self.action_mask.shape[0])
+        return int(self.action_valid.shape[0])
+
+    @property
+    def action_mask(self) -> Tensor:
+        """Mask real legal actions against batch padding."""
+
+        return self.action_valid
 
     def to(self, device: torch.device | str) -> EntityBatch:
         return EntityBatch(
             graph=self.graph.to(device),
-            action_mask=self.action_mask.to(device),
             action_valid=self.action_valid.to(device),
+            env_action_indices=self.env_action_indices.to(device),
             action_kind=self.action_kind.to(device),
             action_entity=self.action_entity.to(device),
-            action_robot=self.action_robot.to(device),
+            action_target=self.action_target.to(device),
         )
 
     def to_model_actions(self, env_actions: Tensor) -> Tensor:
-        """Environment and model use the same entity-major flat indexes."""
+        """Map flat environment actions to compact legal-action indexes."""
 
-        self._validate_actions(env_actions, "env_actions")
-        return env_actions.to(self.action_mask.device)
+        if env_actions.shape != (self.batch_size,):
+            raise ValueError("env_actions must contain one action per batch item")
+        env_actions = env_actions.to(
+            self.action_valid.device,
+            dtype=torch.long,
+        )
+        matches = (
+            self.env_action_indices == env_actions[:, None]
+        ) & self.action_valid
+        if not torch.all(matches.sum(dim=1) == 1):
+            raise ValueError("env_actions contains an action that is not legal")
+        return matches.to(dtype=torch.long).argmax(dim=1)
 
     def to_env_actions(self, model_actions: Tensor) -> Tensor:
-        """Environment and model use the same entity-major flat indexes."""
+        """Map compact legal-action indexes back to flat Env actions."""
 
-        self._validate_actions(model_actions, "model_actions")
-        return model_actions.to(self.action_mask.device)
+        model_actions = self._validated_model_actions(model_actions)
+        return self.env_action_indices.gather(
+            1,
+            model_actions[:, None],
+        ).squeeze(1)
 
-    def _validate_actions(self, actions: Tensor, name: str) -> None:
+    def _validated_model_actions(self, actions: Tensor) -> Tensor:
         if actions.shape != (self.batch_size,):
-            raise ValueError(f"{name} must contain one action per batch item")
-        actions = actions.to(self.action_mask.device, dtype=torch.long)
+            raise ValueError("model_actions must contain one action per batch item")
+        actions = actions.to(self.action_valid.device, dtype=torch.long)
         in_range = (actions >= 0) & (actions < self.action_valid.shape[1])
         safe_actions = actions.clamp(0, self.action_valid.shape[1] - 1)
         valid = self.action_valid.gather(1, safe_actions[:, None]).squeeze(1)
         if not torch.all(in_range & valid):
-            raise ValueError(f"{name} contains a padded or out-of-range action")
+            raise ValueError("model_actions contains a padded or out-of-range action")
+        return actions
 
 
 @dataclass(frozen=True)
@@ -193,31 +217,52 @@ def _encode_graph(graph: HeteroGraph) -> EncodedObservation:
             graph.edges[edge_type].edge_index.copy()
         )
 
-    entity_count, robot_count = graph.action_mask.shape
     wafer_count = len(graph.nodes[WAFER].ids)
-    transport_count = entity_count * robot_count
-    action_count = transport_count + 1
-    action_kind = np.full(action_count, ADVANCE_ACTION, dtype=np.int64)
-    action_entity = np.zeros(action_count, dtype=np.int64)
-    action_robot = np.zeros(action_count, dtype=np.int64)
+    robot_count = len(graph.nodes[ROBOT].ids)
+    module_count = len(graph.nodes[MODULE].ids)
+    pick_count = wafer_count * robot_count
+    place_count = wafer_count * module_count
+    flat_action_mask = np.concatenate(
+        (
+            graph.pick_action_mask.reshape(-1),
+            graph.place_action_mask.reshape(-1),
+            np.asarray([graph.can_advance]),
+        )
+    )
+    env_action_indices = np.flatnonzero(flat_action_mask).astype(
+        np.int64,
+        copy=False,
+    )
+    if not env_action_indices.size:
+        raise ValueError("cannot encode a state without legal actions")
 
-    if transport_count:
-        transport_actions = np.arange(transport_count, dtype=np.int64)
-        entities, robots = np.divmod(transport_actions, robot_count)
-        pick = entities < wafer_count
-        action_kind[:-1] = np.where(pick, PICK_ACTION, PLACE_ACTION)
-        action_entity[:-1] = np.where(pick, entities, entities - wafer_count)
-        action_robot[:-1] = robots
-
-    action_mask = np.concatenate(
-        (graph.action_mask.reshape(-1), np.asarray([graph.can_advance]))
+    action_kind = np.full(
+        env_action_indices.shape,
+        ADVANCE_ACTION,
+        dtype=np.int64,
+    )
+    action_entity = np.zeros_like(env_action_indices)
+    action_target = np.zeros_like(env_action_indices)
+    pick = env_action_indices < pick_count
+    place = (env_action_indices >= pick_count) & (
+        env_action_indices < pick_count + place_count
+    )
+    action_kind[pick] = PICK_ACTION
+    action_entity[pick], action_target[pick] = np.divmod(
+        env_action_indices[pick],
+        robot_count,
+    )
+    action_kind[place] = PLACE_ACTION
+    action_entity[place], action_target[place] = np.divmod(
+        env_action_indices[place] - pick_count,
+        module_count,
     )
     return EncodedObservation(
         graph=data,
-        action_mask=action_mask,
+        env_action_indices=env_action_indices,
         action_kind=action_kind,
         action_entity=action_entity,
-        action_robot=action_robot,
+        action_target=action_target,
     )
 
 
@@ -314,35 +359,41 @@ def _collate_encoded_batch(
 ) -> EntityBatch:
     """Pad action descriptions and attach them to an already batched graph."""
 
-    max_actions = max(item.action_mask.shape[0] for item in encoded)
+    max_actions = max(item.action_count for item in encoded)
     batch_size = len(encoded)
-    action_mask = torch.zeros(batch_size, max_actions, dtype=torch.bool)
-    action_valid = torch.zeros_like(action_mask)
+    action_valid = torch.zeros(batch_size, max_actions, dtype=torch.bool)
+    env_action_indices = torch.full(
+        (batch_size, max_actions),
+        -1,
+        dtype=torch.long,
+    )
     action_kind = torch.full(
         (batch_size, max_actions), PAD_ACTION, dtype=torch.long
     )
     action_entity = torch.zeros(batch_size, max_actions, dtype=torch.long)
-    action_robot = torch.zeros_like(action_entity)
+    action_target = torch.zeros_like(action_entity)
 
     for index, item in enumerate(encoded):
-        action_count = item.action_mask.shape[0]
-        action_mask[index, :action_count] = torch.from_numpy(item.action_mask)
+        action_count = item.action_count
         action_valid[index, :action_count] = True
+        env_action_indices[index, :action_count] = torch.from_numpy(
+            item.env_action_indices
+        )
         action_kind[index, :action_count] = torch.from_numpy(item.action_kind)
         action_entity[index, :action_count] = torch.from_numpy(
             item.action_entity
         )
-        action_robot[index, :action_count] = torch.from_numpy(
-            item.action_robot
+        action_target[index, :action_count] = torch.from_numpy(
+            item.action_target
         )
 
     return EntityBatch(
         graph=graph,
-        action_mask=action_mask,
         action_valid=action_valid,
+        env_action_indices=env_action_indices,
         action_kind=action_kind,
         action_entity=action_entity,
-        action_robot=action_robot,
+        action_target=action_target,
     ).to(device or "cpu")
 
 
@@ -458,7 +509,7 @@ class ClusterActorCritic(nn.Module):
             memory_key_padding_mask=~memory_valid,
         )
         logits = self.actor_head(decoded).squeeze(-1)
-        logits = logits.masked_fill(~batch.action_mask, -torch.inf)
+        logits = logits.masked_fill(~batch.action_valid, -torch.inf)
         global_state = dense_nodes[GLOBAL][0][:, 0]
         value = self.value_head(global_state).squeeze(-1)
         return PolicyValueOutput(logits=logits, value=value)
@@ -470,7 +521,7 @@ class ClusterActorCritic(nn.Module):
     ) -> Tensor:
         batch_index = torch.arange(
             batch.batch_size,
-            device=batch.action_mask.device,
+            device=batch.action_valid.device,
         )[:, None]
         wafer = dense_nodes[WAFER][0][
             batch_index,
@@ -478,15 +529,15 @@ class ClusterActorCritic(nn.Module):
         ]
         module = dense_nodes[MODULE][0][
             batch_index,
-            batch.action_entity.clamp_max(dense_nodes[MODULE][0].shape[1] - 1),
+            batch.action_target.clamp_max(dense_nodes[MODULE][0].shape[1] - 1),
         ]
         robot = dense_nodes[ROBOT][0][
             batch_index,
-            batch.action_robot.clamp_max(dense_nodes[ROBOT][0].shape[1] - 1),
+            batch.action_target.clamp_max(dense_nodes[ROBOT][0].shape[1] - 1),
         ]
         global_state = dense_nodes[GLOBAL][0][:, :1].expand(
             -1,
-            batch.action_mask.shape[1],
+            batch.action_valid.shape[1],
             -1,
         )
         pick = batch.action_kind == PICK_ACTION
@@ -494,7 +545,7 @@ class ClusterActorCritic(nn.Module):
         advance = batch.action_kind == ADVANCE_ACTION
         queries = torch.zeros_like(wafer)
         queries = torch.where(pick[..., None], wafer + robot, queries)
-        queries = torch.where(place[..., None], module + robot, queries)
+        queries = torch.where(place[..., None], wafer + module, queries)
         queries = torch.where(
             advance[..., None],
             global_state + self.advance_query,
@@ -506,19 +557,19 @@ class ClusterActorCritic(nn.Module):
 
     @staticmethod
     def _validate_batch(batch: EntityBatch) -> None:
-        expected_shape = batch.action_mask.shape
-        if batch.action_mask.ndim != 2:
-            raise ValueError("action_mask must have shape [batch, action]")
+        expected_shape = batch.action_valid.shape
+        if batch.action_valid.ndim != 2:
+            raise ValueError("action_valid must have shape [batch, action]")
         for name in (
-            "action_valid",
+            "env_action_indices",
             "action_kind",
             "action_entity",
-            "action_robot",
+            "action_target",
         ):
             if getattr(batch, name).shape != expected_shape:
                 raise ValueError(f"{name} has an invalid shape")
-        if torch.any(batch.action_mask & ~batch.action_valid):
-            raise ValueError("padded actions cannot be legal")
+        if torch.any(batch.env_action_indices[batch.action_valid] < 0):
+            raise ValueError("legal actions must identify an Env action")
         if set(batch.graph.node_types) != set(NODE_TYPES):
             raise ValueError("graph has unexpected node types")
         if set(batch.graph.edge_types) != set(EDGE_TYPES):

@@ -11,12 +11,14 @@ from cluster_rl.hetero_graph import GraphEnvAdapter
 from cluster_rl.hetero_graph.builder import ClusterHeteroGraphBuilder
 from cluster_rl.hetero_graph.feature_schema import (
     GLOBAL_FEATURE_NAMES,
+    MODULE_FEATURE_NAMES,
     ROBOT_FEATURE_NAMES,
     ROUTE_STEP_FEATURE_NAMES,
     TIME_SCALE_SECONDS,
     WAFER_FEATURE_NAMES,
 )
 from problem import load_problem, parse_problem
+from tests.problem_fixtures import load_lock_problem
 
 SCENARIO = (
     Path(__file__).parents[1]
@@ -57,19 +59,84 @@ def test_builder_uses_new_observation_and_action_shapes() -> None:
     assert graph.edges[
         ("wafer", "summarizes_into", "global")
     ].edge_index.tolist() == [[0], [0]]
-    assert graph.action_mask.shape == (
-        len(env.wafer_keys) + len(env.module_ids),
-        1,
+    assert graph.pick_action_mask.shape == (len(env.wafer_keys), 1)
+    assert graph.place_action_mask.shape == (
+        len(env.wafer_keys), len(env.module_ids)
     )
-    assert graph.action_mask[:, 0].tolist() == [
-        True,
-        False,
-        False,
-        False,
-        False,
-        False,
-    ]
+    assert graph.pick_action_mask[:, 0].tolist() == [True]
+    assert not graph.place_action_mask.any()
     assert graph.can_advance
+
+
+def test_al_and_buffer_share_pm_type_feature_without_lp_feature() -> None:
+    raw_problem = json.loads(SCENARIO.read_text())
+    raw_problem["Modules"]["PM1"]["type"] = "AL"
+    raw_problem["Modules"]["PM2"]["type"] = "BUFFER"
+    env = ClusterEnv(parse_problem(raw_problem))
+    builder = ClusterHeteroGraphBuilder.from_env(env)
+    observation, _ = env.reset()
+    features = builder.build(observation).nodes["module"].features
+    is_pm = MODULE_FEATURE_NAMES.index("is_pm")
+
+    assert "is_lp" not in MODULE_FEATURE_NAMES
+    assert features[env.module_ids.index("PM1"), is_pm] == 1.0
+    assert features[env.module_ids.index("PM2"), is_pm] == 1.0
+    assert features[env.module_ids.index("LP"), is_pm] == 0.0
+
+
+def test_wafer_priority_and_index_reach_graph_node_features() -> None:
+    _, builder, observation = _builder_and_observation()
+    observation["wafer_priority"][0] = 0.75
+    observation["wafer_index"][0] = 0.5
+
+    features = builder.build(observation).nodes["wafer"].features[0]
+
+    assert features[WAFER_FEATURE_NAMES.index("priority")] == 0.75
+    assert features[WAFER_FEATURE_NAMES.index("wafer_index")] == 0.5
+
+
+def test_load_lock_stays_a_module_with_side_specific_robot_relations() -> None:
+    env = ClusterEnv(load_lock_problem())
+    builder = ClusterHeteroGraphBuilder.from_env(env)
+    observation, _ = env.reset()
+    graph = builder.build(observation)
+    ll_index = env.module_ids.index("LL1")
+    atm_index = builder.robot_ids.index("ATM")
+    vtm_index = builder.robot_ids.index("VTM")
+    features = graph.nodes["module"].features[ll_index]
+
+    assert "load_lock" not in graph.nodes
+    assert features[MODULE_FEATURE_NAMES.index("ll_pump_time")] == pytest.approx(
+        5 / TIME_SCALE_SECONDS
+    )
+    assert features[MODULE_FEATURE_NAMES.index("ll_vent_time")] == pytest.approx(
+        7 / TIME_SCALE_SECONDS
+    )
+    assert features[
+        MODULE_FEATURE_NAMES.index("ll_last_pick_side_atmosphere")
+    ] == 1
+    assert graph.edges[
+        ("robot", "accesses_atmosphere", "module")
+    ].edge_index.tolist() == [[atm_index], [ll_index]]
+    assert graph.edges[
+        ("robot", "accesses_vacuum", "module")
+    ].edge_index.tolist() == [[vtm_index], [ll_index]]
+    assert [atm_index, ll_index] not in graph.edges[
+        ("robot", "can_access", "module")
+    ].edge_index.T.tolist()
+    assert [vtm_index, ll_index] not in graph.edges[
+        ("robot", "can_access", "module")
+    ].edge_index.T.tolist()
+
+    observation["ll_occupied_exit_side"][ll_index] = 2
+    observation["ll_occupied_transition_progress"][ll_index] = 0.5
+    features = builder.build(observation).nodes["module"].features[ll_index]
+    assert features[
+        MODULE_FEATURE_NAMES.index("ll_occupied_exit_side_vacuum")
+    ] == 1
+    assert features[
+        MODULE_FEATURE_NAMES.index("ll_occupied_transition_progress")
+    ] == 0.5
 
 
 def test_builder_creates_bidirectional_dynamic_edges() -> None:
@@ -151,7 +218,7 @@ def test_route_step_features_include_process_and_residency_times() -> None:
     process_time = ROUTE_STEP_FEATURE_NAMES.index("process_time")
     residency_time = ROUTE_STEP_FEATURE_NAMES.index("residency_time")
     has_residency = ROUTE_STEP_FEATURE_NAMES.index("has_residency_limit")
-    is_return = ROUTE_STEP_FEATURE_NAMES.index("is_return_to_lp")
+    is_return = ROUTE_STEP_FEATURE_NAMES.index("is_return_to_source")
     first_step = builder.route_step_ids.index(("A", 1))
     final_step = builder.route_step_ids.index(
         ("A", len(env.problem.routes["A"].visits) + 1)
@@ -231,15 +298,15 @@ def test_adapter_maps_entity_and_robot_action_indexes() -> None:
     pm_index = env.module_ids.index("PM1")
 
     assert graph_env.decode_action(0).entity_id == ("A", 0)
-    assert graph_env.decode_action(0).robot_id == "TM1"
-    assert graph_env.encode_action("place", pm_index, 0) == (
-        len(env.wafer_keys) + pm_index
+    assert graph_env.decode_action(0).target_id == "TM1"
+    assert graph_env.encode_action("place", 0, pm_index) == (
+        len(env.wafer_keys) * len(env._robot_ids) + pm_index
     )
     assert graph_env.encode_action("advance") == env.action_space.n - 1
     assert graph_env.decode_action(env.action_space.n - 1).kind == "advance"
 
 
-def test_is_ready_requires_processing_complete_and_fifo_head() -> None:
+def test_is_ready_depends_only_on_processing_completion() -> None:
     env = ClusterEnv(
         load_problem(
             Path(__file__).parents[1]
@@ -267,13 +334,13 @@ def test_is_ready_requires_processing_complete_and_fifo_head() -> None:
 
     graph = builder.build(observation)
     assert graph.nodes["wafer"].features[:, is_ready_index].tolist() == [
-        1.0,
-        *([0.0] * (wafer_count - 1)),
-    ]
+        1.0
+    ] * wafer_count
 
     observation["process_remaining"][0] = 1.0
     graph = builder.build(observation)
-    assert not graph.nodes["wafer"].features[:, is_ready_index].any()
+    assert graph.nodes["wafer"].features[0, is_ready_index] == 0.0
+    assert graph.nodes["wafer"].features[1:, is_ready_index].all()
 
     route_id, _ = env.wafer_keys[0]
     observation["process_remaining"][0] = 0.0
@@ -281,14 +348,7 @@ def test_is_ready_requires_processing_complete_and_fifo_head() -> None:
         len(env.problem.routes[route_id].visits) + 1
     )
     graph = builder.build(observation)
-    next_head = min(
-        range(1, wafer_count),
-        key=lambda index: (
-            env.wafer_keys[index][1],
-            env.wafer_keys[index][0],
-        ),
-    )
-    assert graph.nodes["wafer"].features[next_head, is_ready_index] == 1.0
+    assert graph.nodes["wafer"].features[:, is_ready_index].all()
 
 
 def test_multi_lp_graph_keeps_return_identity_and_independent_heads() -> None:
@@ -314,11 +374,13 @@ def test_multi_lp_graph_keeps_return_identity_and_independent_heads() -> None:
                     {
                         "route_id": "A",
                         "wafer_index": "0",
+                        "priority": 0,
                         "location": {"kind": "module", "module_id": "LP1"},
                     },
                     {
                         "route_id": "A",
                         "wafer_index": "1",
+                        "priority": 0,
                         "location": {"kind": "module", "module_id": "LP2"},
                     },
                 ]
@@ -350,7 +412,7 @@ def test_graph_exposes_pending_robot_operation_and_pick_start_holding() -> None:
     env = ClusterEnv(load_problem(SCENARIO))
     builder = ClusterHeteroGraphBuilder.from_env(env)
     observation, _ = env.reset()
-    env._robots[0].module_id = "PM4"
+    env.engine.state.robots["TM1"].module_id = "PM4"
 
     observation, *_ = env.step(0)
     graph = builder.build(observation)

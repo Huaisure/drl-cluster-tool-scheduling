@@ -1,0 +1,579 @@
+{
+  "ClusterTool": {
+    "ATM1": {
+      "arm_type": "single_arm",
+      "module_ids": [
+        "IO1",
+        "AL1",
+        "LL1"
+      ],
+      "pick_time": 12,
+      "place_time": 15,
+      "travel_times": 12
+    },
+    "VTM1": {
+      "arm_type": "single_arm",
+      "module_ids": [
+        "LL1",
+        "PM1_1",
+        "PM1_2",
+        "PM1_3",
+        "PM1_4",
+        "PM1_5",
+        "BUFFER1",
+        "BUFFER2"
+      ],
+      "pick_time": 14,
+      "place_time": 9,
+      "travel_times": 9
+    },
+    "VTM2": {
+      "arm_type": "single_arm",
+      "module_ids": [
+        "BUFFER1",
+        "BUFFER2",
+        "PM2_1",
+        "PM2_2",
+        "PM2_3",
+        "PM2_4"
+      ],
+      "pick_time": 15,
+      "place_time": 12,
+      "travel_times": 15
+    }
+  },
+  "Modules": {
+    "AL1": {
+      "capacity": 1,
+      "type": "AL"
+    },
+    "BUFFER1": {
+      "capacity": 1,
+      "type": "BUFFER"
+    },
+    "BUFFER2": {
+      "capacity": 1,
+      "type": "BUFFER"
+    },
+    "IO1": {
+      "capacity": 12,
+      "type": "IO"
+    },
+    "LL1": {
+      "capacity": 1,
+      "load_lock": {
+        "atmosphere_to_vacuum_time": 20,
+        "initial_state": "atmosphere",
+        "tm_required_states": {
+          "ATM1": "atmosphere",
+          "VTM1": "vacuum"
+        },
+        "vacuum_to_atmosphere_time": 10
+      },
+      "type": "LL"
+    },
+    "PM1_1": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_000",
+        "PROC_003",
+        "PROC_004"
+      ],
+      "type": "PM"
+    },
+    "PM1_2": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_002",
+        "PROC_003",
+        "PROC_006"
+      ],
+      "type": "PM"
+    },
+    "PM1_3": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_001",
+        "PROC_006",
+        "PROC_007"
+      ],
+      "type": "PM"
+    },
+    "PM1_4": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_001",
+        "PROC_005"
+      ],
+      "type": "PM"
+    },
+    "PM1_5": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_001",
+        "PROC_004",
+        "PROC_007"
+      ],
+      "type": "PM"
+    },
+    "PM2_1": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_009",
+        "PROC_011"
+      ],
+      "type": "PM"
+    },
+    "PM2_2": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_008",
+        "PROC_010",
+        "PROC_011"
+      ],
+      "type": "PM"
+    },
+    "PM2_3": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_008",
+        "PROC_009"
+      ],
+      "type": "PM"
+    },
+    "PM2_4": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_010",
+        "PROC_012"
+      ],
+      "type": "PM"
+    }
+  },
+  "_meta": {
+    "generator": {
+      "attempt_seed": 16820865764355836634,
+      "average_legal_actions": 6.24537,
+      "buffer_count": 2,
+      "candidate_ratio": 0.46875,
+      "difficulty": "easy",
+      "feasible": true,
+      "instance_id": "train_easy_13948190459681356007",
+      "io_count": 1,
+      "ll_count": 1,
+      "lower_bound": 3031.0,
+      "max_process_steps": 6,
+      "max_route_length": 11,
+      "median_process_time": 299.0,
+      "mode": "ppo",
+      "multiple_choice_state_ratio": 0.861111,
+      "name": "cluster_generator",
+      "optimality_gap": 5.227648,
+      "pm_count": 9,
+      "pm_total_loads": {
+        "PM1_1": 1775.0,
+        "PM1_2": 1486.0,
+        "PM1_3": 1190.0,
+        "PM1_4": 2012.0,
+        "PM1_5": 1928.0,
+        "PM2_1": 135.0,
+        "PM2_2": 2528.0,
+        "PM2_3": 81.0,
+        "PM2_4": 3031.0
+      },
+      "reference_makespan": 18876.0,
+      "reference_policy": "serial_domain_feasibility_witness",
+      "robot_count": 3,
+      "route_count": 4,
+      "seed": 13948190459681356007,
+      "signature_bucket": 25,
+      "split": "train",
+      "structural_signature": "ec2240296a1a83c9f31aee96be9658f8e133fea9d27bcd230d86224060b5ebc2",
+      "topology_family": "dual_vacuum",
+      "validator_result": true,
+      "version": "0.5.0",
+      "wafer_count": 12
+    }
+  },
+  "initial_state": {
+    "robots": {
+      "ATM1": {
+        "position_module_id": null
+      },
+      "VTM1": {
+        "position_module_id": null
+      },
+      "VTM2": {
+        "position_module_id": null
+      }
+    },
+    "wafers": [
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "2"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "2"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R02",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R02",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R02",
+        "step_index": 0,
+        "wafer_index": "2"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R03",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R03",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R03",
+        "step_index": 0,
+        "wafer_index": "2"
+      }
+    ]
+  },
+  "routes": {
+    "R00": [
+      {
+        "module_ids": [
+          "AL1"
+        ],
+        "process_time": 15
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "PM1_1"
+        ],
+        "process_id": "PROC_000",
+        "process_time": 30
+      },
+      {
+        "module_ids": [
+          "PM1_2",
+          "PM1_3"
+        ],
+        "process_id": "PROC_006",
+        "process_time": 299
+      },
+      {
+        "module_ids": [
+          "PM1_3",
+          "PM1_4",
+          "PM1_5"
+        ],
+        "process_id": "PROC_001",
+        "process_time": 293
+      },
+      {
+        "module_ids": [
+          "PM1_1"
+        ],
+        "process_id": "PROC_000",
+        "process_time": 30
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      }
+    ],
+    "R01": [
+      {
+        "module_ids": [
+          "AL1"
+        ],
+        "process_time": 15
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "PM1_1",
+          "PM1_2"
+        ],
+        "process_id": "PROC_003",
+        "process_time": 589
+      },
+      {
+        "module_ids": [
+          "PM1_1",
+          "PM1_5"
+        ],
+        "process_id": "PROC_004",
+        "process_time": 327
+      },
+      {
+        "module_ids": [
+          "PM1_4"
+        ],
+        "process_id": "PROC_005",
+        "process_time": 573
+      },
+      {
+        "module_ids": [
+          "PM1_2",
+          "PM1_3"
+        ],
+        "process_id": "PROC_006",
+        "process_time": 299
+      },
+      {
+        "module_ids": [
+          "BUFFER1",
+          "BUFFER2"
+        ],
+        "process_time": 43
+      },
+      {
+        "module_ids": [
+          "PM2_2",
+          "PM2_4"
+        ],
+        "process_id": "PROC_010",
+        "process_time": 632
+      },
+      {
+        "module_ids": [
+          "PM2_2",
+          "PM2_3"
+        ],
+        "process_id": "PROC_008",
+        "process_time": 27
+      },
+      {
+        "module_ids": [
+          "BUFFER1",
+          "BUFFER2"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      }
+    ],
+    "R02": [
+      {
+        "module_ids": [
+          "AL1"
+        ],
+        "process_time": 15
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "BUFFER1",
+          "BUFFER2"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "PM2_2",
+          "PM2_4"
+        ],
+        "process_id": "PROC_010",
+        "process_time": 632
+      },
+      {
+        "module_ids": [
+          "PM2_4"
+        ],
+        "process_id": "PROC_012",
+        "process_time": 589
+      },
+      {
+        "module_ids": [
+          "PM2_1",
+          "PM2_2"
+        ],
+        "process_id": "PROC_011",
+        "process_time": 45
+      },
+      {
+        "module_ids": [
+          "BUFFER1",
+          "BUFFER2"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      }
+    ],
+    "R03": [
+      {
+        "module_ids": [
+          "AL1"
+        ],
+        "process_time": 15
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      },
+      {
+        "module_ids": [
+          "PM1_1"
+        ],
+        "process_id": "PROC_000",
+        "process_time": 30
+      },
+      {
+        "module_ids": [
+          "PM1_1",
+          "PM1_5"
+        ],
+        "process_id": "PROC_004",
+        "process_time": 327
+      },
+      {
+        "module_ids": [
+          "BUFFER1",
+          "BUFFER2"
+        ],
+        "process_time": 49
+      },
+      {
+        "module_ids": [
+          "LL1"
+        ],
+        "process_time": 0
+      }
+    ]
+  },
+  "schema_version": 2
+}

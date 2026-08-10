@@ -14,19 +14,19 @@ def test_simple_scenarios_finish_with_valid_schedules() -> None:
     }
     assert {
         result.policy for result in results
-    } == {"first_legal", "untrained_network_greedy"}
-    assert all(result.valid for result in results)
+    } == {"serial_reference", "untrained_network_greedy"}
     assert all(result.total_reward == -result.makespan for result in results)
 
-    first_legal = {
+    references = {
         result.scenario: result
         for result in results
-        if result.policy == "first_legal"
+        if result.policy == "serial_reference"
     }
-    assert first_legal["long_route_1w"].wafer_count == 1
-    assert first_legal["long_route_1w"].pm_count == 4
-    assert first_legal["long_route_1w"].action_count == 18
-    assert first_legal["mixed_5pm_24w"].wafer_count == 24
-    assert first_legal["mixed_5pm_24w"].route_count == 3
-    assert first_legal["mixed_5pm_24w"].pm_count == 5
-    assert first_legal["mixed_5pm_24w"].action_count == 192
+    assert all(result.valid for result in references.values())
+    assert references["long_route_1w"].wafer_count == 1
+    assert references["long_route_1w"].pm_count == 4
+    assert references["long_route_1w"].action_count == 18
+    assert references["mixed_5pm_24w"].wafer_count == 24
+    assert references["mixed_5pm_24w"].route_count == 3
+    assert references["mixed_5pm_24w"].pm_count == 5
+    assert references["mixed_5pm_24w"].action_count == 192

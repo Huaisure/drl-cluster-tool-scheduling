@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
-import pickle
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,17 +13,26 @@ from cluster_generator import ProblemGenerator
 from examples.run_scenarios import SCENARIO_DIR
 from cluster_rl.network import ClusterActorCritic, TransformerConfig
 from cluster_rl.train import (
+    DatasetEnvFactory,
+    EpisodeStat,
+    EvaluationCase,
     GeneratorEnvFactory,
     ParallelEnvPool,
     PPOConfig,
     _advantages,
     _collect_rollout,
     _evaluation_problems,
+    _evaluation,
+    _evaluation_cases,
+    _evaluation_score,
+    _episode_rows,
     _first_legal_reference,
     _manifest_problem_paths,
     _normalize_choice_advantages,
     _normalized_reward,
     _step_env_slot,
+    _stratified_evaluation_subset,
+    _update_row,
     train,
 )
 from tests.test_cluster_env import _problem
@@ -146,8 +155,8 @@ def test_deadlock_reward_prefers_more_completed_route_steps() -> None:
     assert late > early
 
 
-def test_cpu_workers_require_generator_slots() -> None:
-    with pytest.raises(ValueError, match="only supported in generator mode"):
+def test_cpu_workers_require_generated_data_slots() -> None:
+    with pytest.raises(ValueError, match="generator or dataset mode"):
         PPOConfig(
             scenario_paths=(SCENARIO_DIR / "long_route_1w.json",),
             cpu_workers=1,
@@ -227,7 +236,7 @@ def test_rollout_replaces_completed_generator_slot() -> None:
         rollout_batch.states,
         rollout_batch.actions.tolist(),
     ):
-        assert encoded.action_mask[action]
+        assert 0 <= action < encoded.action_count
     assert slots[0].episode_index == 1
     assert [call[0] for call in generator.calls] == [5, 6]
 
@@ -247,7 +256,7 @@ def test_parallel_env_pool_advances_and_replaces_completed_slot() -> None:
     try:
         completed = []
         for _ in range(100):
-            action = int(np.flatnonzero(pool.encoded[0].action_mask)[0])
+            action = int(pool.encoded[0].env_action_indices[0])
             _, _, stats = pool.step([action])
             completed.extend(stats)
             if completed:
@@ -269,7 +278,7 @@ def test_parallel_env_pool_matches_serial_transition() -> None:
         evaluate=False,
     )
     slot = GeneratorEnvFactory(config, generator=generator).make(0)
-    serial_slot = pickle.loads(pickle.dumps(slot))
+    serial_slot = GeneratorEnvFactory(config, generator=generator).make(0)
     action = int(np.flatnonzero(slot.observation["action_mask"])[0])
     pool = ParallelEnvPool([slot], config)
 
@@ -289,8 +298,8 @@ def test_parallel_env_pool_matches_serial_transition() -> None:
     assert parallel_rewards == pytest.approx([serial_reward])
     assert parallel_dones == [serial_done]
     np.testing.assert_array_equal(
-        parallel_encoded.action_mask,
-        serial_encoded.action_mask,
+        parallel_encoded.env_action_indices,
+        serial_encoded.env_action_indices,
     )
     for node_type in serial_encoded.graph.node_types:
         torch.testing.assert_close(
@@ -312,7 +321,18 @@ def test_manifest_problem_paths_load_only_materialized_local_files(
         json.dumps(
             {
                 "generator": {"mode": "ppo"},
-                "instances": [{"problem_file": problem_path.name}],
+                "instances": [
+                    {
+                        "problem_file": problem_path.name,
+                        "instance_id": "validation-00000",
+                        "difficulty": "medium",
+                        "seed": 7,
+                        "metadata": {
+                            "reference_makespan": 61.0,
+                            "topology_family": "single_vacuum",
+                        },
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -328,6 +348,165 @@ def test_manifest_problem_paths_load_only_materialized_local_files(
         )
     )
     assert [split for split, _ in cases] == ["validation", "test"]
+    evaluation_cases = _evaluation_cases(
+        PPOConfig(
+            train_mode="generator",
+            validation_manifest=manifest_path,
+        )
+    )
+    assert evaluation_cases[0].instance_id == "validation-00000"
+    assert evaluation_cases[0].difficulty == "medium"
+    assert evaluation_cases[0].topology_family == "single_vacuum"
+
+
+def test_dataset_factory_cycles_materialized_instances(tmp_path: Path) -> None:
+    problem_paths = []
+    for index in range(2):
+        problem_path = tmp_path / f"train-{index:05d}.json"
+        problem_path.write_text(
+            (SCENARIO_DIR / "long_route_1w.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        problem_paths.append(problem_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "generator": {"mode": "ppo", "version": "0.5.0"},
+                "config": {"split": "train"},
+                "instances": [
+                    {
+                        "problem_file": path.name,
+                        "instance_id": path.stem,
+                        "seed": index + 10,
+                        "metadata": {"reference_makespan": 61.0 + index},
+                    }
+                    for index, path in enumerate(problem_paths)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = PPOConfig(
+        train_mode="dataset",
+        train_manifest=manifest_path,
+        num_envs=1,
+        evaluate=False,
+    )
+    factory = DatasetEnvFactory(config)
+
+    first = factory.make(0, 0)
+    second = factory.make(0, 1)
+
+    assert first.reference_makespan == 61.0
+    assert second.reference_makespan == 62.0
+    assert (first.problem_seed, second.problem_seed) == (10, 11)
+    assert first.env.problem.meta["name"] == "train-00000"
+    assert second.env.problem.meta["name"] == "train-00001"
+
+
+def test_failed_evaluation_has_no_normalized_cost_or_gain(monkeypatch) -> None:
+    case = EvaluationCase(
+        split="validation",
+        instance_id="validation-00000",
+        problem=_problem(),
+        reference_makespan=100.0,
+        difficulty="hard",
+        topology_family="simple",
+        seed=7,
+    )
+    monkeypatch.setattr(
+        "cluster_rl.train.rollout",
+        lambda *args, **kwargs: SimpleNamespace(
+            success=False,
+            termination_reason="deadlock",
+            makespan=5.0,
+            action_count=2,
+            valid=False,
+        ),
+    )
+    model = ClusterActorCritic(
+        TransformerConfig(
+            model_dim=16,
+            num_heads=4,
+            hgt_layers=1,
+            num_layers=1,
+            feedforward_dim=32,
+            dropout=0.0,
+        )
+    )
+
+    result = _evaluation(
+        model,
+        [case],
+        evaluation_phase="periodic",
+        update=3,
+        global_step=36,
+    )[0]
+
+    assert result["instance_id"] == "validation-00000"
+    assert result["success"] is False
+    assert result["termination_reason"] == "deadlock"
+    assert result["normalized_cost"] == ""
+    assert result["relative_gain"] == ""
+    assert _evaluation_score([result]) == (0.0, -float("inf"))
+
+
+def test_training_cost_metrics_exclude_deadlocked_partial_makespan() -> None:
+    failed = EpisodeStat(
+        scenario="train-00000",
+        makespan=5.0,
+        reference_makespan=100.0,
+        normalized_return=-1.0,
+        reward=-5.0,
+        success=False,
+    )
+    metrics = {
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "ppo_epochs": 1.0,
+        "clip_fraction": 0.0,
+        "choice_fraction": 0.0,
+        "grad_norm": 0.0,
+    }
+
+    assert _episode_rows([failed], 1, 12)[0]["normalized_cost"] == ""
+    assert _update_row(metrics, [failed], 1, 12)["mean_makespan"] == ""
+
+
+def test_validation_subset_covers_metadata_buckets_before_filling() -> None:
+    problem = _problem()
+    cases = [
+        EvaluationCase(
+            split="validation",
+            instance_id=f"validation-{index:05d}",
+            problem=problem,
+            reference_makespan=100.0,
+            difficulty=difficulty,
+            topology_family=topology,
+            seed=index,
+        )
+        for index, (topology, difficulty) in enumerate(
+            (
+                ("dual_vacuum", "easy"),
+                ("dual_vacuum", "easy"),
+                ("simple", "easy"),
+                ("single_vacuum", "hard"),
+            )
+        )
+    ]
+
+    subset = _stratified_evaluation_subset(cases, 3)
+
+    assert {
+        (case.topology_family, case.difficulty) for case in subset
+    } == {
+        ("dual_vacuum", "easy"),
+        ("simple", "easy"),
+        ("single_vacuum", "hard"),
+    }
 
 
 def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
@@ -365,3 +544,35 @@ def test_short_ppo_training_writes_checkpoint(tmp_path: Path) -> None:
     assert 1 <= float(update_row["ppo_epochs"]) < config.epochs
     assert "Masked PPO training" in (run_dir / "train.log").read_text()
     assert (run_dir / "training_curves.png").is_file()
+
+
+def test_periodic_validation_writes_best_checkpoint(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    config = PPOConfig(
+        scenario_paths=(SCENARIO_DIR / "long_route_1w.json",),
+        run_dir=run_dir,
+        checkpoint=run_dir / "checkpoint.pt",
+        total_steps=12,
+        rollout_steps=12,
+        epochs=1,
+        minibatch_size=12,
+        model_dim=16,
+        num_heads=4,
+        hgt_layers=1,
+        num_layers=1,
+        feedforward_dim=32,
+        checkpoint_interval=1,
+        evaluation_interval=1,
+        validation_cases=1,
+    )
+
+    summary = train(config)
+
+    assert summary["best_checkpoint"] == str(run_dir / "best_checkpoint.pt")
+    assert (run_dir / "best_checkpoint.pt").is_file()
+    with (run_dir / "evaluation.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert {row["evaluation_phase"] for row in rows} == {"periodic", "final"}
+    assert {row["instance_id"] for row in rows} == {"long_route_1w"}

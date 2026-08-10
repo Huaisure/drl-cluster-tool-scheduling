@@ -18,9 +18,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "warning: SLURM_JOB_ID is unset; training will run outside a Slurm allocation" >&2
 fi
 
+TRAIN_MANIFEST="${TRAIN_MANIFEST:-datasets/train/manifest.json}"
 VALIDATION_MANIFEST="${VALIDATION_MANIFEST:-datasets/validation/manifest.json}"
 TEST_MANIFEST="${TEST_MANIFEST:-datasets/test/manifest.json}"
-for manifest in "$VALIDATION_MANIFEST" "$TEST_MANIFEST"; do
+for manifest in "$TRAIN_MANIFEST" "$VALIDATION_MANIFEST" "$TEST_MANIFEST"; do
   if [[ ! -f "$manifest" ]]; then
     echo "manifest not found: $manifest" >&2
     exit 1
@@ -28,12 +29,14 @@ for manifest in "$VALIDATION_MANIFEST" "$TEST_MANIFEST"; do
 done
 
 TOTAL_STEPS="${TOTAL_STEPS:-1000000}"
+EVALUATION_INTERVAL="${EVALUATION_INTERVAL:-25}"
+VALIDATION_CASES="${VALIDATION_CASES:-20}"
 RUN_ID="${SLURM_JOB_ID:-local}_$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUN_DIR:-runs/generator_a800_large_${RUN_ID}}"
 
 export PYTHONUNBUFFERED=1
 
-echo "Starting A800 generator training"
+echo "Starting A800 dataset training"
 echo "  job        : ${SLURM_JOB_ID:-none}"
 echo "  host       : $(hostname)"
 echo "  CPUs       : $(nproc)"
@@ -41,11 +44,10 @@ echo "  run_dir    : $RUN_DIR"
 echo "  total_steps: $TOTAL_STEPS"
 
 exec python -u -m cluster_rl.train \
-  --train-mode generator \
+  --train-mode dataset \
   --num-envs 16 \
   --cpu-workers 0 \
-  --generator-seed 42 \
-  --generator-max-attempts 64 \
+  --train-manifest "$TRAIN_MANIFEST" \
   --validation-manifest "$VALIDATION_MANIFEST" \
   --test-manifest "$TEST_MANIFEST" \
   --device cuda \
@@ -64,4 +66,6 @@ exec python -u -m cluster_rl.train \
   --target-kl 0.02 \
   --seed 42 \
   --log-interval 1 \
-  --checkpoint-interval 5
+  --checkpoint-interval 5 \
+  --evaluation-interval "$EVALUATION_INTERVAL" \
+  --validation-cases "$VALIDATION_CASES"

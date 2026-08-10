@@ -1,0 +1,536 @@
+{
+  "ClusterTool": {
+    "TM1": {
+      "arm_type": "dual_arm",
+      "module_ids": [
+        "IO1",
+        "PM1",
+        "PM2",
+        "PM3",
+        "PM4"
+      ],
+      "pick_time": 13,
+      "place_time": 11,
+      "travel_times": 13
+    }
+  },
+  "Modules": {
+    "IO1": {
+      "capacity": 33,
+      "type": "IO"
+    },
+    "PM1": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_000",
+        "PROC_001",
+        "PROC_004"
+      ],
+      "type": "PM"
+    },
+    "PM2": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_000",
+        "PROC_002"
+      ],
+      "type": "PM"
+    },
+    "PM3": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_003",
+        "PROC_005"
+      ],
+      "type": "PM"
+    },
+    "PM4": {
+      "capacity": 1,
+      "process_ids": [
+        "PROC_002",
+        "PROC_004"
+      ],
+      "type": "PM"
+    }
+  },
+  "_meta": {
+    "generator": {
+      "attempt_seed": 16044664236088409637,
+      "average_legal_actions": 5.539394,
+      "buffer_count": 0,
+      "candidate_ratio": 0.625,
+      "difficulty": "medium",
+      "feasible": true,
+      "instance_id": "train_medium_9359711845163195232",
+      "io_count": 1,
+      "ll_count": 0,
+      "lower_bound": 18625.0,
+      "max_process_steps": 4,
+      "max_route_length": 4,
+      "median_process_time": 298.0,
+      "mode": "ppo",
+      "multiple_choice_state_ratio": 0.966667,
+      "name": "cluster_generator",
+      "optimality_gap": 1.454228,
+      "pm_count": 4,
+      "pm_total_loads": {
+        "PM1": 18625.0,
+        "PM2": 2307.0,
+        "PM3": 850.0,
+        "PM4": 18018.0
+      },
+      "reference_makespan": 45710.0,
+      "reference_policy": "serial_domain_feasibility_witness",
+      "robot_count": 1,
+      "route_count": 2,
+      "seed": 9359711845163195232,
+      "signature_bucket": 15,
+      "split": "train",
+      "structural_signature": "4ddb6a3fe632c9ec6933c6d36ef72de8f72065e33f141f9c2464bdfb35c8c016",
+      "topology_family": "simple",
+      "validator_result": true,
+      "version": "0.5.0",
+      "wafer_count": 33
+    }
+  },
+  "initial_state": {
+    "robots": {
+      "TM1": {
+        "position_module_id": null
+      }
+    },
+    "wafers": [
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "2"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "3"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "4"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "5"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "6"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "7"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "8"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "9"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "10"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "11"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "12"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "13"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "14"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R00",
+        "step_index": 0,
+        "wafer_index": "15"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "0"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "1"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "2"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "3"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 0,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "4"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "5"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "6"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "7"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 1,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "8"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "9"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "10"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "11"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 2,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "12"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "13"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "14"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "15"
+      },
+      {
+        "location": {
+          "kind": "module",
+          "module_id": "IO1"
+        },
+        "priority": 3,
+        "process_end_time": null,
+        "route_id": "R01",
+        "step_index": 0,
+        "wafer_index": "16"
+      }
+    ]
+  },
+  "routes": {
+    "R00": [
+      {
+        "module_ids": [
+          "PM1",
+          "PM2"
+        ],
+        "process_id": "PROC_000",
+        "process_time": 46
+      },
+      {
+        "module_ids": [
+          "PM2",
+          "PM4"
+        ],
+        "process_id": "PROC_002",
+        "process_time": 49
+      },
+      {
+        "module_ids": [
+          "PM1",
+          "PM4"
+        ],
+        "process_id": "PROC_004",
+        "process_time": 546
+      },
+      {
+        "module_ids": [
+          "PM1"
+        ],
+        "process_id": "PROC_001",
+        "process_time": 563
+      }
+    ],
+    "R01": [
+      {
+        "module_ids": [
+          "PM1"
+        ],
+        "process_id": "PROC_001",
+        "process_time": 563
+      },
+      {
+        "module_ids": [
+          "PM1",
+          "PM4"
+        ],
+        "process_id": "PROC_004",
+        "process_time": 546
+      },
+      {
+        "module_ids": [
+          "PM3"
+        ],
+        "process_id": "PROC_005",
+        "process_time": 50
+      },
+      {
+        "module_ids": [
+          "PM2",
+          "PM4"
+        ],
+        "process_id": "PROC_002",
+        "process_time": 49
+      }
+    ]
+  },
+  "schema_version": 2
+}

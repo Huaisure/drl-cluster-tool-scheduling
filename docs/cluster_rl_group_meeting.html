@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="集束型设备机械手调度：从事件模型到异构图 PPO 的核心方法组会展示">
+  <title>集束型设备调度 · HGT + PPO 核心方法</title>
+  <style>
+    :root {
+      --ink: #102a2b;
+      --muted: #607474;
+      --paper: #f4f1e9;
+      --paper-2: #ebe6da;
+      --card: rgba(255, 253, 247, .86);
+      --line: rgba(16, 42, 43, .14);
+      --teal: #087f78;
+      --teal-deep: #075b59;
+      --teal-soft: #d6ebe5;
+      --orange: #e8642a;
+      --orange-soft: #f8ddca;
+      --gold: #d5a021;
+      --blue: #4f71a3;
+      --shadow: 0 24px 70px rgba(24, 50, 48, .11);
+      --radius: 24px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-snap-type: y mandatory; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 88% 10%, rgba(232, 100, 42, .10), transparent 22rem),
+        radial-gradient(circle at 8% 92%, rgba(8, 127, 120, .10), transparent 28rem),
+        var(--paper);
+      font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    button, a { font: inherit; }
+    button:focus-visible, a:focus-visible { outline: 3px solid var(--gold); outline-offset: 4px; }
+
+    .progress {
+      position: fixed;
+      z-index: 50;
+      inset: 0 0 auto 0;
+      height: 4px;
+      background: rgba(16, 42, 43, .08);
+    }
+    .progress span {
+      display: block;
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, var(--teal), var(--orange));
+      transition: width .25s ease;
+    }
+
+    .rail {
+      position: fixed;
+      z-index: 40;
+      top: 50%;
+      left: 24px;
+      transform: translateY(-50%);
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(244, 241, 233, .78);
+      backdrop-filter: blur(14px);
+    }
+    .rail a {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 11px;
+      font-weight: 800;
+      transition: .2s ease;
+    }
+    .rail a.active { color: #fff; background: var(--ink); transform: scale(1.08); }
+
+    .controls {
+      position: fixed;
+      z-index: 40;
+      right: 24px;
+      bottom: 22px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 253, 247, .86);
+      box-shadow: 0 10px 30px rgba(16, 42, 43, .10);
+      backdrop-filter: blur(14px);
+    }
+    .controls button {
+      border: 0;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      color: var(--ink);
+      background: transparent;
+      cursor: pointer;
+    }
+    .controls button:hover { color: #fff; background: var(--teal); }
+    .counter { min-width: 48px; text-align: center; color: var(--muted); font-size: 12px; font-weight: 800; }
+
+    main { counter-reset: slide; }
+    .slide {
+      min-height: 100svh;
+      padding: clamp(58px, 8vh, 92px) max(7vw, 82px) clamp(56px, 7vh, 76px);
+      display: flex;
+      align-items: center;
+      scroll-snap-align: start;
+      scroll-snap-stop: always;
+      position: relative;
+      counter-increment: slide;
+    }
+    .slide::after {
+      content: "0" counter(slide);
+      position: absolute;
+      right: max(7vw, 82px);
+      top: 34px;
+      color: rgba(16, 42, 43, .22);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .18em;
+    }
+    .stage { width: min(1180px, 100%); margin: 0 auto; }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--teal);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 940px;
+      margin-bottom: 26px;
+      font-family: Georgia, "Songti SC", serif;
+      font-size: clamp(48px, 7.2vw, 96px);
+      font-weight: 500;
+      line-height: .98;
+      letter-spacing: -.045em;
+    }
+    h2 {
+      max-width: 900px;
+      margin-bottom: 30px;
+      font-family: Georgia, "Songti SC", serif;
+      font-size: clamp(34px, 4.6vw, 62px);
+      font-weight: 500;
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+    h3 { margin-bottom: 8px; font-size: 17px; line-height: 1.35; }
+    .lede { max-width: 820px; color: var(--muted); font-size: clamp(18px, 2vw, 24px); line-height: 1.55; }
+    .accent { color: var(--orange); }
+    .teal { color: var(--teal); }
+    .small { color: var(--muted); font-size: 13px; }
+    .strong { font-weight: 850; }
+    .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+
+    .title-grid { display: grid; grid-template-columns: 1fr .65fr; align-items: end; gap: 56px; }
+    .claim {
+      padding: 24px 26px;
+      border-left: 5px solid var(--orange);
+      border-radius: 0 18px 18px 0;
+      color: var(--ink);
+      background: rgba(255, 253, 247, .62);
+      box-shadow: var(--shadow);
+      font-size: 18px;
+    }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255,255,255,.38);
+      font-size: 12px;
+      font-weight: 750;
+    }
+    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
+
+    .orbit {
+      aspect-ratio: 1;
+      position: relative;
+      border: 1px solid rgba(8, 127, 120, .20);
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(8,127,120,.13), transparent 60%);
+    }
+    .orbit::before, .orbit::after {
+      content: "";
+      position: absolute;
+      inset: 17%;
+      border: 1px dashed rgba(8, 127, 120, .35);
+      border-radius: 50%;
+    }
+    .orbit::after { inset: 35%; background: var(--teal); border: 8px solid var(--teal-soft); box-shadow: 0 0 0 1px var(--teal); }
+    .chamber {
+      position: absolute;
+      display: grid;
+      place-items: center;
+      width: 68px;
+      height: 68px;
+      border-radius: 18px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 30px rgba(16, 42, 43, .12);
+      font-size: 12px;
+      font-weight: 900;
+    }
+    .c1 { left: 3%; top: 38%; } .c2 { left: 25%; top: 2%; } .c3 { right: 13%; top: 11%; }
+    .c4 { right: 0; bottom: 24%; } .c5 { left: 28%; bottom: 0; }
+    .robot-label { position: absolute; inset: 46% 0 auto; z-index: 2; text-align: center; color: #fff; font-size: 11px; font-weight: 900; }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .card {
+      min-width: 0;
+      padding: 23px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--card);
+      box-shadow: 0 12px 35px rgba(16, 42, 43, .065);
+    }
+    .card p:last-child { margin-bottom: 0; }
+    .num {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      margin-bottom: 20px;
+      border-radius: 10px;
+      color: #fff;
+      background: var(--ink);
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .kicker { color: var(--orange); font-size: 11px; font-weight: 900; letter-spacing: .12em; }
+    .takeaway {
+      margin-top: 22px;
+      padding: 16px 20px;
+      border-radius: 16px;
+      color: var(--teal-deep);
+      background: var(--teal-soft);
+      font-size: 16px;
+      font-weight: 780;
+    }
+
+    .event-line { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 28px; position: relative; }
+    .event-line::before { content: ""; position: absolute; left: 8%; right: 8%; top: 16px; height: 2px; background: var(--line); }
+    .event { position: relative; text-align: center; }
+    .event i { display: block; width: 14px; height: 14px; margin: 10px auto 17px; border: 4px solid var(--paper); border-radius: 50%; background: var(--orange); box-shadow: 0 0 0 2px var(--orange); }
+    .event:nth-child(even) i { background: var(--teal); box-shadow: 0 0 0 2px var(--teal); }
+    .event b { display: block; font-size: 13px; }
+    .event span { color: var(--muted); font-size: 11px; }
+
+    .mdp { display: grid; grid-template-columns: 1.1fr .9fr; gap: 24px; align-items: stretch; }
+    .formula {
+      padding: 26px;
+      border-radius: var(--radius);
+      color: #f4f1e9;
+      background: var(--ink);
+      box-shadow: var(--shadow);
+    }
+    .formula .label { color: #9dd2ca; font-size: 11px; font-weight: 900; letter-spacing: .14em; }
+    .formula .math { margin: 16px 0; font-family: Georgia, serif; font-size: clamp(22px, 3vw, 34px); line-height: 1.35; }
+    .formula .math em { color: #ff9b6a; font-style: normal; }
+    .formula p { margin-bottom: 0; color: #b8c7c4; font-size: 13px; }
+    .action-stack { display: grid; gap: 11px; }
+    .action {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--card);
+    }
+    .action code { color: var(--teal-deep); font-weight: 900; }
+    .action span { color: var(--muted); font-size: 13px; }
+
+    .graph-wrap { display: grid; grid-template-columns: .88fr 1.12fr; gap: 32px; align-items: center; }
+    .graph {
+      min-height: 410px;
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 32px;
+      background: rgba(255,255,255,.35);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .graph::before { content: ""; position: absolute; inset: 13%; border: 1px dashed rgba(8,127,120,.28); border-radius: 48%; }
+    .node {
+      position: absolute;
+      z-index: 2;
+      display: grid;
+      place-items: center;
+      width: 98px;
+      height: 62px;
+      padding: 8px;
+      border: 2px solid currentColor;
+      border-radius: 18px;
+      background: #fffdf7;
+      text-align: center;
+      font-size: 12px;
+      font-weight: 900;
+      box-shadow: 0 8px 22px rgba(16, 42, 43, .1);
+    }
+    .node small { display: block; color: var(--muted); font-size: 9px; font-weight: 700; }
+    .n-global { left: 38%; top: 40%; color: var(--ink); background: var(--ink); color: #fff; }
+    .n-wafer { left: 8%; top: 18%; color: var(--orange); }
+    .n-step { right: 6%; top: 14%; color: var(--gold); }
+    .n-module { right: 4%; bottom: 12%; color: var(--teal); }
+    .n-robot { left: 9%; bottom: 11%; color: var(--blue); }
+    .link { position: absolute; height: 2px; background: rgba(16,42,43,.23); transform-origin: left center; z-index: 1; }
+    .l1 { width: 150px; left: 24%; top: 32%; transform: rotate(22deg); }
+    .l2 { width: 155px; left: 53%; top: 46%; transform: rotate(-33deg); }
+    .l3 { width: 150px; left: 55%; top: 54%; transform: rotate(29deg); }
+    .l4 { width: 148px; left: 25%; top: 69%; transform: rotate(-26deg); }
+    .l5 { width: 245px; left: 27%; top: 21%; transform: rotate(3deg); border-top: 1px dashed rgba(16,42,43,.32); background: transparent; }
+    .feature-list { display: grid; gap: 10px; }
+    .feature-row { display: grid; grid-template-columns: 92px 1fr; gap: 15px; align-items: baseline; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+    .feature-row:last-child { border-bottom: 0; }
+    .feature-row b { color: var(--teal-deep); font-size: 13px; }
+    .feature-row span { color: var(--muted); font-size: 13px; }
+
+    .pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; align-items: stretch; }
+    .pipe {
+      min-height: 168px;
+      padding: 19px;
+      position: relative;
+      border-radius: 20px;
+      color: var(--ink);
+      background: var(--card);
+      border: 1px solid var(--line);
+    }
+    .pipe:not(:last-child)::after { content: "→"; position: absolute; z-index: 3; right: -15px; top: 42%; color: var(--orange); font-size: 22px; font-weight: 900; }
+    .pipe b { display: block; margin-bottom: 10px; font-size: 14px; }
+    .pipe p { margin: 0; color: var(--muted); font-size: 12px; }
+    .pipe .tag { display: inline-block; margin-bottom: 22px; padding: 3px 8px; border-radius: 999px; color: var(--teal-deep); background: var(--teal-soft); font-size: 9px; font-weight: 900; letter-spacing: .08em; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
+    .head-card { padding: 19px 21px; border-radius: 18px; color: #fff; background: var(--teal-deep); }
+    .head-card.orange { background: var(--orange); }
+    .head-card b { display: block; font-size: 15px; }
+    .head-card span { color: rgba(255,255,255,.74); font-size: 12px; }
+
+    .loop { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 12px; }
+    .loop .card { position: relative; padding-top: 54px; }
+    .loop .card::before { content: attr(data-step); position: absolute; left: 22px; top: 18px; color: var(--orange); font-size: 11px; font-weight: 900; letter-spacing: .12em; }
+    .loop .card:not(:last-child)::after { content: "↗"; position: absolute; z-index: 4; right: -17px; top: 47%; color: var(--teal); font-size: 22px; font-weight: 900; }
+    .reward-band { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 10px; margin-top: 20px; }
+    .reward-cell { padding: 14px 16px; border-radius: 14px; background: var(--paper-2); text-align: center; }
+    .reward-cell b { display: block; color: var(--teal-deep); font-size: 13px; }
+    .reward-cell span { color: var(--muted); font-size: 11px; }
+
+    .data-flow { display: grid; grid-template-columns: .8fr 1.2fr; gap: 26px; align-items: stretch; }
+    .dataset {
+      padding: 28px;
+      border-radius: var(--radius);
+      color: #fff;
+      background: linear-gradient(145deg, var(--teal-deep), #0a6e67);
+      box-shadow: var(--shadow);
+    }
+    .dataset h3 { font-size: 22px; }
+    .dataset p { color: #b9d7d2; }
+    .dataset-row { display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid rgba(255,255,255,.16); font-size: 13px; }
+    .dataset-row span:last-child { color: #ffb186; font-weight: 800; }
+    .guardrails { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .guardrails .card { display: flex; flex-direction: column; justify-content: space-between; }
+    .guardrails .big { margin: 5px 0 12px; color: var(--teal); font-family: Georgia, serif; font-size: 40px; line-height: 1; }
+
+    .results { display: grid; grid-template-columns: .65fr 1.35fr; gap: 28px; align-items: stretch; }
+    .proof {
+      padding: 28px;
+      border-radius: var(--radius);
+      color: #fff;
+      background: var(--ink);
+      box-shadow: var(--shadow);
+    }
+    .proof .hero-number { margin: 18px 0 4px; color: #ff9b6a; font-family: Georgia, serif; font-size: 74px; line-height: .9; }
+    .proof .hero-label { color: #b8c7c4; font-size: 13px; }
+    .proof hr { margin: 25px 0; border: 0; border-top: 1px solid rgba(255,255,255,.16); }
+    .proof p { color: #d4dddb; font-size: 14px; }
+    .bars { display: grid; gap: 25px; }
+    .bar-group { display: grid; grid-template-columns: 150px 1fr 64px; gap: 14px; align-items: center; }
+    .bar-name b { display: block; font-size: 13px; }
+    .bar-name span { color: var(--muted); font-size: 10px; }
+    .track { height: 42px; position: relative; border-radius: 12px; background: var(--paper-2); overflow: hidden; }
+    .refbar, .modelbar { position: absolute; left: 0; height: 12px; border-radius: 999px; }
+    .refbar { top: 7px; background: #aeb9b6; }
+    .modelbar { bottom: 7px; background: var(--teal); }
+    .bar-value { text-align: right; font-size: 12px; font-weight: 800; }
+    .legend { display: flex; gap: 18px; justify-content: flex-end; color: var(--muted); font-size: 11px; }
+    .legend i { display: inline-block; width: 18px; height: 6px; margin-right: 5px; border-radius: 99px; background: #aeb9b6; vertical-align: middle; }
+    .legend .model { background: var(--teal); }
+
+    .boundary { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .status {
+      padding: 27px;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      background: var(--card);
+    }
+    .status.done { border-top: 6px solid var(--teal); }
+    .status.next { border-top: 6px solid var(--orange); }
+    .status ul { margin: 18px 0 0; padding: 0; list-style: none; }
+    .status li { display: grid; grid-template-columns: 20px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+    .status li:last-child { border-bottom: 0; }
+    .status li::before { content: "✓"; color: var(--teal); font-weight: 900; }
+    .status.next li::before { content: "→"; color: var(--orange); }
+
+    .closing { text-align: center; }
+    .closing h2 { max-width: 1050px; margin-inline: auto; font-size: clamp(42px, 6vw, 78px); }
+    .closing .lede { margin-inline: auto; }
+    .one-line { display: inline-grid; grid-auto-flow: column; gap: 8px; margin-top: 32px; }
+    .one-line span { padding: 10px 14px; border-radius: 999px; color: var(--teal-deep); background: var(--teal-soft); font-size: 12px; font-weight: 850; }
+    .one-line i { align-self: center; color: var(--orange); font-style: normal; font-weight: 900; }
+    .source-note { margin-top: 34px; color: var(--muted); font-size: 11px; }
+
+    /* Readability-first presentation treatment: typography carries the hierarchy. */
+    body {
+      font-size: 19px;
+      line-height: 1.65;
+      background: #f7f6f2;
+    }
+    .rail { display: none; }
+    .slide {
+      padding-inline: max(7vw, 72px);
+    }
+    .stage { width: min(1120px, 100%); }
+    h1 {
+      max-width: 1020px;
+      font-size: clamp(56px, 7vw, 88px);
+      line-height: 1.02;
+    }
+    h2 {
+      max-width: 1000px;
+      margin-bottom: 38px;
+      font-size: clamp(42px, 4.7vw, 60px);
+      line-height: 1.12;
+    }
+    h3 { font-size: 22px; }
+    .eyebrow { margin-bottom: 16px; font-size: 14px; }
+    .lede { max-width: 900px; font-size: clamp(22px, 2.3vw, 28px); }
+    .small { color: #4e6161; font-size: 16px; line-height: 1.68; }
+    .title-grid { grid-template-columns: 1fr; }
+    .orbit { display: none; }
+    .claim {
+      max-width: 900px;
+      margin-top: 42px;
+      padding: 6px 0 6px 24px;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      font-size: 22px;
+    }
+    .pill { padding: 8px 14px; font-size: 14px; }
+
+    .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 34px 58px; }
+    .grid-3 { gap: 44px; }
+    .card {
+      padding: 4px 0 4px 22px;
+      border: 0;
+      border-left: 3px solid rgba(8, 127, 120, .28);
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+    .num {
+      display: block;
+      width: auto;
+      height: auto;
+      margin-bottom: 12px;
+      color: var(--orange);
+      background: transparent;
+      font-family: Georgia, serif;
+      font-size: 28px;
+      text-align: left;
+    }
+    .kicker { font-size: 13px; }
+    .takeaway {
+      margin-top: 34px;
+      padding: 18px 0 0;
+      border-top: 2px solid var(--teal);
+      border-radius: 0;
+      background: transparent;
+      font-size: 20px;
+    }
+
+    .event-line { margin-top: 42px; }
+    .event b { font-size: 16px; }
+    .event span { font-size: 14px; }
+    .action-stack { gap: 18px; }
+    .action {
+      grid-template-columns: 130px 1fr;
+      padding: 8px 0 8px 20px;
+      border: 0;
+      border-left: 3px solid var(--teal-soft);
+      border-radius: 0;
+      background: transparent;
+    }
+    .action code { font-size: 17px; }
+    .action span { font-size: 16px; }
+    .formula { padding: 32px; }
+    .formula .label { font-size: 13px; }
+    .formula p { font-size: 16px; line-height: 1.7; }
+
+    .graph {
+      min-height: 430px;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+    .node { width: 112px; height: 72px; font-size: 15px; }
+    .node small { font-size: 11px; }
+    .feature-list { gap: 14px; }
+    .feature-row { grid-template-columns: 112px 1fr; gap: 18px; padding-bottom: 14px; }
+    .feature-row b, .feature-row span { font-size: 16px; }
+
+    .pipeline { gap: 24px; }
+    .pipe {
+      min-height: 190px;
+      padding: 0 8px 0 18px;
+      border: 0;
+      border-left: 3px solid var(--teal-soft);
+      border-radius: 0;
+      background: transparent;
+    }
+    .pipe b { font-size: 18px; }
+    .pipe p { color: #4e6161; font-size: 15px; line-height: 1.65; }
+    .pipe .tag {
+      margin-bottom: 28px;
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      font-size: 12px;
+    }
+    .head-card {
+      padding: 17px 20px;
+      border-radius: 4px;
+    }
+    .head-card b { font-size: 18px; }
+    .head-card span { font-size: 15px; }
+
+    .loop { gap: 34px; }
+    .loop .card { padding: 52px 0 0 20px; }
+    .loop .card::before { left: 20px; top: 10px; font-size: 13px; }
+    .reward-band { margin-top: 34px; }
+    .reward-cell {
+      padding: 10px 14px;
+      border-radius: 0;
+      border-top: 1px solid var(--line);
+      background: transparent;
+    }
+    .reward-cell b { font-size: 16px; }
+    .reward-cell span { font-size: 14px; }
+
+    .proof { padding: 34px; }
+    .proof .hero-label, .proof p { font-size: 16px; }
+    .results > .card { padding-left: 0; border-left: 0; }
+    .legend { font-size: 14px; }
+    .bar-group { grid-template-columns: 180px 1fr 84px; }
+    .bar-name b { font-size: 16px; }
+    .bar-name span { font-size: 13px; }
+    .bar-value { font-size: 15px; }
+
+    .status {
+      padding: 26px 0 0;
+      border: 0;
+      border-top: 5px solid;
+      border-radius: 0;
+      background: transparent;
+    }
+    .status.done { border-top-color: var(--teal); }
+    .status.next { border-top-color: var(--orange); }
+    .status li { padding: 12px 0; font-size: 16px; }
+    .closing .lede { font-size: 25px; }
+    .one-line span { padding: 8px 10px; background: transparent; font-size: 15px; }
+    .source-note { font-size: 13px; }
+
+    @media (max-width: 900px) {
+      html { scroll-snap-type: none; }
+      .rail { display: none; }
+      .controls { right: 12px; bottom: 12px; }
+      .slide { min-height: auto; padding: 72px 24px 80px; }
+      .slide::after { right: 24px; top: 28px; }
+      .title-grid, .grid-2, .grid-3, .grid-4, .mdp, .graph-wrap, .data-flow, .results, .boundary { grid-template-columns: 1fr; }
+      .title-grid { align-items: center; }
+      .orbit { width: min(360px, 90vw); margin: 0 auto; }
+      .pipeline, .loop { grid-template-columns: 1fr; }
+      .pipe:not(:last-child)::after, .loop .card:not(:last-child)::after { content: "↓"; right: 50%; top: auto; bottom: -23px; }
+      .reward-band { grid-template-columns: 1fr; }
+      .bar-group { grid-template-columns: 110px 1fr 48px; }
+      .one-line { grid-auto-flow: row; }
+      .one-line i { transform: rotate(90deg); }
+    }
+
+    @media print {
+      @page { size: 16in 9in; margin: 0; }
+      html { scroll-snap-type: none; }
+      body { background: var(--paper); print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .rail, .controls, .progress { display: none; }
+      .slide { height: 9in; min-height: 9in; padding: .62in .78in; break-after: page; page-break-after: always; overflow: hidden; }
+      .slide::after { right: .78in; top: .35in; }
+      h1 { font-size: 64px; }
+      h2 { font-size: 44px; }
+      .card { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+  <nav class="rail" aria-label="页面导航">
+    <a href="#s1" aria-label="封面">1</a><a href="#s2" aria-label="问题">2</a>
+    <a href="#s3" aria-label="事件建模">3</a><a href="#s4" aria-label="MDP">4</a>
+    <a href="#s5" aria-label="异构图">5</a><a href="#s6" aria-label="模型">6</a>
+    <a href="#s7" aria-label="训练">7</a><a href="#s8" aria-label="证据">8</a>
+    <a href="#s9" aria-label="边界">9</a><a href="#s10" aria-label="结论">10</a>
+  </nav>
+
+  <div class="controls" aria-label="演示控制">
+    <button id="prev" aria-label="上一页" title="上一页（←）">←</button>
+    <span class="counter" id="counter">01 / 10</span>
+    <button id="next" aria-label="下一页" title="下一页（→）">→</button>
+    <button id="fullscreen" aria-label="进入全屏" title="全屏（F）">⛶</button>
+  </div>
+
+  <main>
+    <section class="slide" id="s1" data-title="封面">
+      <div class="stage title-grid">
+        <div>
+          <p class="eyebrow">Cluster Tool Scheduling · Group Meeting</p>
+          <h1>把调度问题<br>变成<span class="accent">可学习的决策</span></h1>
+          <p class="lede">集束型设备机械手调度的事件建模、异构图表征与 HGT + PPO 方法体系。</p>
+          <div class="meta-row">
+            <span class="pill">10–15 min</span>
+            <span class="pill">方法体系完整</span>
+            <span class="pill">小问题已跑通</span>
+          </div>
+          <div class="claim"><b>核心判断：</b>约束由 Engine 守住，策略只在合法动作中学习“此刻做什么最划算”。</div>
+        </div>
+        <div class="orbit" aria-label="集束型设备结构抽象图">
+          <div class="chamber c1">LP</div><div class="chamber c2">PM 1</div>
+          <div class="chamber c3">PM 2</div><div class="chamber c4">PM 3</div>
+          <div class="chamber c5">LL</div><div class="robot-label">TM ROBOT</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="s2" data-title="问题">
+      <div class="stage">
+        <p class="eyebrow">01 · Problem framing</p>
+        <h2>难点不是“走哪条路”，而是<span class="teal">资源、时间与顺序</span>同时耦合</h2>
+        <div class="grid-4">
+          <article class="card"><span class="num">01</span><h3>工艺顺序</h3><p class="small">每片晶圆必须依次完成 Route；每一步可能对应多个候选腔室。</p></article>
+          <article class="card"><span class="num">02</span><h3>资源竞争</h3><p class="small">机械手、手臂、腔室容量与接口在同一时间只能服务有限任务。</p></article>
+          <article class="card"><span class="num">03</span><h3>异步时间</h3><p class="small">加工、移动、Pick、Place、Pump/Vent 均有持续时间，完成时刻不同。</p></article>
+          <article class="card"><span class="num">04</span><h3>全局目标</h3><p class="small">局部可行动作很多，目标却是降低整批晶圆的 makespan，并避免死锁。</p></article>
+        </div>
+        <div class="takeaway">建模目标：在任意决策时刻，从所有合法事件中选择下一步，使系统持续推进并尽量缩短总完工时间。</div>
+      </div>
+    </section>
+
+    <section class="slide" id="s3" data-title="事件建模">
+      <div class="stage">
+        <p class="eyebrow">02 · Event-driven environment</p>
+        <h2>先用离散事件刻画物理世界，再让 RL 做策略选择</h2>
+        <div class="grid-3">
+          <article class="card"><span class="kicker">STATE</span><h3>状态是设备快照</h3><p class="small">晶圆位置与步骤、腔室占用、机械手持片与当前阶段、剩余加工/转换时间。</p></article>
+          <article class="card"><span class="kicker">LEGALITY</span><h3>Engine 生成合法动作</h3><p class="small">可达性、容量、持片、工艺完成和 LL 侧别等约束，不交给网络“猜”。</p></article>
+          <article class="card"><span class="kicker">CLOCK</span><h3>ADVANCE 推进时间</h3><p class="small">当动作已经排入设备，环境跳到下一个事件边界，避免逐秒空转。</p></article>
+        </div>
+        <div class="event-line" aria-label="Pick Place 事件边界">
+          <div class="event"><i></i><b>Pick.start</b><span>占用手臂与源接口</span></div>
+          <div class="event"><i></i><b>Pick.end</b><span>释放源腔室容量</span></div>
+          <div class="event"><i></i><b>Place.start</b><span>预占目标腔室容量</span></div>
+          <div class="event"><i></i><b>Place.end</b><span>晶圆进入目标，释放手臂</span></div>
+        </div>
+        <div class="takeaway">职责分离：Engine 负责“物理上能不能做”，Policy 负责“合法动作里选哪个”。</div>
+      </div>
+    </section>
+
+    <section class="slide" id="s4" data-title="MDP">
+      <div class="stage">
+        <p class="eyebrow">03 · Markov decision process</p>
+        <h2>用三个原子动作，覆盖机械手调度的决策闭环</h2>
+        <div class="mdp">
+          <div class="action-stack">
+            <div class="action"><code>Pick(w, r)</code><span>选择晶圆与执行机械手；从模块取片。</span></div>
+            <div class="action"><code>Place(w, m)</code><span>选择手中晶圆与目标模块；机械手由状态唯一确定。</span></div>
+            <div class="action"><code>Advance</code><span>推进到下一事件边界，让加工或搬运动作完成。</span></div>
+            <div class="card"><h3>终止条件</h3><p class="small"><b>成功：</b>所有晶圆完成 Route 并返回源端。<br><b>失败：</b>未完成且合法动作集合为空，判定死锁。</p></div>
+          </div>
+          <div class="formula">
+            <span class="label">OPTIMIZATION SIGNAL</span>
+            <div class="math">环境奖励 = <em>− Δt</em><br>成功回报 = <em>− makespan</em></div>
+            <p>PPO 训练时再用参考 makespan 构造有界时间代价：成功额外 +1；死锁按未完成进度施加更强惩罚。这样既保留“越快越好”，又拉开成功与死锁。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="s5" data-title="异构图">
+      <div class="stage">
+        <p class="eyebrow">04 · State representation</p>
+        <h2>设备天然是一张异构图：实体不同，关系也不同</h2>
+        <div class="graph-wrap">
+          <div class="graph" aria-label="异构图节点与关系示意">
+            <div class="link l1"></div><div class="link l2"></div><div class="link l3"></div><div class="link l4"></div><div class="link l5"></div>
+            <div class="node n-global">Global<small>系统进度</small></div>
+            <div class="node n-wafer">Wafer<small>位置 / 步骤</small></div>
+            <div class="node n-step">Route step<small>工艺 / 候选腔</small></div>
+            <div class="node n-module">Module<small>容量 / LL 状态</small></div>
+            <div class="node n-robot">Robot<small>持片 / 阶段</small></div>
+          </div>
+          <div>
+            <div class="feature-list">
+              <div class="feature-row"><b>动态关系</b><span>located_in、held_by、operates_on、located_at</span></div>
+              <div class="feature-row"><b>工艺关系</b><span>at_step、next_step、precedes、can_run_on</span></div>
+              <div class="feature-row"><b>拓扑关系</b><span>can_access，以及 LL 的 atmosphere / vacuum 分侧可达</span></div>
+              <div class="feature-row"><b>全局关系</b><span>global 与所有实体双向连接，为价值估计汇聚系统状态</span></div>
+              <div class="feature-row"><b>尺度一致</b><span>所有时间特征统一除以 100 s，保留物理量之间的相对比例</span></div>
+            </div>
+            <div class="takeaway">图结构让同一个策略可以面对不同晶圆数、腔室数与拓扑，而不依赖固定长度的手工拼接。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="s6" data-title="模型">
+      <div class="stage">
+        <p class="eyebrow">05 · HGT + action-query decoder</p>
+        <h2>先理解全局设备状态，再逐个判断合法动作</h2>
+        <div class="pipeline">
+          <div class="pipe"><span class="tag">INPUT</span><b>异构节点特征</b><p>各类型分别线性编码到统一维度。</p></div>
+          <div class="pipe"><span class="tag">ENCODER</span><b>HGT 消息传递</b><p>按节点类型和关系类型聚合，形成上下文化实体表示。</p></div>
+          <div class="pipe"><span class="tag">QUERY</span><b>只构造合法动作</b><p>Pick = wafer + robot；Place = wafer + module；Advance = global。</p></div>
+          <div class="pipe"><span class="tag">DECODER</span><b>Transformer 解码</b><p>动作 query 对整张图 memory 做交叉注意力。</p></div>
+          <div class="pipe"><span class="tag">OUTPUT</span><b>紧凑动作 logits</b><p>只在合法集合上采样或贪心选择，再映射回 Env 动作。</p></div>
+        </div>
+        <div class="split">
+          <div class="head-card"><b>Actor：动作级输出</b><span>每个合法动作一个 logit；不同实例允许不同动作数。</span></div>
+          <div class="head-card orange"><b>Critic：状态级输出</b><span>从 global 节点预测 V(s)，为 GAE 与 PPO 更新提供基线。</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="s7" data-title="训练">
+      <div class="stage">
+        <p class="eyebrow">06 · Training loop</p>
+        <h2>PPO 学“相对更好”的调度，Validator 守住最终可信度</h2>
+        <div class="loop">
+          <article class="card" data-step="STEP 01"><h3>并行采样</h3><p class="small">多环境独立 rollout；策略仅从合法动作分布采样。</p></article>
+          <article class="card" data-step="STEP 02"><h3>优势估计</h3><p class="small">按时间奖励计算 GAE；只对真正存在选择的状态归一化 Actor 优势。</p></article>
+          <article class="card" data-step="STEP 03"><h3>PPO 更新</h3><p class="small">Clipped policy loss + clipped value loss + entropy，限制单次更新幅度。</p></article>
+          <article class="card" data-step="STEP 04"><h3>贪心评估</h3><p class="small">固定验证集上比较 success 与 normalized cost；最佳模型独立保存。</p></article>
+        </div>
+        <div class="reward-band">
+          <div class="reward-cell"><b>训练数据</b><span>固化 manifest / 在线生成 / 固定场景</span></div>
+          <div class="reward-cell"><b>参考尺度</b><span>每个问题使用已验证 reference makespan，跨实例归一化</span></div>
+          <div class="reward-cell"><b>结果复核</b><span>完整动作序列交给独立 ValidatorSuite</span></div>
+        </div>
+        <div class="takeaway">关键不是让神经网络替代约束求解，而是让它在被约束后的可行空间中学习调度偏好。</div>
+      </div>
+    </section>
+
+    <section class="slide" id="s8" data-title="跑通证据">
+      <div class="stage">
+        <p class="eyebrow">07 · Smoke run evidence</p>
+        <h2>小问题已经跑通：证明闭环有效，<span class="accent">尚不代表收敛</span></h2>
+        <div class="results">
+          <aside class="proof">
+            <span class="kicker">END-TO-END CHECK</span>
+            <div class="hero-number">3 / 3</div>
+            <div class="hero-label">贪心评估场景通过独立 Validator</div>
+            <hr>
+            <p><b>训练规模：</b>1,800 env steps · 1 次 PPO update · CPU · 轻量模型。</p>
+            <p><b>训练采样：</b>12 个完成 episode，成功率 100%。</p>
+          </aside>
+          <div class="card">
+            <div class="legend"><span><i></i>reference</span><span><i class="model"></i>model greedy</span></div>
+            <div class="bars">
+              <div class="bar-group">
+                <div class="bar-name"><b>long_route_1w</b><span>1 wafer · 8 steps</span></div>
+                <div class="track"><span class="refbar" style="width:100%"></span><span class="modelbar" style="width:100%"></span></div>
+                <div class="bar-value">61 / 61</div>
+              </div>
+              <div class="bar-group">
+                <div class="bar-name"><b>mixed_3pm_20w</b><span>20 wafers · 3 PM</span></div>
+                <div class="track"><span class="refbar" style="width:100%"></span><span class="modelbar" style="width:100%"></span></div>
+                <div class="bar-value">323 / 323</div>
+              </div>
+              <div class="bar-group">
+                <div class="bar-name"><b>mixed_5pm_24w</b><span>24 wafers · 5 PM</span></div>
+                <div class="track"><span class="refbar" style="width:100%"></span><span class="modelbar" style="width:93.4%"></span></div>
+                <div class="bar-value">424 / 396</div>
+              </div>
+            </div>
+            <div class="takeaway">当前能说：数据→环境→图→策略→PPO→评估→Validator 的链路完整；不能说：已经证明泛化或性能优势。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="s9" data-title="边界">
+      <div class="stage">
+        <p class="eyebrow">08 · Current boundary &amp; next proof</p>
+        <h2>体系已经成形，下一阶段要把“能跑”变成“可信且更优”</h2>
+        <div class="boundary">
+          <section class="status done">
+            <span class="kicker">NOW · 已具备</span>
+            <ul>
+              <li>事件驱动的 Gym 环境与可变规模动作空间</li>
+              <li>Engine 提供合法动作掩码与死锁判定</li>
+              <li>5 类节点的异构图状态协议</li>
+              <li>HGT + Transformer Actor-Critic 与 PPO 训练闭环</li>
+              <li>固定数据集、参考 makespan、checkpoint 与 Validator 评估</li>
+            </ul>
+          </section>
+          <section class="status next">
+            <span class="kicker">NEXT · 需要证明</span>
+            <ul>
+              <li>扩大 train / validation / test 规模，报告均值与分位数</li>
+              <li>与 FIFO、遗传算法和参考调度做统一基准对比</li>
+              <li>分难度与拓扑评估 success、normalized cost、deadlock</li>
+              <li>做动作掩码、图关系、HGT 与 decoder 的消融实验</li>
+              <li>将清洗纳入策略动作或分层决策，并专项验证驻留约束</li>
+            </ul>
+          </section>
+        </div>
+        <div class="takeaway">当前正确定位：<b>完整的方法原型 + 初步闭环验证</b>，而不是已经完成的大规模性能结论。</div>
+      </div>
+    </section>
+
+    <section class="slide" id="s10" data-title="结论">
+      <div class="stage closing">
+        <p class="eyebrow">09 · Take-home message</p>
+        <h2>用规则守住可行性，<br>用图理解结构，<br><span class="accent">用 RL 优化选择。</span></h2>
+        <p class="lede">我们已经把复杂的集束型设备调度，组织成一个可训练、可扩展、可验证的学习系统。</p>
+        <div class="one-line" aria-label="完整方法链路">
+          <span>事件状态</span><i>→</i><span>合法动作</span><i>→</i><span>异构图</span><i>→</i><span>HGT + Decoder</span><i>→</i><span>PPO</span><i>→</i><span>Validator</span>
+        </div>
+        <p class="source-note">内容依据当前仓库：cluster_env.py · hetero_graph/* · network.py · train.py · runs/ppo_hgt_smoke/*</p>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const slides = [...document.querySelectorAll('.slide')];
+      const dots = [...document.querySelectorAll('.rail a')];
+      const counter = document.getElementById('counter');
+      const progress = document.getElementById('progressBar');
+      let current = 0;
+
+      const update = (index) => {
+        current = Math.max(0, Math.min(slides.length - 1, index));
+        dots.forEach((dot, i) => dot.classList.toggle('active', i === current));
+        counter.textContent = `${String(current + 1).padStart(2, '0')} / ${String(slides.length).padStart(2, '0')}`;
+        progress.style.width = `${((current + 1) / slides.length) * 100}%`;
+        document.title = `${slides[current].dataset.title} · 集束型设备调度`;
+      };
+
+      const go = (index) => {
+        const target = Math.max(0, Math.min(slides.length - 1, index));
+        slides[target].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        update(target);
+      };
+
+      document.getElementById('prev').addEventListener('click', () => go(current - 1));
+      document.getElementById('next').addEventListener('click', () => go(current + 1));
+      document.getElementById('fullscreen').addEventListener('click', async () => {
+        if (!document.fullscreenElement) await document.documentElement.requestFullscreen?.();
+        else await document.exitFullscreen?.();
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (['ArrowRight', 'ArrowDown', 'PageDown', ' '].includes(event.key)) {
+          event.preventDefault(); go(current + 1);
+        } else if (['ArrowLeft', 'ArrowUp', 'PageUp'].includes(event.key)) {
+          event.preventDefault(); go(current - 1);
+        } else if (event.key.toLowerCase() === 'f') {
+          document.getElementById('fullscreen').click();
+        } else if (event.key === 'Home') go(0);
+        else if (event.key === 'End') go(slides.length - 1);
+      });
+
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (visible) update(slides.indexOf(visible.target));
+      }, { threshold: [.45, .65] });
+      slides.forEach(slide => observer.observe(slide));
+      update(0);
+    })();
+  </script>
+</body>
+</html>

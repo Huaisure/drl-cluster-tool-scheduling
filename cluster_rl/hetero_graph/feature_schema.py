@@ -41,7 +41,7 @@ GLOBAL_FEATURES = (
 WAFER_FEATURES = (
     FeatureSpec(
         "route_progress",
-        "Completed route steps divided by route visits plus the final LP return.",
+        "Completed route steps divided by route visits plus the final source return.",
     ),
     FeatureSpec(
         "process_remaining",
@@ -49,15 +49,15 @@ WAFER_FEATURES = (
     ),
     FeatureSpec(
         "is_ready",
-        "1 when processing is complete and the wafer is the FIFO head at its location.",
+        "1 when the wafer's current processing or conversion is complete.",
     ),
     FeatureSpec(
         "is_complete",
-        "1 after the wafer has completed its final return to LP, otherwise 0.",
+        "1 after the wafer has completed its final return to source, otherwise 0.",
     ),
     FeatureSpec(
         "remaining_step_ratio",
-        "Remaining route steps divided by route visits plus the final LP return.",
+        "Remaining route steps divided by route visits plus the final source return.",
     ),
     FeatureSpec(
         "remaining_process_time",
@@ -66,6 +66,14 @@ WAFER_FEATURES = (
     FeatureSpec(
         "holding_rank",
         "One-based order in the robot holding list; 0 when not held.",
+    ),
+    FeatureSpec(
+        "priority",
+        "Static source-dispatch priority normalized within the Problem.",
+    ),
+    FeatureSpec(
+        "wafer_index",
+        "Static wafer index normalized within its Recipe.",
     ),
 )
 
@@ -84,17 +92,20 @@ ROUTE_STEP_FEATURES = (
     ),
     FeatureSpec(
         "step_progress",
-        "One-based step index divided by route visits plus the final LP return.",
+        "One-based step index divided by route visits plus the final source return.",
     ),
     FeatureSpec(
-        "is_return_to_lp",
-        "1 for the synthetic final return-to-LP step, otherwise 0.",
+        "is_return_to_source",
+        "1 for the synthetic final return-to-source step, otherwise 0.",
     ),
 )
 
 MODULE_FEATURES = (
-    FeatureSpec("is_lp", "1 for an LP module, otherwise 0."),
-    FeatureSpec("is_pm", "1 for a PM module, otherwise 0."),
+    FeatureSpec("is_io", "1 for the virtual source/terminal IO, otherwise 0."),
+    FeatureSpec(
+        "is_pm",
+        "1 for a processing/holding module (PM, AL, or BUFFER), otherwise 0.",
+    ),
     FeatureSpec("is_ll", "1 for an LL module, otherwise 0."),
     FeatureSpec("capacity", "Maximum number of wafers in the module."),
     FeatureSpec(
@@ -108,6 +119,38 @@ MODULE_FEATURES = (
     FeatureSpec(
         "is_full",
         "1 when physical occupancy plus Place reservations reaches capacity.",
+    ),
+    FeatureSpec(
+        "ll_pump_time",
+        "Atmosphere-to-vacuum time divided by TIME_SCALE_SECONDS; 0 for non-conversion modules.",
+    ),
+    FeatureSpec(
+        "ll_vent_time",
+        "Vacuum-to-atmosphere time divided by TIME_SCALE_SECONDS; 0 for non-conversion modules.",
+    ),
+    FeatureSpec(
+        "ll_last_pick_side_atmosphere",
+        "1 when an empty conversion LL was last picked from atmosphere.",
+    ),
+    FeatureSpec(
+        "ll_last_pick_side_vacuum",
+        "1 when an empty conversion LL was last picked from vacuum.",
+    ),
+    FeatureSpec(
+        "ll_empty_transition_progress",
+        "Progress until an empty conversion LL also accepts Place from the opposite side.",
+    ),
+    FeatureSpec(
+        "ll_occupied_exit_side_atmosphere",
+        "1 when a conversion LL occupant must next be picked from atmosphere.",
+    ),
+    FeatureSpec(
+        "ll_occupied_exit_side_vacuum",
+        "1 when a conversion LL occupant must next be picked from vacuum.",
+    ),
+    FeatureSpec(
+        "ll_occupied_transition_progress",
+        "Progress until a conversion LL occupant is pickable from its exit side.",
     ),
 )
 

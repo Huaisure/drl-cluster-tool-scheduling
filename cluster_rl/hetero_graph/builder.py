@@ -5,8 +5,15 @@ from typing import Any, TypeAlias
 
 import numpy as np
 
-from cluster_rl.cluster_env import RobotPhase
-from problem import ClusterProblem, ModuleType, RouteVisit, TMArmType, WaferKey
+from cluster_rl.cluster_env import LoadLockSide, RobotPhase
+from problem import (
+    ClusterProblem,
+    LoadLockState,
+    ModuleType,
+    RouteVisit,
+    TMArmType,
+    WaferKey,
+)
 
 from .feature_schema import (
     GLOBAL_FEATURE_NAMES,
@@ -40,6 +47,14 @@ PRECEDES: EdgeType = (ROUTE_STEP, "precedes", ROUTE_STEP)
 FOLLOWS: EdgeType = (ROUTE_STEP, "follows", ROUTE_STEP)
 CAN_ACCESS: EdgeType = (ROBOT, "can_access", MODULE)
 ACCESSIBLE_BY: EdgeType = (MODULE, "accessible_by", ROBOT)
+ACCESSES_ATMOSPHERE: EdgeType = (ROBOT, "accesses_atmosphere", MODULE)
+ATMOSPHERE_ACCESSIBLE_BY: EdgeType = (
+    MODULE,
+    "atmosphere_accessible_by",
+    ROBOT,
+)
+ACCESSES_VACUUM: EdgeType = (ROBOT, "accesses_vacuum", MODULE)
+VACUUM_ACCESSIBLE_BY: EdgeType = (MODULE, "vacuum_accessible_by", ROBOT)
 LOCATED_AT: EdgeType = (ROBOT, "located_at", MODULE)
 HAS_ROBOT: EdgeType = (MODULE, "has_robot", ROBOT)
 OPERATES_ON: EdgeType = (ROBOT, "operates_on", WAFER)
@@ -69,6 +84,10 @@ EDGE_TYPES = (
     FOLLOWS,
     CAN_ACCESS,
     ACCESSIBLE_BY,
+    ACCESSES_ATMOSPHERE,
+    ATMOSPHERE_ACCESSIBLE_BY,
+    ACCESSES_VACUUM,
+    VACUUM_ACCESSIBLE_BY,
     LOCATED_AT,
     HAS_ROBOT,
     OPERATES_ON,
@@ -103,7 +122,8 @@ class ClusterHeteroGraphBuilder:
     - ``wafer_loc`` uses modules first, followed by robots;
     - ``robot_loc`` uses module indexes and ``module_count`` for unknown;
     - ``action_mask`` is flat in entity-major order and ends with ADVANCE;
-    - graph transport actions use shape ``[wafer_count + module_count, robot_count]``.
+    - graph Pick actions use shape ``[wafer_count, robot_count]``;
+    - graph Place actions use shape ``[wafer_count, module_count]``.
 
     A route with ``N`` visits owns route-step nodes ``1..N+1``. The last node
     is a synthetic zero-time step for the wafer's final return to LP.
@@ -187,6 +207,30 @@ class ClusterHeteroGraphBuilder:
         process_remaining = np.asarray(
             observation["process_remaining"], dtype=np.float32
         )
+        wafer_priority = np.asarray(
+            observation["wafer_priority"], dtype=np.float32
+        )
+        wafer_index_feature = np.asarray(
+            observation["wafer_index"], dtype=np.float32
+        )
+        ll_pump_time = np.asarray(
+            observation["ll_pump_time"], dtype=np.float32
+        )
+        ll_vent_time = np.asarray(
+            observation["ll_vent_time"], dtype=np.float32
+        )
+        ll_last_pick_side = np.asarray(
+            observation["ll_last_pick_side"], dtype=np.int64
+        )
+        ll_empty_transition_progress = np.asarray(
+            observation["ll_empty_transition_progress"], dtype=np.float32
+        )
+        ll_occupied_exit_side = np.asarray(
+            observation["ll_occupied_exit_side"], dtype=np.int64
+        )
+        ll_occupied_transition_progress = np.asarray(
+            observation["ll_occupied_transition_progress"], dtype=np.float32
+        )
         robot_loc = np.asarray(observation["robot_loc"], dtype=np.int64)
         robot_holding = np.asarray(
             observation["robot_holding"], dtype=np.int64
@@ -214,6 +258,14 @@ class ClusterHeteroGraphBuilder:
             wafer_loc,
             wafer_step,
             process_remaining,
+            wafer_priority,
+            wafer_index_feature,
+            ll_pump_time,
+            ll_vent_time,
+            ll_last_pick_side,
+            ll_empty_transition_progress,
+            ll_occupied_exit_side,
+            ll_occupied_transition_progress,
             robot_loc,
             robot_holding,
             robot_phase,
@@ -224,16 +276,28 @@ class ClusterHeteroGraphBuilder:
             flat_action_mask,
         )
 
-        transport_action_mask = flat_action_mask[:-1].reshape(
-            len(self.wafer_keys) + len(self.module_ids),
-            len(self.robot_ids),
+        pick_count = len(self.wafer_keys) * len(self.robot_ids)
+        place_count = len(self.wafer_keys) * len(self.module_ids)
+        pick_action_mask = flat_action_mask[:pick_count].reshape(
+            len(self.wafer_keys), len(self.robot_ids)
         )
+        place_action_mask = flat_action_mask[
+            pick_count : pick_count + place_count
+        ].reshape(len(self.wafer_keys), len(self.module_ids))
 
         return HeteroGraph(
             nodes=self._build_nodes(
                 wafer_loc,
                 wafer_step,
                 process_remaining,
+                wafer_priority,
+                wafer_index_feature,
+                ll_pump_time,
+                ll_vent_time,
+                ll_last_pick_side,
+                ll_empty_transition_progress,
+                ll_occupied_exit_side,
+                ll_occupied_transition_progress,
                 robot_holding,
                 robot_phase,
                 operation_module,
@@ -248,7 +312,8 @@ class ClusterHeteroGraphBuilder:
                 operation_wafer,
                 operation_module,
             ),
-            action_mask=transport_action_mask,
+            pick_action_mask=pick_action_mask,
+            place_action_mask=place_action_mask,
             can_advance=bool(flat_action_mask[-1]),
         )
 
@@ -257,6 +322,14 @@ class ClusterHeteroGraphBuilder:
         wafer_loc: np.ndarray,
         wafer_step: np.ndarray,
         process_remaining: np.ndarray,
+        wafer_priority: np.ndarray,
+        wafer_index_feature: np.ndarray,
+        ll_pump_time: np.ndarray,
+        ll_vent_time: np.ndarray,
+        ll_last_pick_side: np.ndarray,
+        ll_empty_transition_progress: np.ndarray,
+        ll_occupied_exit_side: np.ndarray,
+        ll_occupied_transition_progress: np.ndarray,
         robot_holding: np.ndarray,
         robot_phase: np.ndarray,
         operation_module: np.ndarray,
@@ -265,7 +338,6 @@ class ClusterHeteroGraphBuilder:
     ) -> dict[str, NodeStore]:
         module_count = len(self.module_ids)
         wafer_count = len(self.wafer_keys)
-        fifo_head = self._fifo_head_mask(wafer_loc, wafer_step)
         holding_rank = np.zeros(wafer_count, dtype=np.float32)
         for row in robot_holding:
             for rank, wafer_index in enumerate(row, start=1):
@@ -286,11 +358,13 @@ class ClusterHeteroGraphBuilder:
             wafer_features[index] = (
                 step / completed_step,
                 process_remaining[index] / TIME_SCALE_SECONDS,
-                float(process_remaining[index] == 0.0 and fifo_head[index]),
+                float(process_remaining[index] == 0.0),
                 float(step == completed_step),
                 (completed_step - step) / completed_step,
                 sum(process_times[step:]) / TIME_SCALE_SECONDS,
                 holding_rank[index],
+                wafer_priority[index],
+                wafer_index_feature[index],
             )
 
         physical_occupancy = np.bincount(
@@ -315,13 +389,26 @@ class ClusterHeteroGraphBuilder:
             capacity = module.capacity
             available = capacity - committed_occupancy[index]
             module_features[index] = (
-                float(module.type is ModuleType.LP),
-                float(module.type is ModuleType.PM),
+                float(module.type is ModuleType.IO),
+                float(
+                    module.type
+                    in (ModuleType.PM, ModuleType.AL, ModuleType.BUFFER)
+                ),
                 float(module.type is ModuleType.LL),
                 capacity,
                 physical_occupancy[index] / capacity,
                 available / capacity,
                 float(available <= 0),
+                ll_pump_time[index] / TIME_SCALE_SECONDS,
+                ll_vent_time[index] / TIME_SCALE_SECONDS,
+                float(ll_last_pick_side[index] == LoadLockSide.ATMOSPHERE),
+                float(ll_last_pick_side[index] == LoadLockSide.VACUUM),
+                ll_empty_transition_progress[index],
+                float(
+                    ll_occupied_exit_side[index] == LoadLockSide.ATMOSPHERE
+                ),
+                float(ll_occupied_exit_side[index] == LoadLockSide.VACUUM),
+                ll_occupied_transition_progress[index],
             )
 
         held_count = np.sum(robot_holding < wafer_count, axis=1)
@@ -358,8 +445,8 @@ class ClusterHeteroGraphBuilder:
         )
         for index, (route_id, step) in enumerate(self.route_step_ids):
             route = self.problem.routes[route_id]
-            is_return_to_lp = step == len(route.visits) + 1
-            visit = None if is_return_to_lp else route.visits[step - 1]
+            is_return_to_source = step == len(route.visits) + 1
+            visit = None if is_return_to_source else route.visits[step - 1]
             residency_time = None if visit is None else self._residency_time(visit)
             route_step_features[index] = (
                 (
@@ -370,7 +457,7 @@ class ClusterHeteroGraphBuilder:
                 (residency_time or 0.0) / TIME_SCALE_SECONDS,
                 float(residency_time is not None),
                 step / (len(route.visits) + 1),
-                float(is_return_to_lp),
+                float(is_return_to_source),
             )
 
         completed_steps = 0
@@ -450,36 +537,6 @@ class ClusterHeteroGraphBuilder:
                 return value
         return self.problem.just_in_time.residency_time
 
-    def _fifo_head_mask(
-        self,
-        wafer_loc: np.ndarray,
-        wafer_step: np.ndarray,
-    ) -> np.ndarray:
-        """Mark the lowest-index unfinished wafer at each location."""
-
-        heads: dict[int, int] = {}
-        for index, (route_id, wafer_index) in enumerate(self.wafer_keys):
-            completed_step = len(self.problem.routes[route_id].visits) + 1
-            if wafer_step[index] == completed_step:
-                continue
-
-            location = int(wafer_loc[index])
-            current = heads.get(location)
-            if current is None:
-                heads[location] = index
-                continue
-
-            current_route_id, current_wafer_index = self.wafer_keys[current]
-            if (wafer_index, route_id) < (
-                current_wafer_index,
-                current_route_id,
-            ):
-                heads[location] = index
-
-        mask = np.zeros(len(self.wafer_keys), dtype=np.bool_)
-        mask[list(heads.values())] = True
-        return mask
-
     def _build_edges(
         self,
         wafer_loc: np.ndarray,
@@ -558,11 +615,22 @@ class ClusterHeteroGraphBuilder:
                     (route_step_index, self._route_step_index[next_key])
                 )
 
-        can_access = [
-            (self._robot_index[robot_id], self._module_index[module_id])
-            for robot_id, robot in self.problem.ClusterTool.items()
-            for module_id in robot.module_ids
-        ]
+        can_access: list[tuple[int, int]] = []
+        accesses_atmosphere: list[tuple[int, int]] = []
+        accesses_vacuum: list[tuple[int, int]] = []
+        for robot_id, robot in self.problem.ClusterTool.items():
+            robot_index = self._robot_index[robot_id]
+            for module_id in robot.module_ids:
+                module_index = self._module_index[module_id]
+                load_lock = self.problem.Modules[module_id].load_lock
+                if load_lock is None:
+                    can_access.append((robot_index, module_index))
+                    continue
+                required_state = load_lock.tm_required_states.get(robot_id)
+                if required_state is LoadLockState.ATMOSPHERE:
+                    accesses_atmosphere.append((robot_index, module_index))
+                elif required_state is LoadLockState.VACUUM:
+                    accesses_vacuum.append((robot_index, module_index))
         located_at = [
             (robot_index, int(module_index))
             for robot_index, module_index in enumerate(robot_loc)
@@ -584,6 +652,12 @@ class ClusterHeteroGraphBuilder:
             FOLLOWS: _edge_store(_reverse(precedes)),
             CAN_ACCESS: _edge_store(can_access),
             ACCESSIBLE_BY: _edge_store(_reverse(can_access)),
+            ACCESSES_ATMOSPHERE: _edge_store(accesses_atmosphere),
+            ATMOSPHERE_ACCESSIBLE_BY: _edge_store(
+                _reverse(accesses_atmosphere)
+            ),
+            ACCESSES_VACUUM: _edge_store(accesses_vacuum),
+            VACUUM_ACCESSIBLE_BY: _edge_store(_reverse(accesses_vacuum)),
             LOCATED_AT: _edge_store(located_at),
             HAS_ROBOT: _edge_store(_reverse(located_at)),
             OPERATES_ON: _edge_store(operates_on),
@@ -613,6 +687,14 @@ class ClusterHeteroGraphBuilder:
         wafer_loc: np.ndarray,
         wafer_step: np.ndarray,
         process_remaining: np.ndarray,
+        wafer_priority: np.ndarray,
+        wafer_index_feature: np.ndarray,
+        ll_pump_time: np.ndarray,
+        ll_vent_time: np.ndarray,
+        ll_last_pick_side: np.ndarray,
+        ll_empty_transition_progress: np.ndarray,
+        ll_occupied_exit_side: np.ndarray,
+        ll_occupied_transition_progress: np.ndarray,
         robot_loc: np.ndarray,
         robot_holding: np.ndarray,
         robot_phase: np.ndarray,
@@ -630,10 +712,22 @@ class ClusterHeteroGraphBuilder:
             wafer_loc.shape != (wafer_count,)
             or wafer_step.shape != (wafer_count,)
             or process_remaining.shape != (wafer_count,)
+            or wafer_priority.shape != (wafer_count,)
+            or wafer_index_feature.shape != (wafer_count,)
         ):
             raise ValueError("observation has invalid wafer array shapes")
         if robot_loc.shape != (robot_count,):
             raise ValueError("robot_loc must contain one index per robot")
+        load_lock_arrays = (
+            ll_pump_time,
+            ll_vent_time,
+            ll_last_pick_side,
+            ll_empty_transition_progress,
+            ll_occupied_exit_side,
+            ll_occupied_transition_progress,
+        )
+        if any(array.shape != (module_count,) for array in load_lock_arrays):
+            raise ValueError("LL observation arrays must contain one value per module")
         if robot_holding.shape != (robot_count, self._max_arm_capacity):
             raise ValueError("robot_holding has an invalid shape")
         robot_arrays = (
@@ -646,7 +740,7 @@ class ClusterHeteroGraphBuilder:
         if any(array.shape != (robot_count,) for array in robot_arrays):
             raise ValueError("robot operation arrays must contain one value per robot")
         expected_action_count = (
-            (wafer_count + module_count) * robot_count + 1
+            wafer_count * robot_count + wafer_count * module_count + 1
         )
         if action_mask.shape != (expected_action_count,):
             raise ValueError(
@@ -703,6 +797,34 @@ class ClusterHeteroGraphBuilder:
             raise ValueError(
                 "process_remaining must contain finite non-negative values"
             )
+        for name, feature in (
+            ("wafer_priority", wafer_priority),
+            ("wafer_index", wafer_index_feature),
+        ):
+            if np.any(~np.isfinite(feature)) or np.any(
+                (feature < 0) | (feature > 1)
+            ):
+                raise ValueError(f"{name} must contain values in [0, 1]")
+        ll_times = np.concatenate((ll_pump_time, ll_vent_time))
+        if np.any(~np.isfinite(ll_times)) or np.any(ll_times < 0):
+            raise ValueError("LL transition times must be finite and non-negative")
+        for name, progress in (
+            ("ll_empty_transition_progress", ll_empty_transition_progress),
+            (
+                "ll_occupied_transition_progress",
+                ll_occupied_transition_progress,
+            ),
+        ):
+            if np.any(~np.isfinite(progress)) or np.any(
+                (progress < 0) | (progress > 1)
+            ):
+                raise ValueError(f"{name} must contain values in [0, 1]")
+        for name, side in (
+            ("ll_last_pick_side", ll_last_pick_side),
+            ("ll_occupied_exit_side", ll_occupied_exit_side),
+        ):
+            if np.any((side < 0) | (side >= len(LoadLockSide))):
+                raise ValueError(f"{name} contains an invalid side")
         for index, (route_id, _) in enumerate(self.wafer_keys):
             completed_step = len(self.problem.routes[route_id].visits) + 1
             if not 0 <= wafer_step[index] <= completed_step:

@@ -4,16 +4,20 @@
 
 1. HGT encoder 在 `global`、`wafer`、`route_step`、`module` 和 `robot`
    节点及其异构关系上进行消息传递；
-2. Transformer decoder 为每个 `(wafer, robot)` Pick、`(module, robot)`
-   Place 和 `ADVANCE` 动作构造 query，并对 HGT 节点 memory 解码；
-3. Actor 输出与环境完全一致的
-   `((W + M) * R + 1)` 个 masked logits，Critic 从 global 节点输出状态价值。
+2. Transformer decoder只为当前合法的Pick、Place和`ADVANCE`动作构造query，
+   并对HGT节点memory解码；
+3. Actor 输出紧凑的合法动作logits，并通过batch内保存的环境动作索引完成双向映射；
+   Critic从global节点输出状态价值。
+
+Module类型特征只保留`is_io`、`is_pm`和`is_ll`。AL与BUFFER作为特殊的加工/暂存
+Module共享`is_pm`，不增加额外类型位；旧的`is_lp`已经移除。
 
 环境按物理时间增量返回奖励，因此成功 episode 的原始回报是 `-makespan`。
-PPO 使用 first-legal 调度的 makespan 进行归一化：
+PPO 使用数据集生成时已验证的参考调度 makespan 构造有界时间代价，并额外区分成功与死锁。
 
 ```text
-成功 episode 归一化回报 = 1 - makespan / reference_makespan
+成功 episode 归一化回报
+= 1 - 0.5 * makespan / (reference_makespan + makespan)
 ```
 
 ## 环境与启动
@@ -25,30 +29,49 @@ conda activate rl
 python -m pip install -e ../cluster-tool-validator
 ```
 
-在线生成训练需要提供固定的验证集和测试集 manifest：
+先一次性固化训练、验证和测试数据：
+
+```bash
+chmod +x scripts/generate_datasets.sh
+./scripts/generate_datasets.sh
+```
+
+默认生成1000个训练实例、100个验证实例和100个测试实例，全部保存Problem JSON和
+reference metadata，不保存训练不需要的参考动作列表。数量和seed可通过环境变量覆盖：
+
+```bash
+TRAIN_COUNT=2000 VALIDATION_COUNT=200 TEST_COUNT=200 DATASET_SEED=42 \
+  ./scripts/generate_datasets.sh
+```
+
+训练只读取固化后的manifest，不在episode切换时调用generator：
 
 ```bash
 python -m cluster_rl.train \
-  --train-mode generator \
+  --train-mode dataset \
   --num-envs 8 \
   --cpu-workers 0 \
-  --generator-seed 42 \
+  --train-manifest datasets/train/manifest.json \
   --validation-manifest datasets/validation/manifest.json \
   --test-manifest datasets/test/manifest.json \
   --total-steps 100000
 ```
 
-每个环境槽位在 episode 结束后都会用新的确定性种子生成完整实例，并同步替换
-`ClusterEnv`、观察编码器和初始观察。训练参考值由 RL 环境的 FIFO-aware
-逐片串行 `first_legal` rollout 计算；工具包 manifest 中的启发式 actions 不作为RL基线。
-训练结束后的 greedy evaluation 只读取固定 validation/test manifest。
+每个环境槽位在episode结束后按`slot_index + episode_index * num_envs`确定性轮换训练集，
+并同步替换`ClusterEnv`、观察编码器和初始观察。训练和评估参考值直接读取manifest中的
+已验证reference makespan。训练期间每隔`--evaluation-interval`个update在固定的
+`--validation-cases`个validation实例上评估；子集会优先覆盖topology/difficulty组合。
+模型首先按success rate、再按成功实例的
+mean normalized cost保存`best_checkpoint.pt`。最终validation/test评估使用该最佳模型。
+`--train-mode generator`仍保留用于在线生成实验。
 
 首次验证链路可以运行：
 
 ```bash
 python -m cluster_rl.train \
-  --train-mode generator \
+  --train-mode dataset \
   --num-envs 2 \
+  --train-manifest datasets/train/manifest.json \
   --validation-manifest datasets/validation/manifest.json \
   --total-steps 384 \
   --rollout-steps 128 \
@@ -80,6 +103,7 @@ minibatch拼接路径，避免通用PyG Batch的额外拆装。
 ```text
 runs/ppo_cluster_YYYYMMDD_HHMMSS/
 ├── checkpoint.pt
+├── best_checkpoint.pt
 ├── config.json
 ├── train.log
 ├── updates.csv
@@ -91,7 +115,9 @@ runs/ppo_cluster_YYYYMMDD_HHMMSS/
 - `train.log` 保留完整控制台训练日志；
 - `updates.csv` 保存 PPO loss、entropy、KL、choice fraction 和梯度范数；
 - `episodes.csv` 保存分场景 makespan 与归一化回报；
-- `evaluation.csv` 保存训练结束后的 greedy rollout 结果；
+- `evaluation.csv` 同时保存周期validation和最终validation/test结果，包含instance ID、
+  difficulty、topology family、seed、success和termination reason；仅成功episode计算
+  normalized cost与relative gain；
 - `training_curves.png` 可视化 makespan、归一化回报、loss、entropy 和 KL；
 - greedy rollout 会通过独立 `ValidatorSuite` 检查动作序列。
 
@@ -102,7 +128,7 @@ chmod +x scripts/train_a800_large.sh
 ./scripts/train_a800_large.sh
 ```
 
-脚本默认训练500万步，可通过环境变量覆盖训练量和输出目录，例如：
+脚本默认训练100万步，可通过环境变量覆盖训练量和输出目录，例如：
 
 ```bash
 TOTAL_STEPS=2000000 RUN_DIR=runs/my_large_run \

@@ -16,6 +16,7 @@ from cluster_rl.network import (
     collate_observations,
 )
 from problem import load_problem, parse_problem
+from tests.problem_fixtures import load_lock_problem
 
 SCENARIO_DIR = Path(__file__).parents[1] / "examples" / "scenarios"
 
@@ -39,7 +40,7 @@ def _env(path: str = "long_route_1w.json"):
     return env, observation
 
 
-def test_collate_uses_environment_action_layout_and_pads_scenarios() -> None:
+def test_collate_keeps_only_legal_actions_and_pads_scenarios() -> None:
     first_env, first_observation = _env("long_route_1w.json")
     second_env, second_observation = _env("mixed_3pm_20w.json")
     batch = collate_observations(
@@ -51,13 +52,20 @@ def test_collate_uses_environment_action_layout_and_pads_scenarios() -> None:
     )
 
     assert batch.batch_size == 2
-    assert batch.action_mask.shape == (2, second_env.action_space.n)
-    assert batch.action_valid[0].sum() == first_env.action_space.n
-    assert batch.action_valid[1].sum() == second_env.action_space.n
-    assert batch.action_mask[0, 0]
-    assert not batch.action_mask[0, first_env.action_space.n :].any()
+    first_legal = torch.from_numpy(first_observation["action_mask"].nonzero()[0])
+    second_legal = torch.from_numpy(second_observation["action_mask"].nonzero()[0])
+    assert batch.action_mask.shape == (
+        2,
+        max(len(first_legal), len(second_legal)),
+    )
+    assert batch.action_valid[0].sum() == len(first_legal)
+    assert batch.action_valid[1].sum() == len(second_legal)
+    assert torch.equal(batch.env_action_indices[0, : len(first_legal)], first_legal)
+    assert torch.equal(
+        batch.env_action_indices[1, : len(second_legal)],
+        second_legal,
+    )
     assert batch.action_kind[0, 0] == PICK_ACTION
-    assert batch.action_kind[0, first_env.action_space.n - 1] == ADVANCE_ACTION
 
 
 def test_forward_masks_illegal_and_padded_actions() -> None:
@@ -80,6 +88,20 @@ def test_forward_masks_illegal_and_padded_actions() -> None:
     assert torch.isfinite(output.value).all()
 
 
+def test_forward_accepts_conversion_load_lock_relations() -> None:
+    env = ClusterEnv(load_lock_problem())
+    observation, _ = env.reset()
+    batch = collate_observations(
+        [ClusterObservationEncoder.from_env(env)],
+        [observation],
+    )
+
+    output = _model()(batch)
+
+    assert torch.isfinite(output.logits[batch.action_mask]).all()
+    assert torch.isfinite(output.value).all()
+
+
 def test_fast_collate_matches_generic_pyg_batch() -> None:
     first_env, first_observation = _env("long_route_1w.json")
     second_env, second_observation = _env("mixed_3pm_20w.json")
@@ -97,9 +119,10 @@ def test_fast_collate_matches_generic_pyg_batch() -> None:
     for name in (
         "action_mask",
         "action_valid",
+        "env_action_indices",
         "action_kind",
         "action_entity",
-        "action_robot",
+        "action_target",
     ):
         assert torch.equal(getattr(fast, name), getattr(generic, name))
     for node_type in generic.graph.node_types:
@@ -126,16 +149,21 @@ def test_fast_collate_matches_generic_pyg_batch() -> None:
     assert torch.equal(fast_output.value, generic_output.value)
 
 
-def test_action_indexes_are_identical_between_model_and_environment() -> None:
+def test_compact_action_indexes_map_to_environment_actions() -> None:
     env, observation = _env()
+    observation["action_mask"][:] = 0
+    observation["action_mask"][2] = 1
+    observation["action_mask"][-1] = 1
     batch = collate_observations(
         [ClusterObservationEncoder.from_env(env)],
         [observation],
     )
-    action = torch.tensor([0])
+    env_action = torch.tensor([env.action_space.n - 1])
+    model_action = torch.tensor([1])
 
-    assert batch.to_model_actions(action).tolist() == [0]
-    assert batch.to_env_actions(action).tolist() == [0]
+    assert batch.env_action_indices.tolist() == [[2, env.action_space.n - 1]]
+    assert batch.to_model_actions(env_action).tolist() == [1]
+    assert batch.to_env_actions(model_action).tolist() == [env.action_space.n - 1]
 
 
 def test_hgt_decoder_actor_and_value_receive_gradients() -> None:
@@ -155,7 +183,7 @@ def test_hgt_decoder_actor_and_value_receive_gradients() -> None:
     assert model.value_head[-1].weight.grad is not None
 
 
-def test_multiple_robots_expand_entity_major_actions() -> None:
+def test_pick_uses_robot_targets_and_place_uses_module_targets() -> None:
     problem = parse_problem(
         {
             "Modules": {"LP": {"type": "LP"}, "PM1": {"type": "PM"}},
@@ -175,6 +203,7 @@ def test_multiple_robots_expand_entity_major_actions() -> None:
                     {
                         "route_id": "A",
                         "wafer_index": "0",
+                        "priority": 0,
                         "step_index": 0,
                         "location": {"kind": "module", "module_id": "LP"},
                     }
@@ -190,5 +219,6 @@ def test_multiple_robots_expand_entity_major_actions() -> None:
     )
     output = _model()(batch)
 
-    assert output.logits.shape == (1, (1 + 2) * 2 + 1)
-    assert torch.isfinite(output.logits[0, :2]).all()
+    assert output.logits.shape == (1, 2)
+    assert batch.env_action_indices.tolist() == [[0, 1]]
+    assert torch.isfinite(output.logits).all()

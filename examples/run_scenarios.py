@@ -33,6 +33,8 @@ class RolloutResult:
     action_count: int
     makespan: float
     total_reward: float
+    success: bool
+    termination_reason: str
     valid: bool
 
 
@@ -45,6 +47,47 @@ def first_legal_action(
 ) -> int:
     del env
     return int(np.flatnonzero(observation["action_mask"])[0])
+
+
+def serial_reference_action(
+    env: ClusterEnv,
+    observation: dict[str, object],
+) -> int:
+    """Finish the smallest in-tool wafer before dispatching another wafer."""
+
+    legal = np.flatnonzero(observation["action_mask"])
+    robot_count = len(env._robot_ids)
+    module_count = len(env.module_ids)
+    advance = env.action_space.n - 1
+    for wafer_index, wafer_key in enumerate(env.wafer_keys):
+        wafer = env.engine.state.wafers[wafer_key]
+        route_end = len(env.problem.routes[wafer_key[0]].visits) + 1
+        reserved = any(
+            operation.action_type == "pick"
+            and operation.wafer_key == wafer_key
+            for operation in env.engine.state.pending_operations
+        )
+        if not (reserved or wafer.module_id is None or 0 < wafer.step_index < route_end):
+            continue
+        pick = legal[
+            (legal >= wafer_index * robot_count)
+            & (legal < (wafer_index + 1) * robot_count)
+        ]
+        if len(pick):
+            return int(pick[0])
+        place_start = len(env.wafer_keys) * robot_count + wafer_index * module_count
+        place = legal[(legal >= place_start) & (legal < place_start + module_count)]
+        if len(place):
+            return int(place[0])
+        if advance in legal:
+            return int(advance)
+
+    pick = legal[legal < len(env.wafer_keys) * robot_count]
+    if len(pick):
+        return int(pick[0])
+    if advance in legal:
+        return int(advance)
+    raise RuntimeError("serial reference has no legal action")
 
 
 def network_greedy_selector(
@@ -81,20 +124,18 @@ def rollout(
     problem = env.problem
     observation, _ = env.reset()
     total_reward = 0.0
+    success = False
 
     while True:
         action = select_action(env, observation)
         observation, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         if terminated or truncated:
-            if not info.get("is_success"):
-                raise RuntimeError(
-                    f"{scenario}/{policy} ended with {info.get('reason')}"
-                )
+            success = bool(info.get("is_success"))
             break
 
-    validation = ValidatorSuite(problem).validate(env.actions)
-    if not validation.ok:
+    validation = ValidatorSuite(problem).validate(env.actions) if success else None
+    if validation is not None and not validation.ok:
         raise RuntimeError(f"{scenario}/{policy} produced invalid actions")
 
     return RolloutResult(
@@ -109,7 +150,9 @@ def rollout(
         action_count=len(env.actions),
         makespan=float(info["time"]),
         total_reward=total_reward,
-        valid=True,
+        success=success,
+        termination_reason=str(info.get("reason", "unknown")),
+        valid=bool(validation is not None and validation.ok),
     )
 
 
@@ -132,8 +175,8 @@ def run_all(seed: int = 0) -> list[RolloutResult]:
         reference = rollout(
             env,
             path.stem,
-            "first_legal",
-            first_legal_action,
+            "serial_reference",
+            serial_reference_action,
         )
         results.append(reference)
         results.append(

@@ -5,63 +5,58 @@ from collections import Counter
 import numpy as np
 import pytest
 
-from cluster_rl.cluster_env import ClusterEnv
+from cluster_rl.cluster_env import ClusterEnv, LoadLockSide
 from problem import parse_problem
+from tests.problem_fixtures import load_lock_problem
 from validator import ValidatorSuite
 
 
 def _raw_problem(
     *,
-    routes: dict[str, list[dict[str, object]]] | None = None,
     wafer_routes: tuple[str, ...] = ("A",),
+    priorities: tuple[int, ...] | None = None,
+    arm_type: str = "single_arm",
     robot_position: str | None = None,
-    travel_time: float = 2,
-    pick_time: float = 1,
-    place_time: float = 1.5,
+    routes: dict[str, list[dict[str, object]]] | None = None,
 ) -> dict[str, object]:
-    routes = routes or {
-        "A": [
-            {
-                "module_ids": ["PM1", "PM2"],
-                "process_time": 5,
-            }
-        ]
-    }
+    priorities = priorities or (0,) * len(wafer_routes)
     indexes: Counter[str] = Counter()
     wafers = []
-    for route_id in wafer_routes:
+    for route_id, priority in zip(wafer_routes, priorities, strict=True):
         wafers.append(
             {
                 "route_id": route_id,
                 "wafer_index": str(indexes[route_id]),
-                "step_index": 0,
-                "location": {"kind": "module", "module_id": "LP"},
+                "priority": priority,
+                "location": {"kind": "module", "module_id": "IO1"},
             }
         )
         indexes[route_id] += 1
-
-    initial_state: dict[str, object] = {"wafers": wafers}
-    if robot_position is not None:
-        initial_state["robots"] = {
-            "TM1": {"position_module_id": robot_position}
-        }
     return {
         "Modules": {
-            "LP": {"type": "LP"},
+            "IO1": {"type": "IO", "capacity": len(wafers)},
             "PM1": {"type": "PM"},
             "PM2": {"type": "PM"},
         },
         "ClusterTool": {
             "TM1": {
-                "module_ids": ["LP", "PM1", "PM2"],
-                "arm_type": "single_arm",
-                "travel_times": travel_time,
-                "pick_time": pick_time,
-                "place_time": place_time,
+                "module_ids": ["IO1", "PM1", "PM2"],
+                "arm_type": arm_type,
+                "travel_times": 2,
+                "pick_time": 1,
+                "place_time": 1.5,
             }
         },
-        "routes": routes,
-        "initial_state": initial_state,
+        "routes": routes or {
+            route_id: [
+                {"module_ids": ["PM1", "PM2"], "process_time": 5}
+            ]
+            for route_id in set(wafer_routes)
+        },
+        "initial_state": {
+            "robots": {"TM1": {"position_module_id": robot_position}},
+            "wafers": wafers,
+        },
     }
 
 
@@ -69,297 +64,160 @@ def _problem(**kwargs):
     return parse_problem(_raw_problem(**kwargs))
 
 
-def _place_action(env: ClusterEnv, module_id: str) -> int:
-    entity_index = len(env.wafer_keys) + env.module_ids.index(module_id)
-    return entity_index * len(env._robot_ids)
+def _pick_action(env: ClusterEnv, wafer_index: int, robot_index: int = 0) -> int:
+    return wafer_index * len(env._robot_ids) + robot_index
+
+
+def _place_action(env: ClusterEnv, wafer_index: int, module_id: str) -> int:
+    return (
+        len(env.wafer_keys) * len(env._robot_ids)
+        + wafer_index * len(env.module_ids)
+        + env.module_ids.index(module_id)
+    )
 
 
 def _advance_action(env: ClusterEnv) -> int:
     return int(env.action_space.n) - 1
 
 
-def test_reset_exposes_stable_spaces_and_only_pick_actions() -> None:
-    env = ClusterEnv(_problem(wafer_routes=("A", "A")))
+def test_reset_uses_explicit_pick_place_action_layout_and_static_features() -> None:
+    env = ClusterEnv(_problem(wafer_routes=("A", "A"), priorities=(0, 0)))
 
     observation, info = env.reset(seed=7)
 
-    assert env.wafer_keys == (("A", 0), ("A", 1))
-    assert env.module_ids == ("LP", "PM1", "PM2")
-    assert env.action_space.n == len(env.wafer_keys) + len(env.module_ids) + 1
+    assert env.action_space.n == 2 * 1 + 2 * 3 + 1
     assert env.observation_space.contains(observation)
-    assert observation["action_mask"].shape == (env.action_space.n,)
-    assert observation["action_mask"].tolist() == [1, 0, 0, 0, 0, 0]
-    assert observation["robot_loc"].tolist() == [len(env.module_ids)]
+    assert np.flatnonzero(observation["action_mask"]).tolist() == [0]
+    assert observation["wafer_priority"].tolist() == [0.0, 0.0]
+    assert observation["wafer_index"].tolist() == [0.0, 1.0]
     assert info == {"time": 0.0}
-    assert env.actions == ()
 
 
-def test_action_decode_and_explicit_advance_boundaries() -> None:
-    problem = _problem(robot_position="PM2")
-    env = ClusterEnv(problem)
+def test_engine_priority_then_env_recipe_index_tie_break() -> None:
+    env = ClusterEnv(
+        _problem(
+            wafer_routes=("A", "A", "B", "B"),
+            priorities=(0, 0, 0, 1),
+        )
+    )
     observation, _ = env.reset()
 
-    assert env._decode_action(0) == ("pick", 0, 0)
-    assert env._decode_action(_place_action(env, "PM1")) == (
-        "place",
-        env.module_ids.index("PM1"),
-        0,
+    # Engine keeps global priority 0. Env then keeps the smallest index in
+    # each Recipe, so A0 and B0 remain while A1 and B1 are masked.
+    assert np.flatnonzero(observation["action_mask"]).tolist() == [0, 2]
+
+
+def test_action_decode_and_explicit_place_selects_the_wafer() -> None:
+    raw = _problem(wafer_routes=("A", "A"), arm_type="dual_arm").model_dump(
+        mode="json", by_alias=True
     )
-    assert env._decode_action(_advance_action(env)) == (
-        "advance",
-        None,
-        None,
-    )
+    raw["initial_state"] = {
+        "wafers": [
+            {
+                "route_id": "A",
+                "wafer_index": str(index),
+                "priority": 0,
+                "location": {
+                    "kind": "robot",
+                    "robot_id": "TM1",
+                    "arm_id": f"arm{index}",
+                },
+            }
+            for index in range(2)
+        ]
+    }
+    env = ClusterEnv(parse_problem(raw))
+    observation, _ = env.reset()
+    place_0 = _place_action(env, 0, "PM1")
+    place_1 = _place_action(env, 1, "PM1")
+
+    assert env._decode_action(place_0) == ("place", 0, env.module_ids.index("PM1"))
+    assert env._decode_action(place_1) == ("place", 1, env.module_ids.index("PM1"))
+    assert observation["action_mask"][place_0]
+    assert observation["action_mask"][place_1]
+
+    env.step(place_1)
+    assert env.actions[-1]["wafer_index"] == 1
+
+
+def test_pick_and_advance_preserve_engine_event_boundaries() -> None:
+    env = ClusterEnv(_problem(robot_position="PM2"))
+    observation, _ = env.reset()
 
     observation, reward, terminated, truncated, info = env.step(0)
-    assert not terminated and not truncated
-    assert reward == 0.0
-    assert info["time"] == 0.0
-    assert np.flatnonzero(observation["action_mask"]).tolist() == [
-        _advance_action(env)
-    ]
-    assert env.actions[0]["action_type"] == "pick"
+    assert reward == 0 and not terminated and not truncated
     assert (env.actions[0]["start"], env.actions[0]["end"]) == (2.0, 3.0)
+    assert np.flatnonzero(observation["action_mask"]).tolist() == [_advance_action(env)]
 
     observation, *_ = env.step(_advance_action(env))
-    assert info["time"] == 0.0
-    assert env._time == 2.0
-    assert env._robots[0].holding == [0]
-    assert np.flatnonzero(observation["action_mask"]).tolist() == [
-        _advance_action(env)
-    ]
-
+    assert env.time == 2.0
+    assert observation["robot_phase"].tolist() == [2]
     observation, *_ = env.step(_advance_action(env))
-    assert env._time == 3.0
-    assert observation["action_mask"][_place_action(env, "PM1")]
+    assert env.time == 3.0
+    assert observation["action_mask"][_place_action(env, 0, "PM1")]
 
 
-def test_invalid_action_raises_without_changing_state() -> None:
-    env = ClusterEnv(_problem())
-    before, _ = env.reset()
-
-    with pytest.raises(ValueError, match="not allowed"):
-        env.step(_place_action(env, "LP"))
-
-    after, _, _, _, info = env.step(0)
-    assert env.actions[0]["start"] == 0.0
-    assert info["time"] == 0.0
-    assert before["wafer_step"].tolist() == after["wafer_step"].tolist()
-    assert len(env.actions) == 1
-
-
-def test_repeated_pm_route_can_release_then_reoccupy_the_same_module() -> None:
-    problem = _problem(
-        routes={
-            "A": [
-                {"module_id": "PM1", "process_time": 0},
-                {"module_id": "PM1", "process_time": 0},
-            ]
-        }
-    )
-    env = ClusterEnv(problem)
-    observation, _ = env.reset()
-
-    transport_actions = iter(
-        (
-            0,
-            _place_action(env, "PM1"),
-            0,
-            _place_action(env, "PM1"),
-            0,
-            _place_action(env, "LP"),
-        )
-    )
-    next_transport = next(transport_actions)
-    terminated = False
-    for _ in range(30):
-        action = (
-            next_transport
-            if next_transport >= 0
-            and observation["action_mask"][next_transport]
-            else _advance_action(env)
-        )
-        assert observation["action_mask"][action]
-        observation, _, terminated, _, _ = env.step(action)
-        if action == next_transport:
-            next_transport = next(transport_actions, -1)
-        if terminated:
-            break
-
-    assert terminated
-    assert ValidatorSuite(problem).validate(env.actions).ok
-
-
-def test_masked_random_episode_finishes_with_a_valid_schedule() -> None:
+def test_greedy_masked_episode_finishes_with_a_valid_schedule() -> None:
     problem = _problem(wafer_routes=("A", "A", "A"))
     env = ClusterEnv(problem)
-    observation, _ = env.reset(seed=11)
-    rng = np.random.default_rng(11)
+    observation, _ = env.reset()
     total_reward = 0.0
 
-    for _ in range(100):
-        legal_actions = np.flatnonzero(observation["action_mask"])
-        action = int(rng.choice(legal_actions))
+    for _ in range(200):
+        legal = np.flatnonzero(observation["action_mask"])
+        place = legal[
+            (legal >= env._pick_action_count)
+            & (legal < env.action_space.n - 1)
+        ]
+        action = int(place[0] if len(place) else legal[0])
         observation, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         if terminated or truncated:
             break
 
     assert terminated and not truncated
-    assert info["is_success"]
     assert total_reward == -info["time"]
     assert ValidatorSuite(problem).validate(env.actions).ok
 
 
-def test_ignored_constraints_do_not_enter_environment_state() -> None:
-    raw = _raw_problem()
-    raw["just_in_time"] = {"residency_time": 1}
-    raw["cleaning"] = {
-        "module_ids": ["PM1"],
-        "process_switch": {"clean_time": 3},
-    }
-    raw["routes"]["A"][0]["residency_time"] = 1
-
-    env = ClusterEnv(parse_problem(raw))
-
-    observation, _ = env.reset()
-    assert set(observation) == {
-        "wafer_loc",
-        "wafer_step",
-        "process_remaining",
-        "robot_loc",
-        "robot_holding",
-        "robot_phase",
-        "robot_operation_wafer",
-        "robot_operation_module",
-        "time_to_operation_start",
-        "time_to_operation_end",
-        "legal_action_mask",
-        "deadlock_safe_mask",
-        "action_mask",
-    }
-
-
-def test_place_mask_blocks_a_closed_module_wait_cycle() -> None:
-    raw = _raw_problem(
-        routes={
-            "A": [
-                {"module_ids": ["PM1", "PM2"], "process_time": 0},
-                {"module_id": "PM3", "process_time": 0},
-            ],
-            "B": [
-                {"module_id": "PM3", "process_time": 0},
-                {"module_id": "PM1", "process_time": 0},
-            ],
-        },
-        wafer_routes=("A", "B"),
-    )
-    raw["Modules"]["PM3"] = {"type": "PM"}
-    raw["ClusterTool"]["TM1"]["module_ids"].append("PM3")
-    env = ClusterEnv(parse_problem(raw))
+def test_invalid_action_raises_without_dispatching() -> None:
+    env = ClusterEnv(_problem())
     env.reset()
 
-    env._wafers[0].module_id = None
-    env._wafers[0].robot_id = "TM1"
-    env._robots[0].holding = [0]
-    env._wafers[1].module_id = "PM3"
-    env._wafers[1].step_index = 1
-
-    observation = env._observation()
-    place_pm1 = _place_action(env, "PM1")
-    place_pm2 = _place_action(env, "PM2")
-
-    assert observation["legal_action_mask"][place_pm1]
-    assert observation["legal_action_mask"][place_pm2]
-    assert not observation["deadlock_safe_mask"][place_pm1]
-    assert observation["deadlock_safe_mask"][place_pm2]
-    assert not observation["action_mask"][place_pm1]
-    assert observation["action_mask"][place_pm2]
+    with pytest.raises(ValueError, match="not allowed"):
+        env.step(_place_action(env, 0, "IO1"))
+    assert env.actions == ()
 
 
-def test_pick_mask_blocks_a_wafer_when_its_only_destination_closes_a_cycle() -> None:
-    raw = _raw_problem(
-        routes={
-            "A": [
-                {"module_id": "PM1", "process_time": 0},
-                {"module_id": "PM3", "process_time": 0},
-            ],
-            "B": [
-                {"module_id": "PM3", "process_time": 0},
-                {"module_id": "PM1", "process_time": 0},
-            ],
-        },
-        wafer_routes=("A", "B"),
-    )
-    raw["Modules"]["PM3"] = {"type": "PM"}
-    raw["ClusterTool"]["TM1"]["module_ids"].append("PM3")
-    env = ClusterEnv(parse_problem(raw))
-    env.reset()
-    env._wafers[1].module_id = "PM3"
-    env._wafers[1].step_index = 1
-
-    observation = env._observation()
-
-    assert observation["legal_action_mask"][0]
-    assert observation["legal_action_mask"][1]
-    assert not observation["deadlock_safe_mask"][0]
-    assert observation["deadlock_safe_mask"][1]
-    assert not observation["action_mask"][0]
-    assert observation["action_mask"][1]
-
-
-def test_multiple_lps_have_independent_fifo_heads_and_return_targets() -> None:
-    problem = parse_problem(
-        {
-            "Modules": {
-                "LP1": {"type": "LP"},
-                "LP2": {"type": "LP"},
-                "PM1": {"type": "PM"},
-            },
-            "ClusterTool": {
-                "TM1": {
-                    "module_ids": ["LP1", "LP2", "PM1"],
-                    "arm_type": "single_arm",
-                    "travel_times": 1,
-                    "pick_time": 1,
-                    "place_time": 1,
-                }
-            },
-            "routes": {"A": [{"module_id": "PM1", "process_time": 1}]},
-            "initial_state": {
-                "robots": {"TM1": {"position_module_id": "LP1"}},
-                "wafers": [
-                    {
-                        "route_id": "A",
-                        "wafer_index": "0",
-                        "location": {"kind": "module", "module_id": "LP1"},
-                    },
-                    {
-                        "route_id": "A",
-                        "wafer_index": "1",
-                        "location": {"kind": "module", "module_id": "LP2"},
-                    },
-                ],
-            },
-        }
-    )
-    env = ClusterEnv(problem)
+def test_load_lock_observation_distinguishes_empty_and_occupied_timers() -> None:
+    env = ClusterEnv(load_lock_problem())
     observation, _ = env.reset()
+    ll_index = env.module_ids.index("LL1")
+    io_index = env.module_ids.index("IO1")
 
-    assert env.return_module_ids == ("LP1", "LP2")
-    assert observation["action_mask"][:2].tolist() == [1, 1]
+    assert env.observation_space.contains(observation)
+    assert observation["ll_pump_time"][ll_index] == 5
+    assert observation["ll_vent_time"][ll_index] == 7
+    assert observation["ll_last_pick_side"][ll_index] == LoadLockSide.ATMOSPHERE
+    assert observation["ll_empty_transition_progress"][ll_index] == 0
+    assert observation["ll_occupied_exit_side"][ll_index] == LoadLockSide.NONE
+    assert observation["ll_occupied_transition_progress"][ll_index] == 0
+    assert observation["ll_pump_time"][io_index] == 0
 
-    for _ in range(100):
-        action = int(np.flatnonzero(observation["action_mask"])[0])
-        observation, _, terminated, _, _ = env.step(action)
-        if terminated:
-            break
+    runtime = env.engine.state.load_locks["LL1"]
+    env.engine.state.time = 2.5
+    observation = env._observation()
+    assert observation["ll_empty_transition_progress"][ll_index] == 0.5
 
-    assert terminated
-    assert [wafer.module_id for wafer in env._wafers] == ["LP1", "LP2"]
-    final_places = {
-        (action["route_id"], action["wafer_index"]): action["module_id"]
-        for action in env.actions
-        if action["action_type"] == "place" and action["step_index"] == 2
-    }
-    assert final_places == {("A", 0): "LP1", ("A", 1): "LP2"}
+    runtime.occupied_exit_side = "vacuum"
+    runtime.occupied_transition_start = env.time
+    runtime.occupied_transition_duration = 5
+    runtime.occupied_ready_at = env.time + 5
+    observation = env._observation()
+    assert observation["ll_empty_transition_progress"][ll_index] == 0
+    assert observation["ll_occupied_exit_side"][ll_index] == LoadLockSide.VACUUM
+    assert observation["ll_occupied_transition_progress"][ll_index] == 0
+
+    env.engine.state.time += 2.5
+    observation = env._observation()
+    assert observation["ll_occupied_transition_progress"][ll_index] == 0.5

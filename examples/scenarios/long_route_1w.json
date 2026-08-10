@@ -39,6 +39,7 @@
       {
         "route_id": "A",
         "wafer_index": "0",
+        "priority": 0,
         "step_index": 0,
         "location": {"kind": "module", "module_id": "LP"}
       }

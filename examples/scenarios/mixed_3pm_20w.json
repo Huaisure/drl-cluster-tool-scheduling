@@ -37,12 +37,14 @@
       {
         "route_id": "A",
         "wafer_index": "0-9",
+        "priority": 0,
         "step_index": 0,
         "location": {"kind": "module", "module_id": "LP"}
       },
       {
         "route_id": "B",
         "wafer_index": "0-9",
+        "priority": 0,
         "step_index": 0,
         "location": {"kind": "module", "module_id": "LP"}
       }

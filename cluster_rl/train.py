@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import torch
@@ -36,11 +36,11 @@ from cluster_rl.network import (
     TransformerConfig,
     collate_encoded_observations_fast,
 )
-from cluster_generator import ProblemGenerator
+from cluster_generator import ProblemGenerator, build_safe_reference_schedule
 from problem import ClusterProblem, load_problem
 
 
-CHECKPOINT_VERSION = 6
+CHECKPOINT_VERSION = 8
 TIME_COST_WEIGHT = 0.5
 DEADLOCK_PENALTY = 1.0
 DEADLOCK_PROGRESS_WEIGHT = 0.5
@@ -72,8 +72,16 @@ EPISODE_FIELDS = (
     "success",
 )
 EVALUATION_FIELDS = (
+    "evaluation_phase",
+    "update",
+    "global_step",
     "split",
-    "scenario",
+    "instance_id",
+    "difficulty",
+    "topology_family",
+    "seed",
+    "success",
+    "termination_reason",
     "reference_makespan",
     "makespan",
     "normalized_cost",
@@ -86,9 +94,10 @@ EVALUATION_FIELDS = (
 @dataclass(frozen=True, slots=True)
 class PPOConfig:
     scenario_paths: tuple[Path, ...] = ()
-    train_mode: Literal["scenarios", "generator"] = "scenarios"
+    train_mode: Literal["scenarios", "generator", "dataset"] = "scenarios"
     num_envs: int = 8
     cpu_workers: int = 0
+    train_manifest: Path | None = None
     generator_seed: int = 42
     generator_max_attempts: int = 64
     difficulty_weights: dict[str, float] = field(
@@ -126,6 +135,8 @@ class PPOConfig:
     profile_timing: bool = False
     log_interval: int = 1
     checkpoint_interval: int = 25
+    evaluation_interval: int = 25
+    validation_cases: int = 20
     evaluate: bool = True
 
     def __post_init__(self) -> None:
@@ -136,21 +147,30 @@ class PPOConfig:
             "minibatch_size": self.minibatch_size,
             "log_interval": self.log_interval,
             "checkpoint_interval": self.checkpoint_interval,
+            "evaluation_interval": self.evaluation_interval,
+            "validation_cases": self.validation_cases,
         }
-        if self.train_mode == "generator":
+        if self.train_mode in ("generator", "dataset"):
             positive_integers["num_envs"] = self.num_envs
+        if self.train_mode == "generator":
             positive_integers["generator_max_attempts"] = self.generator_max_attempts
         for name, value in positive_integers.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.train_mode == "scenarios" and not self.scenario_paths:
             raise ValueError("at least one scenario is required")
-        if self.train_mode not in ("scenarios", "generator"):
-            raise ValueError("train_mode must be 'scenarios' or 'generator'")
+        if self.train_mode not in ("scenarios", "generator", "dataset"):
+            raise ValueError(
+                "train_mode must be 'scenarios', 'generator', or 'dataset'"
+            )
+        if self.train_mode == "dataset" and self.train_manifest is None:
+            raise ValueError("dataset training requires train_manifest")
         if self.cpu_workers < 0:
             raise ValueError("cpu_workers must be non-negative")
-        if self.cpu_workers and self.train_mode != "generator":
-            raise ValueError("cpu_workers are only supported in generator mode")
+        if self.cpu_workers and self.train_mode not in ("generator", "dataset"):
+            raise ValueError(
+                "cpu_workers are only supported in generator or dataset mode"
+            )
         if self.cpu_workers > self.num_envs:
             raise ValueError("cpu_workers must not exceed num_envs")
         if self.train_mode == "generator":
@@ -166,14 +186,15 @@ class PPOConfig:
                 raise ValueError(
                     "difficulty_weights must be finite, non-negative, and have a positive sum"
                 )
-            if (
-                self.evaluate
-                and self.validation_manifest is None
-                and self.test_manifest is None
-            ):
-                raise ValueError(
-                    "generator training evaluation requires a validation or test manifest"
-                )
+        if (
+            self.train_mode in ("generator", "dataset")
+            and self.evaluate
+            and self.validation_manifest is None
+            and self.test_manifest is None
+        ):
+            raise ValueError(
+                "generated-data evaluation requires a validation or test manifest"
+            )
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.gamma <= 1.0:
@@ -233,6 +254,31 @@ class ParallelStepResult:
     done: bool
     episode_stat: EpisodeStat | None
     slot_state: EnvSlotState
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetInstance:
+    instance_id: str
+    problem_path: Path
+    reference_makespan: float
+    difficulty: str
+    topology_family: str
+    seed: int
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationCase:
+    split: str
+    instance_id: str
+    problem: ClusterProblem
+    reference_makespan: float
+    difficulty: str
+    topology_family: str
+    seed: int
+
+
+class EnvFactory(Protocol):
+    def make(self, slot_index: int, episode_index: int = 0) -> EnvSlot: ...
 
 
 class PhaseTimer:
@@ -295,6 +341,64 @@ class GeneratorEnvFactory:
         )
 
 
+class DatasetEnvFactory:
+    """Cycle deterministically through materialized training instances."""
+
+    def __init__(self, config: PPOConfig) -> None:
+        if config.train_manifest is None:
+            raise ValueError("dataset training requires train_manifest")
+        self.config = config
+        self.instances = _manifest_instances(
+            config.train_manifest,
+            expected_split="train",
+        )
+
+    def dataset_index(self, slot_index: int, episode_index: int) -> int:
+        return (
+            slot_index + episode_index * self.config.num_envs
+        ) % len(self.instances)
+
+    def validate_problems(self) -> None:
+        for instance in self.instances:
+            load_problem(instance.problem_path)
+
+    def make(self, slot_index: int, episode_index: int = 0) -> EnvSlot:
+        instance = self.instances[self.dataset_index(slot_index, episode_index)]
+        problem = load_problem(instance.problem_path)
+        problem.meta["name"] = instance.instance_id
+        return _slot_from_problem(
+            problem,
+            instance.reference_makespan,
+            instance.seed,
+            episode_index,
+        )
+
+
+def _slot_from_problem(
+    problem: ClusterProblem,
+    reference_makespan: float,
+    problem_seed: int,
+    episode_index: int,
+) -> EnvSlot:
+    env = ClusterEnv(problem)
+    return EnvSlot(
+        env=env,
+        encoder=ClusterObservationEncoder.from_env(env),
+        observation=env.reset(seed=problem_seed)[0],
+        reference_makespan=reference_makespan,
+        problem_seed=problem_seed,
+        episode_index=episode_index,
+    )
+
+
+def _training_env_factory(config: PPOConfig) -> EnvFactory:
+    if config.train_mode == "generator":
+        return GeneratorEnvFactory(config)
+    if config.train_mode == "dataset":
+        return DatasetEnvFactory(config)
+    raise ValueError("training environment factory requires generated data")
+
+
 class _Tee:
     def __init__(self, *streams: Any) -> None:
         self.streams = streams
@@ -336,60 +440,9 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
-def _fifo_serial_action(
-    env: ClusterEnv,
-    observation: dict[str, Any],
-) -> int:
-    legal_actions = np.flatnonzero(observation["action_mask"])
-    if not len(legal_actions):
-        raise RuntimeError("FIFO serial reference reached a deadlock")
-
-    robot_count = len(env._robot_ids)
-    pick_action_count = len(env.wafer_keys) * robot_count
-    advance_action = env.action_space.n - 1
-    active_wafers = [
-        wafer_index
-        for wafer_index, wafer in enumerate(env._wafers)
-        if env._is_pick_reserved(wafer_index)
-        or wafer.module_id is None
-        or 0 < wafer.step_index < (
-            len(env.problem.routes[env.wafer_keys[wafer_index][0]].visits) + 1
-        )
-    ]
-    if active_wafers:
-        wafer_index = min(active_wafers)
-        wafer_pick_actions = legal_actions[
-            (legal_actions >= wafer_index * robot_count)
-            & (legal_actions < (wafer_index + 1) * robot_count)
-        ]
-        if len(wafer_pick_actions):
-            return int(wafer_pick_actions[0])
-
-        place_actions = legal_actions[
-            (legal_actions >= pick_action_count)
-            & (legal_actions < advance_action)
-        ]
-        if len(place_actions):
-            return int(place_actions[0])
-        if advance_action in legal_actions:
-            return advance_action
-        raise RuntimeError("FIFO serial reference cannot advance the active wafer")
-
-    pick_actions = legal_actions[legal_actions < pick_action_count]
-    if len(pick_actions):
-        return int(pick_actions[0])
-    if advance_action in legal_actions:
-        return advance_action
-    raise RuntimeError("FIFO serial reference has no legal Pick")
-
-
 def _first_legal_reference(problem: ClusterProblem, scenario: str) -> float:
-    return rollout(
-        ClusterEnv(problem),
-        scenario,
-        "reference_fifo_serial",
-        _fifo_serial_action,
-    ).makespan
+    del scenario
+    return float(build_safe_reference_schedule(problem).makespan)
 
 
 def _retry_seed(seed: int, attempt: int) -> int:
@@ -421,7 +474,7 @@ def make_env_slot(
                 else dict(difficulty_weights)
             ),
         )
-        scenario = str(problem.meta.get("name", f"generated_{problem_seed}"))
+        scenario = _problem_name(problem, f"generated_{problem_seed}")
         try:
             reference_makespan = _first_legal_reference(problem, scenario)
         except (RuntimeError, IndexError) as exc:
@@ -477,16 +530,36 @@ def _fixed_env_slots(
 
 
 def _manifest_problem_paths(manifest_path: Path) -> tuple[Path, ...]:
+    return tuple(
+        instance.problem_path
+        for instance in _manifest_instances(manifest_path)
+    )
+
+
+def _manifest_instances(
+    manifest_path: Path,
+    *,
+    expected_split: str | None = None,
+) -> tuple[DatasetInstance, ...]:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read evaluation manifest: {manifest_path}") from exc
     if manifest.get("generator", {}).get("mode") != "ppo":
         raise ValueError(f"not a PPO dataset manifest: {manifest_path}")
+    configured_split = manifest.get("config", {}).get("split")
+    if (
+        expected_split is not None
+        and configured_split is not None
+        and configured_split != expected_split
+    ):
+        raise ValueError(
+            f"dataset manifest split must be {expected_split!r}: {manifest_path}"
+        )
 
-    paths = []
+    instances = []
     dataset_dir = manifest_path.parent.resolve()
-    for entry in manifest.get("instances", []):
+    for index, entry in enumerate(manifest.get("instances", [])):
         problem_file = entry.get("problem_file")
         if not isinstance(problem_file, str):
             raise ValueError(
@@ -497,15 +570,73 @@ def _manifest_problem_paths(manifest_path: Path) -> tuple[Path, ...]:
             raise ValueError(
                 f"evaluation manifest contains an unsafe problem path: {problem_file}"
             )
-        paths.append(problem_path)
-    if not paths:
+        metadata = entry.get("metadata")
+        reference = (
+            metadata.get("reference_makespan")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if (
+            isinstance(reference, bool)
+            or not isinstance(reference, (int, float))
+            or not math.isfinite(float(reference))
+            or float(reference) <= 0
+        ):
+            raise ValueError(
+                f"dataset instance lacks a positive reference_makespan: {problem_file}"
+            )
+        instance_id = entry.get("instance_id", f"instance-{index:05d}")
+        difficulty = entry.get("difficulty")
+        if difficulty is None and isinstance(metadata, Mapping):
+            difficulty = metadata.get("difficulty")
+        topology_family = (
+            metadata.get("topology_family")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        seed = entry.get("seed", index)
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError(f"dataset instance has an invalid id: {problem_file}")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError(f"dataset instance has an invalid seed: {problem_file}")
+        if not isinstance(difficulty, str) or not difficulty:
+            difficulty = "unknown"
+        if not isinstance(topology_family, str) or not topology_family:
+            topology_family = "unknown"
+        instances.append(
+            DatasetInstance(
+                instance_id=instance_id,
+                problem_path=problem_path,
+                reference_makespan=float(reference),
+                difficulty=difficulty,
+                topology_family=topology_family,
+                seed=seed,
+            )
+        )
+    if not instances:
         raise ValueError(f"evaluation manifest has no instances: {manifest_path}")
-    return tuple(paths)
+    return tuple(instances)
+
+
+def _problem_name(problem: ClusterProblem, fallback: str) -> str:
+    generator = problem.meta.get("generator")
+    if isinstance(generator, Mapping):
+        instance_id = generator.get("instance_id")
+        if isinstance(instance_id, str) and instance_id:
+            return instance_id
+    name = problem.meta.get("name")
+    return name if isinstance(name, str) and name else fallback
 
 
 def _evaluation_problems(
     config: PPOConfig,
 ) -> list[tuple[str, ClusterProblem]]:
+    return [(case.split, case.problem) for case in _evaluation_cases(config)]
+
+
+def _evaluation_cases(
+    config: PPOConfig,
+) -> list[EvaluationCase]:
     manifests = tuple(
         (split, path)
         for split, path in (
@@ -516,14 +647,73 @@ def _evaluation_problems(
     )
     if manifests:
         return [
-            (split, load_problem(problem_path))
+            EvaluationCase(
+                split=split,
+                instance_id=instance.instance_id,
+                problem=load_problem(instance.problem_path),
+                reference_makespan=instance.reference_makespan,
+                difficulty=instance.difficulty,
+                topology_family=instance.topology_family,
+                seed=instance.seed,
+            )
             for split, manifest_path in manifests
-            for problem_path in _manifest_problem_paths(manifest_path)
+            for instance in _manifest_instances(
+                manifest_path,
+                expected_split=split,
+            )
         ]
     return [
-        ("scenario", load_problem(path))
+        EvaluationCase(
+            split="scenario",
+            instance_id=_problem_name(problem, path.stem),
+            problem=problem,
+            reference_makespan=_first_legal_reference(problem, path.stem),
+            difficulty="scenario",
+            topology_family="unknown",
+            seed=config.seed,
+        )
         for path in config.scenario_paths
+        for problem in (load_problem(path),)
     ]
+
+
+def _periodic_evaluation_cases(config: PPOConfig) -> list[EvaluationCase]:
+    validation = [
+        case for case in _evaluation_cases(config) if case.split == "validation"
+    ]
+    if validation:
+        return _stratified_evaluation_subset(
+            validation,
+            config.validation_cases,
+        )
+    return [
+        case for case in _evaluation_cases(config) if case.split == "scenario"
+    ][: config.validation_cases]
+
+
+def _stratified_evaluation_subset(
+    cases: Sequence[EvaluationCase],
+    limit: int,
+) -> list[EvaluationCase]:
+    """Select a stable subset that covers topology/difficulty buckets first."""
+
+    selected_indexes = []
+    covered: set[tuple[str, str]] = set()
+    for index, case in enumerate(cases):
+        bucket = (case.topology_family, case.difficulty)
+        if bucket not in covered:
+            selected_indexes.append(index)
+            covered.add(bucket)
+            if len(selected_indexes) == limit:
+                break
+    if len(selected_indexes) < limit:
+        already_selected = set(selected_indexes)
+        selected_indexes.extend(
+            index
+            for index in range(len(cases))
+            if index not in already_selected
+        )
+    return [cases[index] for index in selected_indexes[:limit]]
 
 
 def _flatten_encoded_steps(
@@ -639,7 +829,7 @@ def _step_env_slot(
     slot: EnvSlot,
     action: int,
     index: int,
-    env_factory: GeneratorEnvFactory | None,
+    env_factory: EnvFactory | None,
     timings: dict[str, float] | None = None,
 ) -> tuple[EnvSlot, float, bool, EpisodeStat | None]:
     step_started = time.perf_counter()
@@ -665,7 +855,7 @@ def _step_env_slot(
 
     if done:
         episode_stat = EpisodeStat(
-            scenario=str(slot.env.problem.meta.get("name", f"env_{index}")),
+            scenario=_problem_name(slot.env.problem, f"env_{index}"),
             makespan=float(info["time"]),
             reference_makespan=slot.reference_makespan,
             normalized_return=slot.episode_normalized_return,
@@ -698,12 +888,28 @@ def _step_env_slot(
 def _parallel_env_worker(
     connection: Connection,
     config: PPOConfig,
-    indexed_slots: list[tuple[int, EnvSlot]],
+    indexed_slots: list[
+        tuple[int, ClusterProblem, float, int, int]
+    ],
 ) -> None:
     try:
         torch.set_num_threads(1)
-        slots = dict(indexed_slots)
-        env_factory = GeneratorEnvFactory(config)
+        slots = {
+            index: _slot_from_problem(
+                problem,
+                reference_makespan,
+                problem_seed,
+                episode_index,
+            )
+            for (
+                index,
+                problem,
+                reference_makespan,
+                problem_seed,
+                episode_index,
+            ) in indexed_slots
+        }
+        env_factory = _training_env_factory(config)
         initial = [
             (
                 index,
@@ -794,7 +1000,16 @@ class ParallelEnvPool:
                     args=(
                         child,
                         config,
-                        [(index, slots[index]) for index in indexes],
+                        [
+                            (
+                                index,
+                                slots[index].env.problem,
+                                slots[index].reference_makespan,
+                                slots[index].problem_seed,
+                                slots[index].episode_index,
+                            )
+                            for index in indexes
+                        ],
                     ),
                     name=f"cluster-env-{worker_index}",
                 )
@@ -895,7 +1110,7 @@ def _collect_rollout(
     slots: list[EnvSlot],
     config: PPOConfig,
     device: torch.device,
-    env_factory: GeneratorEnvFactory | None = None,
+    env_factory: EnvFactory | None = None,
     timer: PhaseTimer | None = None,
 ) -> tuple[RolloutBatch, list[EpisodeStat]]:
     state_steps = []
@@ -1110,7 +1325,10 @@ def _ppo_update(
 ) -> dict[str, float]:
     with _measure(timer, "ppo.prepare"):
         choice_mask = torch.as_tensor(
-            [state.action_mask.sum() > 1 for state in rollout_batch.states],
+            [
+                state.action_count > 1
+                for state in rollout_batch.states
+            ],
             dtype=torch.bool,
             device=rollout_batch.advantages.device,
         )
@@ -1163,7 +1381,7 @@ def _ppo_update(
                     - rollout_batch.old_log_probabilities[minibatch_indexes]
                 )
                 ratio = log_ratio.exp()
-                has_choice = states.action_mask.sum(dim=1) > 1
+                has_choice = states.action_valid.sum(dim=1) > 1
                 choice_fraction = has_choice.float().mean()
 
             with _measure(timer, "ppo.loss_gpu"):
@@ -1273,6 +1491,7 @@ def _serialize_config(config: PPOConfig) -> dict[str, object]:
         "run_dir",
         "checkpoint",
         "resume",
+        "train_manifest",
         "validation_manifest",
         "test_manifest",
     ):
@@ -1289,10 +1508,14 @@ def _save_checkpoint(
     episode_indexes: list[int],
     global_step: int,
     update: int,
+    *,
+    path: Path | None = None,
+    best_validation_score: tuple[float, float] | None = None,
 ) -> None:
-    config.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = config.checkpoint.with_suffix(
-        config.checkpoint.suffix + ".tmp"
+    checkpoint_path = path or config.checkpoint
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = checkpoint_path.with_suffix(
+        checkpoint_path.suffix + ".tmp"
     )
     torch.save(
         {
@@ -1304,10 +1527,11 @@ def _save_checkpoint(
             "episode_indexes": episode_indexes,
             "global_step": global_step,
             "update": update,
+            "best_validation_score": best_validation_score,
         },
         temporary_path,
     )
-    temporary_path.replace(config.checkpoint)
+    temporary_path.replace(checkpoint_path)
 
 
 def _append_csv(
@@ -1367,24 +1591,27 @@ def _plot_training_curves(run_dir: Path) -> Path:
     grouped_episodes: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in episode_rows:
         grouped_episodes[row["scenario"]].append(row)
+    has_successful_episodes = False
     for index, (scenario, rows) in enumerate(
         sorted(grouped_episodes.items())
     ):
         color = colors(index)
-        episode_steps = [
-            int(row["global_step"]) for row in rows
-        ]
-        makespans = [float(row["makespan"]) for row in rows]
+        successful_rows = [row for row in rows if row["success"] == "True"]
+        if successful_rows:
+            has_successful_episodes = True
+            axes[0, 0].plot(
+                [int(row["global_step"]) for row in successful_rows],
+                _rolling_mean(
+                    [float(row["makespan"]) for row in successful_rows]
+                ),
+                label=scenario,
+                color=color,
+                marker=".",
+            )
+        episode_steps = [int(row["global_step"]) for row in rows]
         normalized_returns = [
             float(row["normalized_return"]) for row in rows
         ]
-        axes[0, 0].plot(
-            episode_steps,
-            _rolling_mean(makespans),
-            label=scenario,
-            color=color,
-            marker=".",
-        )
         axes[0, 1].plot(
             episode_steps,
             _rolling_mean(normalized_returns),
@@ -1393,13 +1620,14 @@ def _plot_training_curves(run_dir: Path) -> Path:
             marker=".",
         )
 
-    axes[0, 0].set_title("Episode makespan (rolling mean)")
+    axes[0, 0].set_title("Successful episode makespan (rolling mean)")
     axes[0, 0].set_ylabel("Makespan")
     axes[0, 1].set_title("Normalized return (rolling mean)")
     axes[0, 1].axhline(0.0, color="0.5", linewidth=1)
-    axes[0, 1].set_ylabel("1 - makespan / reference")
-    if grouped_episodes:
+    axes[0, 1].set_ylabel("Shaped normalized return")
+    if has_successful_episodes:
         axes[0, 0].legend(fontsize=8)
+    if grouped_episodes:
         axes[0, 1].legend(fontsize=8)
 
     axes[1, 0].plot(
@@ -1467,7 +1695,11 @@ def _episode_rows(
             "scenario": stat.scenario,
             "makespan": stat.makespan,
             "reference_makespan": stat.reference_makespan,
-            "normalized_cost": stat.makespan / stat.reference_makespan,
+            "normalized_cost": (
+                stat.makespan / stat.reference_makespan
+                if stat.success
+                else ""
+            ),
             "normalized_return": stat.normalized_return,
             "reward": stat.reward,
             "success": stat.success,
@@ -1483,6 +1715,7 @@ def _update_row(
     global_step: int,
 ) -> dict[str, object]:
     completed = len(stats)
+    successful = [stat for stat in stats if stat.success]
     return {
         "update": update,
         "global_step": global_step,
@@ -1493,8 +1726,8 @@ def _update_row(
             else ""
         ),
         "mean_makespan": (
-            sum(stat.makespan for stat in stats) / completed
-            if completed
+            sum(stat.makespan for stat in successful) / len(successful)
+            if successful
             else ""
         ),
         "mean_normalized_return": (
@@ -1519,12 +1752,25 @@ def _print_update(
         f"{100 * float(success):5.1f}%" if success != "" else "  n/a "
     )
     scenario_values: dict[str, list[float]] = defaultdict(list)
+    scenario_failures: dict[str, int] = defaultdict(int)
     for stat in stats:
-        scenario_values[stat.scenario].append(stat.makespan)
-    scenario_text = ", ".join(
-        f"{name}={sum(values) / len(values):.1f}"
-        for name, values in sorted(scenario_values.items())
-    )
+        if stat.success:
+            scenario_values[stat.scenario].append(stat.makespan)
+        else:
+            scenario_failures[stat.scenario] += 1
+    scenario_names = sorted(set(scenario_values) | set(scenario_failures))
+    scenario_parts = []
+    for name in scenario_names:
+        values = scenario_values[name]
+        successful_text = (
+            f"makespan={sum(values) / len(values):.1f}"
+            if values
+            else "makespan=n/a"
+        )
+        scenario_parts.append(
+            f"{name}({successful_text}, deadlocks={scenario_failures[name]})"
+        )
+    scenario_text = ", ".join(scenario_parts)
     if not scenario_text:
         scenario_text = "no completed episode"
     normalized_return = row["mean_normalized_return"]
@@ -1597,29 +1843,43 @@ def _print_timing_profile(timer: PhaseTimer) -> None:
 
 def _evaluation(
     model: ClusterActorCritic,
-    envs: list[ClusterEnv],
-    references: list[float],
-    splits: list[str] | None = None,
+    cases: Sequence[EvaluationCase],
+    *,
+    evaluation_phase: str,
+    update: int,
+    global_step: int,
 ) -> list[dict[str, object]]:
     model.eval()
     results = []
-    evaluation_splits = splits or ["scenario"] * len(envs)
-    for split, env, reference in zip(evaluation_splits, envs, references):
-        scenario = str(env.problem.meta.get("name", "scenario"))
+    for case in cases:
+        env = ClusterEnv(case.problem)
         result = rollout(
             env,
-            scenario,
+            case.instance_id,
             "trained_network_greedy",
-            network_greedy_selector(env, model, reference),
+            network_greedy_selector(env, model, case.reference_makespan),
         )
+        normalized_cost: float | str = ""
+        relative_gain: float | str = ""
+        if result.success:
+            normalized_cost = result.makespan / case.reference_makespan
+            relative_gain = 1.0 - normalized_cost
         results.append(
             {
-                "split": split,
-                "scenario": scenario,
-                "reference_makespan": reference,
+                "evaluation_phase": evaluation_phase,
+                "update": update,
+                "global_step": global_step,
+                "split": case.split,
+                "instance_id": case.instance_id,
+                "difficulty": case.difficulty,
+                "topology_family": case.topology_family,
+                "seed": case.seed,
+                "success": result.success,
+                "termination_reason": result.termination_reason,
+                "reference_makespan": case.reference_makespan,
                 "makespan": result.makespan,
-                "normalized_cost": result.makespan / reference,
-                "relative_gain": 1.0 - result.makespan / reference,
+                "normalized_cost": normalized_cost,
+                "relative_gain": relative_gain,
                 "action_count": result.action_count,
                 "valid": result.valid,
             }
@@ -1627,24 +1887,53 @@ def _evaluation(
     return results
 
 
-def _print_evaluation(results: list[dict[str, object]]) -> None:
+def _evaluation_score(
+    results: Sequence[Mapping[str, object]],
+) -> tuple[float, float]:
+    if not results:
+        return (0.0, -math.inf)
+    successful_costs = [
+        float(result["normalized_cost"])
+        for result in results
+        if result["success"] and result["normalized_cost"] != ""
+    ]
+    success_rate = len(successful_costs) / len(results)
+    mean_cost = (
+        float(np.mean(successful_costs)) if successful_costs else math.inf
+    )
+    return success_rate, -mean_cost
+
+
+def _print_evaluation(
+    results: list[dict[str, object]],
+    *,
+    title: str = "Greedy evaluation",
+) -> None:
     if not results:
         return
-    print("\nFinal greedy evaluation")
+    print(f"\n{title}")
     print("-" * 78)
     print(
-        f"{'Split':<12} {'Scenario':<20} {'Reference':>10} {'Model':>10} "
-        f"{'Gain':>10} {'Valid':>8}"
+        f"{'Split':<12} {'Group':<22} {'Cases':>7} {'Success':>10} "
+        f"{'Mean cost':>12}"
     )
     print("-" * 78)
+    groups: dict[tuple[str, str], list[Mapping[str, object]]] = defaultdict(list)
     for result in results:
+        groups[(str(result["split"]), "overall")].append(result)
+        groups[
+            (str(result["split"]), f"topology:{result['topology_family']}")
+        ].append(result)
+        groups[
+            (str(result["split"]), f"difficulty:{result['difficulty']}")
+        ].append(result)
+    for (split, group), group_results in sorted(groups.items()):
+        success_rate, negative_cost = _evaluation_score(group_results)
+        mean_cost = -negative_cost
+        cost_text = f"{mean_cost:.4f}" if math.isfinite(mean_cost) else "n/a"
         print(
-            f"{str(result['split']):<12} "
-            f"{str(result['scenario']):<20} "
-            f"{float(result['reference_makespan']):>10.1f} "
-            f"{float(result['makespan']):>10.1f} "
-            f"{100 * float(result['relative_gain']):>9.2f}% "
-            f"{str(result['valid']):>8}"
+            f"{split:<12} {group:<22} {len(group_results):>7d} "
+            f"{100 * success_rate:>9.2f}% {cost_text:>12}"
         )
     print("-" * 78)
 
@@ -1656,6 +1945,7 @@ def _prepare_run_dir(config: PPOConfig) -> None:
             "updates.csv",
             "episodes.csv",
             "evaluation.csv",
+            "best_checkpoint.pt",
             "training_curves.png",
             "train.log",
             "config.json",
@@ -1687,10 +1977,12 @@ def _train(config: PPOConfig) -> dict[str, object]:
     device = _resolve_device(config.device)
 
     env_factory = (
-        GeneratorEnvFactory(config)
-        if config.train_mode == "generator"
-        else None
+        None
+        if config.train_mode == "scenarios"
+        else _training_env_factory(config)
     )
+    if isinstance(env_factory, DatasetEnvFactory):
+        env_factory.validate_problems()
     if env_factory is None:
         problems = [load_problem(path) for path in config.scenario_paths]
         slots = _fixed_env_slots(
@@ -1720,6 +2012,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
     )
     global_step = 0
     first_update = 1
+    best_validation_score: tuple[float, float] | None = None
 
     if config.resume is not None:
         checkpoint = torch.load(
@@ -1752,11 +2045,24 @@ def _train(config: PPOConfig) -> dict[str, object]:
         optimizer.load_state_dict(checkpoint["optimizer"])
         global_step = int(checkpoint["global_step"])
         first_update = int(checkpoint["update"]) + 1
+        saved_best_score = checkpoint.get("best_validation_score")
+        if (
+            isinstance(saved_best_score, (list, tuple))
+            and len(saved_best_score) == 2
+        ):
+            best_validation_score = (
+                float(saved_best_score[0]),
+                float(saved_best_score[1]),
+            )
 
     steps_per_update = config.rollout_steps * len(slots)
     remaining_steps = max(0, config.total_steps - global_step)
     update_count = math.ceil(remaining_steps / steps_per_update)
     last_update = first_update + update_count - 1
+    periodic_cases = (
+        _periodic_evaluation_cases(config) if config.evaluate else []
+    )
+    best_checkpoint_path = config.run_dir / "best_checkpoint.pt"
 
     print("=" * 78)
     print("Masked PPO training")
@@ -1768,7 +2074,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
     print("Reference makespans:")
     for slot in slots:
         print(
-            f"  - {slot.env.problem.meta.get('name', 'scenario')}: "
+            f"  - {_problem_name(slot.env.problem, 'scenario')}: "
             f"{slot.reference_makespan:.1f}"
         )
     print("=" * 78)
@@ -1844,6 +2150,53 @@ def _train(config: PPOConfig) -> dict[str, object]:
                 if timer is not None:
                     _print_timing_profile(timer)
 
+            if periodic_cases and (
+                update % config.evaluation_interval == 0
+                or update == last_update
+            ):
+                periodic_evaluation = _evaluation(
+                    model,
+                    periodic_cases,
+                    evaluation_phase="periodic",
+                    update=update,
+                    global_step=global_step,
+                )
+                for result in periodic_evaluation:
+                    _append_csv(
+                        config.run_dir / "evaluation.csv",
+                        EVALUATION_FIELDS,
+                        result,
+                    )
+                _print_evaluation(
+                    periodic_evaluation,
+                    title=f"Periodic validation (update {update})",
+                )
+                validation_score = _evaluation_score(periodic_evaluation)
+                if (
+                    best_validation_score is None
+                    or validation_score > best_validation_score
+                ):
+                    best_validation_score = validation_score
+                    slot_states = (
+                        [_env_slot_state(slot) for slot in slots]
+                        if env_pool is None
+                        else env_pool.states
+                    )
+                    _save_checkpoint(
+                        model,
+                        optimizer,
+                        config,
+                        [
+                            state.reference_makespan
+                            for state in slot_states
+                        ],
+                        [state.episode_index for state in slot_states],
+                        global_step,
+                        update,
+                        path=best_checkpoint_path,
+                        best_validation_score=best_validation_score,
+                    )
+
             if (
                 update % config.checkpoint_interval == 0
                 or update == last_update
@@ -1861,6 +2214,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
                     [state.episode_index for state in slot_states],
                     global_step,
                     update,
+                    best_validation_score=best_validation_score,
                 )
                 _plot_training_curves(config.run_dir)
 
@@ -1878,6 +2232,7 @@ def _train(config: PPOConfig) -> dict[str, object]:
                 [state.episode_index for state in slot_states],
                 global_step,
                 first_update - 1,
+                best_validation_score=best_validation_score,
             )
             if _read_csv(config.run_dir / "updates.csv"):
                 _plot_training_curves(config.run_dir)
@@ -1892,14 +2247,20 @@ def _train(config: PPOConfig) -> dict[str, object]:
     )
 
     if config.evaluate:
-        evaluation_cases = _evaluation_problems(config)
-        evaluation_problems = [problem for _, problem in evaluation_cases]
-        evaluation_references = _reference_makespans(evaluation_problems)
+        evaluation_cases = _evaluation_cases(config)
+        if best_checkpoint_path.exists():
+            best_checkpoint = torch.load(
+                best_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+            model.load_state_dict(best_checkpoint["model"])
         evaluation = _evaluation(
             model,
-            [ClusterEnv(problem) for problem in evaluation_problems],
-            evaluation_references,
-            [split for split, _ in evaluation_cases],
+            evaluation_cases,
+            evaluation_phase="final",
+            update=last_update if update_count else first_update - 1,
+            global_step=global_step,
         )
     else:
         evaluation = []
@@ -1909,11 +2270,13 @@ def _train(config: PPOConfig) -> dict[str, object]:
             EVALUATION_FIELDS,
             result,
         )
-    _print_evaluation(evaluation)
+    _print_evaluation(evaluation, title="Final greedy evaluation")
 
     curve_path = config.run_dir / "training_curves.png"
     print("\nSaved outputs")
     print(f"  checkpoint : {config.checkpoint}")
+    if best_checkpoint_path.exists():
+        print(f"  best       : {best_checkpoint_path}")
     print(f"  updates    : {config.run_dir / 'updates.csv'}")
     print(f"  episodes   : {config.run_dir / 'episodes.csv'}")
     print(f"  curves     : {curve_path}")
@@ -1921,6 +2284,9 @@ def _train(config: PPOConfig) -> dict[str, object]:
 
     return {
         "checkpoint": str(config.checkpoint),
+        "best_checkpoint": (
+            str(best_checkpoint_path) if best_checkpoint_path.exists() else None
+        ),
         "run_dir": str(config.run_dir),
         "curves": str(curve_path),
         "device": str(device),
@@ -1945,7 +2311,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--train-mode",
-        choices=("scenarios", "generator"),
+        choices=("scenarios", "generator", "dataset"),
         default="scenarios",
     )
     parser.add_argument("--num-envs", type=int, default=8)
@@ -1957,6 +2323,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--generator-seed", type=int, default=42)
     parser.add_argument("--generator-max-attempts", type=int, default=64)
+    parser.add_argument("--train-manifest", type=Path)
     parser.add_argument("--validation-manifest", type=Path)
     parser.add_argument("--test-manifest", type=Path)
     parser.add_argument("--run-dir", type=Path)
@@ -1992,6 +2359,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--checkpoint-interval", type=int, default=25)
+    parser.add_argument(
+        "--evaluation-interval",
+        type=int,
+        default=25,
+        help="run the fixed validation subset every N PPO updates",
+    )
+    parser.add_argument(
+        "--validation-cases",
+        type=int,
+        default=20,
+        help="number of fixed validation instances used during training",
+    )
     parser.add_argument("--no-eval", action="store_true")
     return parser
 
@@ -2012,6 +2391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_mode=args.train_mode,
         num_envs=args.num_envs,
         cpu_workers=args.cpu_workers,
+        train_manifest=args.train_manifest,
         generator_seed=args.generator_seed,
         generator_max_attempts=args.generator_max_attempts,
         validation_manifest=args.validation_manifest,
@@ -2041,6 +2421,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile_timing=args.profile_timing,
         log_interval=args.log_interval,
         checkpoint_interval=args.checkpoint_interval,
+        evaluation_interval=args.evaluation_interval,
+        validation_cases=args.validation_cases,
         evaluate=not args.no_eval,
     )
     train(config)
