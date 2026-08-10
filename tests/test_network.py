@@ -15,7 +15,7 @@ from cluster_rl.network import (
     collate_encoded_observations_fast,
     collate_observations,
 )
-from problem import load_problem, parse_problem
+from cluster_toolkit.problem import load_problem, parse_problem
 from tests.problem_fixtures import load_lock_problem
 
 SCENARIO_DIR = Path(__file__).parents[1] / "examples" / "scenarios"

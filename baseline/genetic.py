@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from cluster_rl.cluster_env import ClusterEnv
-from problem import ClusterProblem, load_problem
+from cluster_toolkit.problem import ClusterProblem, load_problem
 
 
 @dataclass(frozen=True, slots=True)

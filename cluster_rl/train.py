@@ -36,8 +36,8 @@ from cluster_rl.network import (
     TransformerConfig,
     collate_encoded_observations_fast,
 )
-from cluster_generator import ProblemGenerator, build_safe_reference_schedule
-from problem import ClusterProblem, load_problem
+from cluster_toolkit.cluster_generator import ProblemGenerator, build_safe_reference_schedule
+from cluster_toolkit.problem import ClusterProblem, load_problem
 
 
 CHECKPOINT_VERSION = 8

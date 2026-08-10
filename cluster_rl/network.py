@@ -28,7 +28,7 @@ from cluster_rl.hetero_graph.feature_schema import (
     WAFER_FEATURE_NAMES,
 )
 from cluster_rl.hetero_graph.schema import HeteroGraph
-from problem import ClusterProblem, WaferKey
+from cluster_toolkit.problem import ClusterProblem, WaferKey
 
 PICK_ACTION = 0
 PLACE_ACTION = 1

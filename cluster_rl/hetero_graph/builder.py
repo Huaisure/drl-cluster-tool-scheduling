@@ -6,7 +6,7 @@ from typing import Any, TypeAlias
 import numpy as np
 
 from cluster_rl.cluster_env import LoadLockSide, RobotPhase
-from problem import (
+from cluster_toolkit.problem import (
     ClusterProblem,
     LoadLockState,
     ModuleType,

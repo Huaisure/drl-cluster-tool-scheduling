@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from cluster_generator import ProblemGenerator
+from cluster_toolkit.cluster_generator import ProblemGenerator
 from examples.run_scenarios import SCENARIO_DIR
 from cluster_rl.network import ClusterActorCritic, TransformerConfig
 from cluster_rl.train import (

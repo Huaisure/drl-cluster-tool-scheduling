@@ -8,8 +8,8 @@ import pytest
 from baseline import solve
 from baseline.genetic import main
 from cluster_rl.cluster_env import ClusterEnv
-from problem import load_problem
-from validator import ValidatorSuite
+from cluster_toolkit.problem import load_problem
+from cluster_toolkit.validator import ValidatorSuite
 
 from .test_cluster_env import _problem, _raw_problem
 

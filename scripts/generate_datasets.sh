@@ -12,7 +12,7 @@ TEST_COUNT="${TEST_COUNT:-100}"
 generate_split() {
   local split="$1"
   local count="$2"
-  python -m run_rl_generation "datasets/${split}" \
+  python -m cluster_toolkit.run_rl_generation "datasets/${split}" \
     --split "$split" \
     --count "$count" \
     --seed "$DATASET_SEED" \

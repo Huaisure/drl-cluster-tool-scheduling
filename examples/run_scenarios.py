@@ -16,8 +16,8 @@ from cluster_rl.network import (
     TransformerConfig,
     collate_observations,
 )
-from problem import load_problem
-from validator import ValidatorSuite
+from cluster_toolkit.problem import load_problem
+from cluster_toolkit.validator import ValidatorSuite
 
 
 SCENARIO_DIR = Path(__file__).with_name("scenarios")

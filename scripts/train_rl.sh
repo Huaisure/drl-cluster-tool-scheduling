@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-CONDA_ENV="${CONDA_ENV:-lhs}"
+CONDA_ENV="${CONDA_ENV:-rl}"
 if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]]; then
   if ! command -v conda >/dev/null 2>&1; then
     echo "conda is unavailable; activate ${CONDA_ENV} before running this script" >&2
@@ -14,19 +14,10 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]]; then
   conda activate "$CONDA_ENV"
 fi
 
-# Prefer the adjacent Toolkit checkout during local development. On a training
-# machine without that checkout, the v0.3.2 package installed in the Conda
-# environment is used instead.
-TOOLKIT_DIR="${TOOLKIT_DIR:-$PROJECT_DIR/../cluster-tool-validator}"
-if [[ -d "$TOOLKIT_DIR" ]]; then
-  export PYTHONPATH="$TOOLKIT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-fi
-
 if ! python -c \
-  'from cluster_engine import ClusterEngine; assert hasattr(ClusterEngine, "load_lock_observation")'
+  'from cluster_toolkit.cluster_engine import ClusterEngine; assert hasattr(ClusterEngine, "load_lock_observation")'
 then
-  echo "cluster-tool-toolkit v0.3.2 or newer is required" >&2
-  echo "install it with: python -m pip install -r requirements.txt" >&2
+  echo "the vendored cluster_toolkit source is unavailable or incompatible" >&2
   exit 1
 fi
 

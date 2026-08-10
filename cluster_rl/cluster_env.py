@@ -9,14 +9,14 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from cluster_engine import (
+from cluster_toolkit.cluster_engine import (
     ADVANCE as ENGINE_ADVANCE,
     ClusterEngine,
     EngineAction,
     PickAction,
     PlaceAction,
 )
-from problem import ClusterProblem, ModuleType, TMArmType, WaferKey
+from cluster_toolkit.problem import ClusterProblem, ModuleType, TMArmType, WaferKey
 
 
 PICK = "pick"
@@ -79,6 +79,22 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self._module_index = {
             module_id: index for index, module_id in enumerate(self._module_ids)
         }
+        self._robot_modules = {
+            robot_id: frozenset(problem.ClusterTool[robot_id].module_ids)
+            for robot_id in self._robot_ids
+        }
+        self._arm_capacities = {
+            robot_id: (
+                1
+                if problem.ClusterTool[robot_id].arm_type is TMArmType.SINGLE_ARM
+                else 2
+            )
+            for robot_id in self._robot_ids
+        }
+        self._transfer_robots_cache: dict[
+            tuple[str, int, str, str],
+            frozenset[str],
+        ] = {}
         self._initial_wafers = snapshot.wafers_by_key
         self._return_module_ids = tuple(
             problem.return_module_id(snapshot.wafers_by_key[key])
@@ -91,10 +107,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self._pick_action_count = wafer_count * robot_count
         self._place_action_count = wafer_count * module_count
         self._max_arm_capacity = max(
-            (
-                1 if robot.arm_type is TMArmType.SINGLE_ARM else 2
-                for robot in problem.ClusterTool.values()
-            ),
+            self._arm_capacities.values(),
             default=1,
         )
 
@@ -519,8 +532,124 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             action
             for action in self._env_available_actions(engine)
             if not isinstance(action, PickAction)
-            or self._robot_can_reach_next_target(engine, action)
+            or (
+                self._robot_can_reach_next_target(engine, action)
+                and not self._pick_fills_robot_with_blocked_wafers(engine, action)
+            )
         )
+
+    def _pick_fills_robot_with_blocked_wafers(
+        self,
+        engine: ClusterEngine,
+        action: PickAction,
+    ) -> bool:
+        """Detect a guaranteed full-arm wait cycle before simulating it.
+
+        Once this Pick completes, a full Robot cannot unload any held wafer if
+        all of their destinations are full of wafers that only this same Robot
+        can transfer onward.  Other Robots are treated optimistically: one
+        topologically valid transfer is enough to leave the Pick available.
+        """
+
+        robot = engine.state.robots[action.robot_id]
+        held_after_pick = (*robot.holding, action.wafer_key)
+        if len(held_after_pick) < self._arm_capacities[action.robot_id]:
+            return False
+        return all(
+            self._wafer_destinations_require_same_robot_release(
+                engine,
+                wafer_key,
+                action.robot_id,
+                action.wafer_key,
+            )
+            for wafer_key in held_after_pick
+        )
+
+    def _wafer_destinations_require_same_robot_release(
+        self,
+        engine: ClusterEngine,
+        wafer_key: WaferKey,
+        robot_id: str,
+        released_wafer_key: WaferKey,
+    ) -> bool:
+        wafer = engine.state.wafers[wafer_key]
+        targets = self._next_targets(
+            wafer.route_id,
+            wafer.step_index,
+            wafer.return_module_id,
+        )
+        return bool(targets) and all(
+            self._full_target_requires_same_robot_release(
+                engine,
+                target_id,
+                robot_id,
+                released_wafer_key,
+            )
+            for target_id in targets
+        )
+
+    def _full_target_requires_same_robot_release(
+        self,
+        engine: ClusterEngine,
+        module_id: str,
+        robot_id: str,
+        released_wafer_key: WaferKey,
+    ) -> bool:
+        occupants = engine.state.module_occupants[module_id]
+        released_count = int(released_wafer_key in occupants)
+        if (
+            len(occupants) - released_count
+            < self.problem.Modules[module_id].capacity
+        ):
+            return False
+
+        for wafer_key in occupants:
+            if wafer_key == released_wafer_key:
+                continue
+            if any(
+                operation.action_type == PICK
+                and operation.wafer_key == wafer_key
+                and operation.robot_id != robot_id
+                for operation in engine.state.pending_operations
+            ):
+                return False
+            if any(
+                candidate != robot_id
+                for candidate in self._transfer_robot_ids(
+                    engine,
+                    wafer_key,
+                    module_id,
+                )
+            ):
+                return False
+        return True
+
+    def _transfer_robot_ids(
+        self,
+        engine: ClusterEngine,
+        wafer_key: WaferKey,
+        source_module_id: str,
+    ) -> frozenset[str]:
+        wafer = engine.state.wafers[wafer_key]
+        key = (
+            wafer.route_id,
+            wafer.step_index,
+            wafer.return_module_id,
+            source_module_id,
+        )
+        if key not in self._transfer_robots_cache:
+            targets = self._next_targets(
+                wafer.route_id,
+                wafer.step_index,
+                wafer.return_module_id,
+            )
+            self._transfer_robots_cache[key] = frozenset(
+                robot_id
+                for robot_id, robot_modules in self._robot_modules.items()
+                if source_module_id in robot_modules
+                and any(target_id in robot_modules for target_id in targets)
+            )
+        return self._transfer_robots_cache[key]
 
     def _robot_can_reach_next_target(
         self,
@@ -528,7 +657,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         action: PickAction,
     ) -> bool:
         wafer = engine.state.wafers[action.wafer_key]
-        robot_modules = self.problem.ClusterTool[action.robot_id].module_ids
+        robot_modules = self._robot_modules[action.robot_id]
         return any(
             module_id in robot_modules
             for module_id in self._next_targets(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from problem import ClusterProblem, parse_problem
+from cluster_toolkit.problem import ClusterProblem, parse_problem
 
 
 def load_lock_problem() -> ClusterProblem:

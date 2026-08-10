@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 from cluster_rl.cluster_env import ClusterEnv, LoadLockSide
-from problem import parse_problem
+from cluster_toolkit.problem import parse_problem
 from tests.problem_fixtures import load_lock_problem
-from validator import ValidatorSuite
+from cluster_toolkit.validator import ValidatorSuite
 
 
 def _raw_problem(

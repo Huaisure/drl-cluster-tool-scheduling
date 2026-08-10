@@ -1,0 +1,105 @@
+{
+  "Modules": {
+    "LP": {
+      "type": "LP"
+    },
+    "LLA": {
+      "type": "LL",
+      "load_lock": {
+        "initial_state": "atmosphere",
+        "atmosphere_to_vacuum_time": 2,
+        "vacuum_to_atmosphere_time": 2,
+        "tm_required_states": {
+          "TM1": "atmosphere",
+          "TM2": "vacuum"
+        }
+      }
+    },
+    "PM1": {
+      "type": "PM"
+    }
+  },
+  "ClusterTool": {
+    "TM1": {
+      "arm_type": "single_arm",
+      "module_ids": ["LP", "LLA"],
+      "travel_times": 1,
+      "load_time": 1,
+      "unload_time": 1
+    },
+    "TM2": {
+      "arm_type": "dual_arm",
+      "module_ids": ["LLA", "PM1"],
+      "travel_times": 1,
+      "load_time": 1,
+      "unload_time": 1
+    }
+  },
+  "cleaning": {
+    "module_ids": ["PM1"],
+    "route_switch": {
+      "clean_time": 3
+    }
+  },
+  "routes": {
+    "A": [
+      {
+        "module_id": "LLA",
+        "process_time": 0
+      },
+      {
+        "module_id": "PM1",
+        "process_time": 4
+      },
+      {
+        "module_id": "LLA",
+        "process_time": 0
+      }
+    ],
+    "B": [
+      {
+        "module_id": "LLA",
+        "process_time": 0
+      },
+      {
+        "module_id": "PM1",
+        "process_time": 4
+      },
+      {
+        "module_id": "LLA",
+        "process_time": 0
+      }
+    ]
+  },
+  "initial_state": {
+    "robots": {
+      "TM1": {
+        "position_module_id": "LP"
+      }
+    },
+    "wafers": [
+      {
+        "route_id": "A",
+        "wafer_index": "0",
+        "priority": 0,
+        "step_index": 0,
+        "location": {
+          "kind": "module",
+          "module_id": "LP"
+        },
+        "process_end_time": null
+      },
+      {
+        "route_id": "B",
+        "wafer_index": "0",
+        "priority": 0,
+        "step_index": 0,
+        "location": {
+          "kind": "module",
+          "module_id": "LP"
+        },
+        "process_end_time": null
+      }
+    ]
+  }
+}
