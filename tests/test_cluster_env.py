@@ -80,6 +80,11 @@ def _advance_action(env: ClusterEnv) -> int:
     return int(env.action_space.n) - 1
 
 
+def test_safety_lookahead_depth_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ClusterEnv(_problem(), safety_lookahead_depth=-1)
+
+
 def test_reset_uses_explicit_pick_place_action_layout_and_static_features() -> None:
     env = ClusterEnv(_problem(wafer_routes=("A", "A"), priorities=(0, 0)))
 

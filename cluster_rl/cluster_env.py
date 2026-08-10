@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy, deepcopy
 from enum import IntEnum
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -53,9 +54,17 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
     Robot.
     """
 
-    def __init__(self, problem: ClusterProblem) -> None:
+    def __init__(
+        self,
+        problem: ClusterProblem,
+        *,
+        safety_lookahead_depth: int = 2,
+    ) -> None:
+        if safety_lookahead_depth < 0:
+            raise ValueError("safety_lookahead_depth must be non-negative")
         self.problem = problem
         self.engine = ClusterEngine(problem)
+        self.safety_lookahead_depth = safety_lookahead_depth
 
         snapshot = problem.initial_state.to_snapshot()
         self._robot_ids = tuple(sorted(problem.ClusterTool))
@@ -239,7 +248,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
         terminated = self.engine.is_complete()
         observation = self._observation()
-        truncated = not terminated and not observation["legal_action_mask"].any()
+        truncated = not terminated and not observation["action_mask"].any()
         info: dict[str, Any] = {
             "time": self.time,
             "action_mask": observation["action_mask"],
@@ -248,7 +257,12 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         if terminated:
             info.update(is_success=True, reason="completed")
         elif truncated:
-            info.update(is_success=False, reason="deadlock")
+            reason = (
+                "deadlock"
+                if not observation["legal_action_mask"].any()
+                else "safety_deadlock"
+            )
+            info.update(is_success=False, reason=reason)
         return (
             observation,
             previous_time - self.time,
@@ -259,6 +273,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
 
     def _observation(self) -> dict[str, Any]:
         state = self.engine.state
+        legal_action_mask = self._legal_action_mask()
         action_mask = self._action_mask()
         return {
             "wafer_loc": np.asarray(
@@ -294,7 +309,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
                 dtype=np.int64,
             ),
             **self._robot_observation(),
-            "legal_action_mask": action_mask.copy(),
+            "legal_action_mask": legal_action_mask,
             "action_mask": action_mask,
         }
 
@@ -406,20 +421,41 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         )
 
     def _action_mask(self) -> np.ndarray:
+        """Return actions that pass local rules and bounded lookahead."""
+
+        actions = self._safe_available_actions(
+            self.engine,
+            self.safety_lookahead_depth,
+        )
+        return self._encode_action_mask(actions)
+
+    def _legal_action_mask(self) -> np.ndarray:
+        """Return current Engine actions after Env admission ordering."""
+
+        return self._encode_action_mask(self._env_available_actions(self.engine))
+
+    def _encode_action_mask(
+        self,
+        actions: tuple[EngineAction, ...],
+    ) -> np.ndarray:
         mask = np.zeros(self.action_space.n, dtype=np.int8)
-        actions = self._env_available_actions()
         for action in actions:
             mask[self._encode_engine_action(action)] = 1
         return mask
 
-    def _env_available_actions(self) -> tuple[EngineAction, ...]:
+    def _env_available_actions(
+        self,
+        engine: ClusterEngine | None = None,
+    ) -> tuple[EngineAction, ...]:
         """Apply the Env-only same-Recipe index tie-break to Engine actions."""
 
-        actions = self.engine.available_actions()
+        engine = self.engine if engine is None else engine
+        actions = engine.available_actions()
         source_picks = [
             action
             for action in actions
-            if isinstance(action, PickAction) and self._is_source_pick(action)
+            if isinstance(action, PickAction)
+            and self._is_source_pick(action, engine)
         ]
         minimum_indexes: dict[tuple[int, str], int] = {}
         for action in source_picks:
@@ -433,7 +469,7 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             action
             for action in actions
             if not isinstance(action, PickAction)
-            or not self._is_source_pick(action)
+            or not self._is_source_pick(action, engine)
             or self._initial_wafers[action.wafer_key].wafer_index
             == minimum_indexes[
                 (
@@ -443,14 +479,141 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             ]
         )
 
-    def _is_source_pick(self, action: PickAction) -> bool:
-        wafer = self.engine.state.wafers[action.wafer_key]
+    def _is_source_pick(
+        self,
+        action: PickAction,
+        engine: ClusterEngine | None = None,
+    ) -> bool:
+        engine = self.engine if engine is None else engine
+        wafer = engine.state.wafers[action.wafer_key]
         return (
             wafer.step_index == 0
             and wafer.module_id is not None
             and self.problem.Modules[wafer.module_id].type
             in {ModuleType.IO, ModuleType.LP}
         )
+
+    def _safe_available_actions(
+        self,
+        engine: ClusterEngine,
+        lookahead_depth: int,
+    ) -> tuple[EngineAction, ...]:
+        actions = self._statically_safe_actions(engine)
+        if lookahead_depth == 0:
+            return actions
+        return tuple(
+            action
+            for action in actions
+            if self._action_has_safe_continuation(
+                engine,
+                action,
+                lookahead_depth,
+            )
+        )
+
+    def _statically_safe_actions(
+        self,
+        engine: ClusterEngine,
+    ) -> tuple[EngineAction, ...]:
+        return tuple(
+            action
+            for action in self._env_available_actions(engine)
+            if not isinstance(action, PickAction)
+            or self._robot_can_reach_next_target(engine, action)
+        )
+
+    def _robot_can_reach_next_target(
+        self,
+        engine: ClusterEngine,
+        action: PickAction,
+    ) -> bool:
+        wafer = engine.state.wafers[action.wafer_key]
+        robot_modules = self.problem.ClusterTool[action.robot_id].module_ids
+        return any(
+            module_id in robot_modules
+            for module_id in self._next_targets(
+                wafer.route_id,
+                wafer.step_index,
+                wafer.return_module_id,
+            )
+        )
+
+    def _next_targets(
+        self,
+        route_id: str,
+        step_index: int,
+        return_module_id: str,
+    ) -> tuple[str, ...]:
+        route = self.problem.routes[route_id]
+        next_step = step_index + 1
+        if 1 <= next_step <= len(route.visits):
+            return route.visits[next_step - 1].module_ids
+        if next_step == len(route.visits) + 1:
+            return (return_module_id,)
+        return ()
+
+    def _action_has_safe_continuation(
+        self,
+        engine: ClusterEngine,
+        action: EngineAction,
+        remaining_depth: int,
+    ) -> bool:
+        next_engine = self._fork_engine(engine)
+        next_engine.step(action)
+        if action != ENGINE_ADVANCE:
+            remaining_depth -= 1
+        return self._state_has_safe_continuation(
+            next_engine,
+            remaining_depth,
+        )
+
+    def _state_has_safe_continuation(
+        self,
+        engine: ClusterEngine,
+        remaining_depth: int,
+    ) -> bool:
+        if engine.is_complete():
+            return True
+
+        actions = self._statically_safe_actions(engine)
+        while actions == (ENGINE_ADVANCE,):
+            engine.step(ENGINE_ADVANCE)
+            if engine.is_complete():
+                return True
+            actions = self._statically_safe_actions(engine)
+
+        if not actions:
+            return False
+        if remaining_depth <= 0:
+            return True
+        return any(
+            self._action_has_safe_continuation(
+                engine,
+                action,
+                remaining_depth,
+            )
+            for action in sorted(
+                actions,
+                key=lambda candidate: self._search_priority(engine, candidate),
+            )
+        )
+
+    def _search_priority(
+        self,
+        engine: ClusterEngine,
+        action: EngineAction,
+    ) -> int:
+        if isinstance(action, PlaceAction):
+            return 0
+        if isinstance(action, PickAction):
+            return 2 if self._is_source_pick(action, engine) else 1
+        return 3
+
+    @staticmethod
+    def _fork_engine(engine: ClusterEngine) -> ClusterEngine:
+        fork = copy(engine)
+        fork._state = deepcopy(engine.state)
+        return fork
 
     def _engine_action(self, action: int) -> EngineAction:
         kind, wafer_index, target_index = self._decode_action(action)

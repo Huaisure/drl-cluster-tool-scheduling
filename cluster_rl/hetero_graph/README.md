@@ -28,6 +28,8 @@
 - `robot_operation_module: [R]`：Pick 源或 Place 目标，`M` 表示无；
 - `time_to_operation_start/end: [R]`：pending operation 到 start/end 的相对时间；
 - 环境的 `action_mask: [W * R + W * M + 1]`：Pick区、Place区，最后一位是ADVANCE；
+- `legal_action_mask`保留Engine合法动作和Env投片顺序；`action_mask`进一步过滤
+  无法到达任何下一步候选Module的Pick，并默认执行两层有效运输动作安全前瞻；
 - 图中的 `pick_action_mask: [W, R]` 和 `place_action_mask: [W, M]`；
   `can_advance`单独表示ADVANCE。
 
@@ -40,6 +42,10 @@ place_action = W * R + wafer_index * M + module_index
 
 `action == W * R + W * M`表示ADVANCE。Place显式选择wafer，持有该wafer的Robot由
 Engine状态唯一推导，因此双臂Robot不会再按holding顺序隐式选片。
+
+安全前瞻中的深度只计算Pick/Place。只有ADVANCE可选时，前瞻会自动推进到下一个
+事件边界，不消耗深度。深度边界采用乐观判断；若某个状态仍有Engine合法动作，但
+所有动作都被安全前瞻判定为必然进入短期死锁，episode以`safety_deadlock`提前结束。
 
 Env observation 和事件计算中的时间单位保持为秒。构图时，所有时间类节点特征统一除以
 `TIME_SCALE_SECONDS = 100.0`，包括加工、驻留、Pick、Place、移动和 pending
