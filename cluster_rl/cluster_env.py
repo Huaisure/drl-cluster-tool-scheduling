@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import copy, deepcopy
 from enum import IntEnum
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -9,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from cluster_rl.action_mask import ActionSafetyFilter
 from cluster_toolkit.cluster_engine import (
     ADVANCE as ENGINE_ADVANCE,
     ClusterEngine,
@@ -16,7 +16,7 @@ from cluster_toolkit.cluster_engine import (
     PickAction,
     PlaceAction,
 )
-from cluster_toolkit.problem import ClusterProblem, ModuleType, TMArmType, WaferKey
+from cluster_toolkit.problem import ClusterProblem, TMArmType, WaferKey
 
 
 PICK = "pick"
@@ -65,6 +65,10 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         self.problem = problem
         self.engine = ClusterEngine(problem)
         self.safety_lookahead_depth = safety_lookahead_depth
+        self.safety_filter = ActionSafetyFilter(
+            problem,
+            lookahead_depth=safety_lookahead_depth,
+        )
 
         snapshot = problem.initial_state.to_snapshot()
         self._robot_ids = tuple(sorted(problem.ClusterTool))
@@ -91,10 +95,6 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             )
             for robot_id in self._robot_ids
         }
-        self._transfer_robots_cache: dict[
-            tuple[str, int, str, str],
-            frozenset[str],
-        ] = {}
         self._initial_wafers = snapshot.wafers_by_key
         self._return_module_ids = tuple(
             problem.return_module_id(snapshot.wafers_by_key[key])
@@ -434,18 +434,16 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         )
 
     def _action_mask(self) -> np.ndarray:
-        """Return actions that pass local rules and bounded lookahead."""
+        """Return actions accepted by the safety filter."""
 
-        actions = self._safe_available_actions(
-            self.engine,
-            self.safety_lookahead_depth,
-        )
-        return self._encode_action_mask(actions)
+        return self._encode_action_mask(self.safety_filter.safe_actions(self.engine))
 
     def _legal_action_mask(self) -> np.ndarray:
         """Return current Engine actions after Env admission ordering."""
 
-        return self._encode_action_mask(self._env_available_actions(self.engine))
+        return self._encode_action_mask(
+            self.safety_filter.available_actions(self.engine)
+        )
 
     def _encode_action_mask(
         self,
@@ -455,294 +453,6 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         for action in actions:
             mask[self._encode_engine_action(action)] = 1
         return mask
-
-    def _env_available_actions(
-        self,
-        engine: ClusterEngine | None = None,
-    ) -> tuple[EngineAction, ...]:
-        """Apply the Env-only same-Recipe index tie-break to Engine actions."""
-
-        engine = self.engine if engine is None else engine
-        actions = engine.available_actions()
-        source_picks = [
-            action
-            for action in actions
-            if isinstance(action, PickAction)
-            and self._is_source_pick(action, engine)
-        ]
-        minimum_indexes: dict[tuple[int, str], int] = {}
-        for action in source_picks:
-            initial = self._initial_wafers[action.wafer_key]
-            key = (initial.priority, initial.route_id)
-            minimum_indexes[key] = min(
-                minimum_indexes.get(key, initial.wafer_index),
-                initial.wafer_index,
-            )
-        return tuple(
-            action
-            for action in actions
-            if not isinstance(action, PickAction)
-            or not self._is_source_pick(action, engine)
-            or self._initial_wafers[action.wafer_key].wafer_index
-            == minimum_indexes[
-                (
-                    self._initial_wafers[action.wafer_key].priority,
-                    self._initial_wafers[action.wafer_key].route_id,
-                )
-            ]
-        )
-
-    def _is_source_pick(
-        self,
-        action: PickAction,
-        engine: ClusterEngine | None = None,
-    ) -> bool:
-        engine = self.engine if engine is None else engine
-        wafer = engine.state.wafers[action.wafer_key]
-        return (
-            wafer.step_index == 0
-            and wafer.module_id is not None
-            and self.problem.Modules[wafer.module_id].type
-            in {ModuleType.IO, ModuleType.LP}
-        )
-
-    def _safe_available_actions(
-        self,
-        engine: ClusterEngine,
-        lookahead_depth: int,
-    ) -> tuple[EngineAction, ...]:
-        actions = self._statically_safe_actions(engine)
-        if lookahead_depth == 0:
-            return actions
-        return tuple(
-            action
-            for action in actions
-            if self._action_has_safe_continuation(
-                engine,
-                action,
-                lookahead_depth,
-            )
-        )
-
-    def _statically_safe_actions(
-        self,
-        engine: ClusterEngine,
-    ) -> tuple[EngineAction, ...]:
-        return tuple(
-            action
-            for action in self._env_available_actions(engine)
-            if not isinstance(action, PickAction)
-            or (
-                self._robot_can_reach_next_target(engine, action)
-                and not self._pick_fills_robot_with_blocked_wafers(engine, action)
-            )
-        )
-
-    def _pick_fills_robot_with_blocked_wafers(
-        self,
-        engine: ClusterEngine,
-        action: PickAction,
-    ) -> bool:
-        """Detect a guaranteed full-arm wait cycle before simulating it.
-
-        Once this Pick completes, a full Robot cannot unload any held wafer if
-        all of their destinations are full of wafers that only this same Robot
-        can transfer onward.  Other Robots are treated optimistically: one
-        topologically valid transfer is enough to leave the Pick available.
-        """
-
-        robot = engine.state.robots[action.robot_id]
-        held_after_pick = (*robot.holding, action.wafer_key)
-        if len(held_after_pick) < self._arm_capacities[action.robot_id]:
-            return False
-        return all(
-            self._wafer_destinations_require_same_robot_release(
-                engine,
-                wafer_key,
-                action.robot_id,
-                action.wafer_key,
-            )
-            for wafer_key in held_after_pick
-        )
-
-    def _wafer_destinations_require_same_robot_release(
-        self,
-        engine: ClusterEngine,
-        wafer_key: WaferKey,
-        robot_id: str,
-        released_wafer_key: WaferKey,
-    ) -> bool:
-        wafer = engine.state.wafers[wafer_key]
-        targets = self._next_targets(
-            wafer.route_id,
-            wafer.step_index,
-            wafer.return_module_id,
-        )
-        return bool(targets) and all(
-            self._full_target_requires_same_robot_release(
-                engine,
-                target_id,
-                robot_id,
-                released_wafer_key,
-            )
-            for target_id in targets
-        )
-
-    def _full_target_requires_same_robot_release(
-        self,
-        engine: ClusterEngine,
-        module_id: str,
-        robot_id: str,
-        released_wafer_key: WaferKey,
-    ) -> bool:
-        occupants = engine.state.module_occupants[module_id]
-        released_count = int(released_wafer_key in occupants)
-        if (
-            len(occupants) - released_count
-            < self.problem.Modules[module_id].capacity
-        ):
-            return False
-
-        for wafer_key in occupants:
-            if wafer_key == released_wafer_key:
-                continue
-            if any(
-                operation.action_type == PICK
-                and operation.wafer_key == wafer_key
-                and operation.robot_id != robot_id
-                for operation in engine.state.pending_operations
-            ):
-                return False
-            if any(
-                candidate != robot_id
-                for candidate in self._transfer_robot_ids(
-                    engine,
-                    wafer_key,
-                    module_id,
-                )
-            ):
-                return False
-        return True
-
-    def _transfer_robot_ids(
-        self,
-        engine: ClusterEngine,
-        wafer_key: WaferKey,
-        source_module_id: str,
-    ) -> frozenset[str]:
-        wafer = engine.state.wafers[wafer_key]
-        key = (
-            wafer.route_id,
-            wafer.step_index,
-            wafer.return_module_id,
-            source_module_id,
-        )
-        if key not in self._transfer_robots_cache:
-            targets = self._next_targets(
-                wafer.route_id,
-                wafer.step_index,
-                wafer.return_module_id,
-            )
-            self._transfer_robots_cache[key] = frozenset(
-                robot_id
-                for robot_id, robot_modules in self._robot_modules.items()
-                if source_module_id in robot_modules
-                and any(target_id in robot_modules for target_id in targets)
-            )
-        return self._transfer_robots_cache[key]
-
-    def _robot_can_reach_next_target(
-        self,
-        engine: ClusterEngine,
-        action: PickAction,
-    ) -> bool:
-        wafer = engine.state.wafers[action.wafer_key]
-        robot_modules = self._robot_modules[action.robot_id]
-        return any(
-            module_id in robot_modules
-            for module_id in self._next_targets(
-                wafer.route_id,
-                wafer.step_index,
-                wafer.return_module_id,
-            )
-        )
-
-    def _next_targets(
-        self,
-        route_id: str,
-        step_index: int,
-        return_module_id: str,
-    ) -> tuple[str, ...]:
-        route = self.problem.routes[route_id]
-        next_step = step_index + 1
-        if 1 <= next_step <= len(route.visits):
-            return route.visits[next_step - 1].module_ids
-        if next_step == len(route.visits) + 1:
-            return (return_module_id,)
-        return ()
-
-    def _action_has_safe_continuation(
-        self,
-        engine: ClusterEngine,
-        action: EngineAction,
-        remaining_depth: int,
-    ) -> bool:
-        next_engine = self._fork_engine(engine)
-        next_engine.step(action)
-        if action != ENGINE_ADVANCE:
-            remaining_depth -= 1
-        return self._state_has_safe_continuation(
-            next_engine,
-            remaining_depth,
-        )
-
-    def _state_has_safe_continuation(
-        self,
-        engine: ClusterEngine,
-        remaining_depth: int,
-    ) -> bool:
-        if engine.is_complete():
-            return True
-
-        actions = self._statically_safe_actions(engine)
-        while actions == (ENGINE_ADVANCE,):
-            engine.step(ENGINE_ADVANCE)
-            if engine.is_complete():
-                return True
-            actions = self._statically_safe_actions(engine)
-
-        if not actions:
-            return False
-        if remaining_depth <= 0:
-            return True
-        return any(
-            self._action_has_safe_continuation(
-                engine,
-                action,
-                remaining_depth,
-            )
-            for action in sorted(
-                actions,
-                key=lambda candidate: self._search_priority(engine, candidate),
-            )
-        )
-
-    def _search_priority(
-        self,
-        engine: ClusterEngine,
-        action: EngineAction,
-    ) -> int:
-        if isinstance(action, PlaceAction):
-            return 0
-        if isinstance(action, PickAction):
-            return 2 if self._is_source_pick(action, engine) else 1
-        return 3
-
-    @staticmethod
-    def _fork_engine(engine: ClusterEngine) -> ClusterEngine:
-        fork = copy(engine)
-        fork._state = deepcopy(engine.state)
-        return fork
 
     def _engine_action(self, action: int) -> EngineAction:
         kind, wafer_index, target_index = self._decode_action(action)

@@ -30,7 +30,7 @@
 - 环境的 `action_mask: [W * R + W * M + 1]`：Pick区、Place区，最后一位是ADVANCE；
 - `legal_action_mask`保留Engine合法动作和Env投片顺序；`action_mask`进一步过滤
   无法到达任何下一步候选Module的Pick、会填满Robot且形成同Robot循环等待的Pick，
-  并默认执行两层有效运输动作安全前瞻；
+  并默认检查候选动作所属Robot后续两次Pick/Place的安全前瞻；
 - 图中的 `pick_action_mask: [W, R]` 和 `place_action_mask: [W, M]`；
   `can_advance`单独表示ADVANCE。
 
@@ -44,11 +44,14 @@ place_action = W * R + wafer_index * M + module_index
 `action == W * R + W * M`表示ADVANCE。Place显式选择wafer，持有该wafer的Robot由
 Engine状态唯一推导，因此双臂Robot不会再按holding顺序隐式选片。
 
-安全前瞻中的深度只计算Pick/Place。只有ADVANCE可选时，前瞻会自动推进到下一个
-事件边界，不消耗深度。深度边界采用乐观判断；若某个状态仍有Engine合法动作，但
-所有动作都被安全前瞻判定为必然进入短期死锁，episode以`safety_deadlock`提前结束。
-满手循环等待检查只在目标当前已满，且其中所有阻塞wafer都无法由其他Robot继续运输时
-屏蔽Pick；只要存在其他Robot的拓扑可行解就保持乐观，因此该检查不需要展开搜索树。
+安全前瞻不把候选动作本身计入深度，只计算同一Robot后续的Pick/Place。ADVANCE、该
+Robot的pending事件以及其他Robot动作不消耗深度；其他Robot不展开无关动作，只作为
+等待资源的潜在外部出口。到达深度边界仍检查闭合wait-for环，而不是仅凭存在任意动作
+就判定安全。若所有动作均被证明会进入闭合等待，episode以`safety_deadlock`提前结束。
+满手循环等待检查把pending Pick视为未来容量释放，把pending Place视为未来占用，并在
+多个满手Robot之间使用固定点剥离。只要存在其他Robot或候选Module形成的潜在出口就保持
+乐观。Conversion LL中的阻塞wafer只把`occupied_exit_side`匹配的Robot视为出口，不能仅
+凭拓扑连线判定。
 
 Env observation 和事件计算中的时间单位保持为秒。构图时，所有时间类节点特征统一除以
 `TIME_SCALE_SECONDS = 100.0`，包括加工、驻留、Pick、Place、移动和 pending
