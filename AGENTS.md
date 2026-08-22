@@ -1,34 +1,31 @@
-# 仓库介绍
+# Repository Guidelines
 
-## 需要解决的问题
+## Project Structure & Module Organization
 
-半导体制造领域中，集束型设备内部的机械手的调度问题。
+`cluster_rl/` contains the Gymnasium environment, heterogeneous-graph adapter, HGT/Transformer policy, and PPO trainer. `cluster_toolkit/` provides the problem schema, event-driven engine, instance generator, and schedule validators; each toolkit component keeps focused tests under its own `tests/` directory. Repository-wide RL and integration tests live in `tests/`. Use `examples/` for fixed scenarios, `datasets/{train,validation,test}/` for materialized inputs, `scripts/` for reproducible workflows, and `runs/` for generated checkpoints and metrics. Architecture details are in `cluster_rl/TRAINING.md` and `cluster_rl/hetero_graph/README.md`.
 
-集束型设备的定义如下：
-- 集束型设备通常由多个集束型单元组成，不同单元间通过Buffer连接。
-- 一个集束型设备通常由一个机械手（单臂或者双臂）、多个加工腔室组成，其中机械手位于设备中心，通过旋转和伸缩完成晶圆的取放片（pick/place）
+## Build, Test, and Development Commands
 
-具体的问题背景和详细约束可以参考`Cluster Tool Scheduling`技能。
+This is a Python project without a separate build step. From the repository root:
 
-## 项目组成
+```bash
+python -m venv .venv && source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pytest -q
+./scripts/generate_datasets.sh
+TOTAL_STEPS=10000 NUM_ENVS=2 ./scripts/train_rl.sh
+```
 
-cluster_rl/ 包含环境、异构图网络和PPO训练代码
+The dataset script regenerates all three splits and overwrites their contents; reduce `TRAIN_COUNT`, `VALIDATION_COUNT`, and `TEST_COUNT` for experiments. For a small direct smoke run, follow the command in `cluster_rl/TRAINING.md`.
 
-examples/ 和 tests/ 分别包含固定示例与RL测试
+## Coding Style & Naming Conventions
 
-问题Schema、Validator、ClusterEngine和Generator由相邻的
-`cluster-tool-validator` 工具包统一维护，本仓库通过依赖使用，不再保留副本。
+Use Python 3 type hints, four-space indentation, and PEP 8 naming: `snake_case` for functions and modules, `PascalCase` for classes, and `UPPER_CASE` for constants. Keep imports grouped standard-library, third-party, then local. Prefer small, explicit domain operations over duplicated intermediate state. No formatter or linter is configured, so match nearby code and keep lines readable. Treat the feature order in `cluster_rl/hetero_graph/feature_schema.py` as a model input protocol; update builders and tests together.
 
-## 核心任务
+## Testing Guidelines
 
-通过RL来训练一个可以对集束型设备内部机械手调度的模型
+Tests use `pytest`; files and functions follow `test_*.py` and `test_*` naming. Add unit tests beside toolkit components and cross-component behavior under `tests/`. Use deterministic seeds and `tmp_path` for generated files. Run the full suite before submitting; while iterating, target a module, for example `python -m pytest tests/test_network.py -q`. No numeric coverage threshold is enforced, but new behavior and regressions should be exercised.
 
-初始目标：
-1. 针对问题的简单情况，跑通一个小框架，即不考虑驻留时间约束、清洗约束，完成RL训练框架中的环境搭建
-2. 完成模型结构搭建，明确输入输出，明确架构和RL训练框架
+## Commit & Pull Request Guidelines
 
-
-# 代码要求
-
-1. 逻辑简单清晰，结构明确
-2. 避免冗余语义，不要重复创建变量，如果已有的变量够用了，就用当前变量，增强可读性
+History favors short, imperative subjects, with occasional Conventional Commit prefixes such as `feat:` and `fix:`. Prefer a scoped form such as `fix: prevent FIFO rollout deadlock`. Pull requests should explain the scheduling or model behavior changed, list validation commands, and call out dataset/schema or checkpoint compatibility. Link the relevant issue; include plots or metric excerpts when training behavior changes. Keep generated `runs/` artifacts and local environment files out of commits unless they are intentional review fixtures.
