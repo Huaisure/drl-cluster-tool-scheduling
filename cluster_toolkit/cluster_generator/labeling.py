@@ -10,10 +10,22 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-from baseline.branch_search import solve_instance as solve_branch_search
-from baseline.cpsat.direct import FeasibilityConsistencyError
+from baseline.branch_search import (
+    SOLVER_VERSION as BRANCH_SEARCH_VERSION,
+    BranchSearchExhaustedError,
+    solve_instance as solve_branch_search,
+)
+from baseline.cpsat.direct import (
+    SOLVER_VERSION as DIRECT_VERSION,
+    FeasibilityConsistencyError,
+)
 from baseline.cpsat.direct import solve_instance as solve_direct
-from baseline.cpsat.periodic import periodic_ratio, solve_periodic_instance
+from baseline.cpsat.periodic import (
+    SOLVER_VERSION as PERIODIC_VERSION,
+    periodic_ratio,
+    solve_periodic_instance,
+)
+from baseline.genetic import SOLVER_VERSION as GENETIC_VERSION
 from baseline.genetic import solve_instance as solve_genetic
 
 from cluster_toolkit.validator import ValidatorSuite
@@ -370,7 +382,7 @@ def _solver_worker(root_value: str, task_values: dict[str, object]) -> None:
                 makespan=result.makespan,
                 runtime_seconds=result.runtime_seconds,
                 termination_reason=TerminationReason(result.termination_reason),
-                solver_version="0.2.0",
+                solver_version=GENETIC_VERSION,
             )
         else:
             assert task.planning_horizon is not None
@@ -419,6 +431,16 @@ def _solver_worker(root_value: str, task_values: dict[str, object]) -> None:
             task,
             runtime_seconds=time.monotonic() - started,
             error=str(exc),
+        )
+    except BranchSearchExhaustedError as exc:
+        _write_terminal_failure(
+            root,
+            task,
+            termination_reason=TerminationReason.NORMAL,
+            runtime_seconds=time.monotonic() - started,
+            error=str(exc),
+            signal_name="search_exhausted",
+            solver_version=BRANCH_SEARCH_VERSION,
         )
     except TimeoutError as exc:
         _write_terminal_failure(
@@ -599,6 +621,8 @@ def _write_terminal_failure(
     termination_reason: TerminationReason,
     runtime_seconds: float,
     error: str,
+    signal_name: str = "error",
+    solver_version: str | None = None,
 ) -> None:
     if _record_path(root, task).is_file():
         return
@@ -607,7 +631,7 @@ def _write_terminal_failure(
         instance_id=task.instance_id,
         solution_id=task.solution_id,
         solver_name=task.solver_name,
-        solver_version="unknown",
+        solver_version=solver_version or _solver_version(task),
         solver_config_hash=task.config_hash,
         seed=task.seed,
         status=SolverStatus.UNKNOWN,
@@ -618,7 +642,7 @@ def _write_terminal_failure(
         time_limit_seconds=task.time_limit_seconds,
         strong_sample_signals={
             "no_incumbent": True,
-            "error": error[:4000],
+            signal_name: error[:4000],
         },
     )
     InstanceSolutions(root / "instances" / task.instance_id).write(record)
@@ -638,7 +662,7 @@ def _write_infeasible_consistency_failure(
         instance_id=task.instance_id,
         solution_id=task.solution_id,
         solver_name=task.solver_name,
-        solver_version="unknown",
+        solver_version=_solver_version(task),
         solver_config_hash=task.config_hash,
         seed=task.seed,
         status=SolverStatus.INFEASIBLE,
@@ -653,6 +677,15 @@ def _write_infeasible_consistency_failure(
         },
     )
     InstanceSolutions(root / "instances" / task.instance_id).write(record)
+
+
+def _solver_version(task: SolverTask) -> str:
+    return {
+        "cpsat_direct": DIRECT_VERSION,
+        "cpsat_periodic": PERIODIC_VERSION,
+        "genetic": GENETIC_VERSION,
+        "branch_search": BRANCH_SEARCH_VERSION,
+    }[task.solver_name]
 
 
 def _load_instance(root: Path, instance_id: str) -> SchedulingInstance:

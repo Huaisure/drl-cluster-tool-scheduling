@@ -5,7 +5,12 @@ import json
 import random
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from cluster_toolkit.cluster_generator.labeling import (
+    SolverTask,
+    _write_terminal_failure,
     reduce_run,
     run_labeling,
     run_status,
@@ -21,6 +26,10 @@ from cluster_toolkit.cluster_generator.production import (
 from cluster_toolkit.cluster_generator.production_models import (
     ProductionRunSpec,
     SolverBudgets,
+)
+from cluster_toolkit.cluster_generator.solutions import (
+    SolutionRecord,
+    TerminationReason,
 )
 
 
@@ -87,6 +96,61 @@ def test_source_catalog_recursively_loads_file_backed_archetypes() -> None:
             for topology in topologies
         }
     ) == 32
+
+
+def test_run_spec_rejects_wafer_ranges_that_cannot_fit_periodic_ratios() -> None:
+    raw = _tiny_spec().model_dump(mode="json")
+    raw.update(
+        {
+            "recipe_counts": [3],
+            "periodic_fraction": 0.5,
+            "wafer_ranges": {"small": {"minimum": 2, "maximum": 3}},
+        }
+    )
+
+    with pytest.raises(ValidationError, match="cannot fit periodic ratio"):
+        ProductionRunSpec.model_validate(raw)
+
+
+def test_catalog_configuration_fails_before_creating_run_directory(
+    tmp_path: Path,
+) -> None:
+    raw = _tiny_spec().model_dump(mode="json")
+    raw["topology_count"] = 33
+    spec = ProductionRunSpec.model_validate(raw)
+    run_root = tmp_path / "invalid-run"
+
+    with pytest.raises(ValueError, match="topology_count exceeds"):
+        materialize_plan(run_root, spec)
+
+    assert not run_root.exists()
+
+
+def test_supervisor_failure_records_concrete_solver_version(tmp_path: Path) -> None:
+    plan = materialize_plan(tmp_path, _tiny_spec())
+    task = SolverTask(
+        instance_id=plan.entries[0].instance_id,
+        solver_name="cpsat_direct",
+        attempt="short",
+        seed=0,
+        time_limit_seconds=1,
+    )
+
+    _write_terminal_failure(
+        tmp_path,
+        task,
+        termination_reason=TerminationReason.INTERRUPTED,
+        runtime_seconds=1,
+        error="test hard deadline",
+    )
+
+    path = next(
+        (tmp_path / "instances" / task.instance_id / "solutions").rglob(
+            "*.solution.json"
+        )
+    )
+    record = SolutionRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    assert record.solver_version == "0.2.0"
 
 
 def test_topology_selection_uses_catalog_contents_without_code_fallback() -> None:

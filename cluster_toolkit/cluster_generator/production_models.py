@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .pipeline import PERIODIC_RATIOS
 from .pipeline_models import IntInterval, InstanceGenerationRequest
 
 
@@ -131,6 +132,29 @@ class ProductionRunSpec(_StrictModel):
             raise ValueError("recipe_counts supports only 1, 2, and 3")
         if set(self.wafer_scales) - set(self.wafer_ranges):
             raise ValueError("every wafer scale needs a configured range")
+        for scale in self.wafer_scales:
+            interval = self.wafer_ranges[scale]
+            if interval.minimum < 1:
+                raise ValueError(f"wafer range {scale} must start at a positive value")
+            if self.periodic_fraction < 1 and interval.maximum < max(
+                self.recipe_counts
+            ):
+                raise ValueError(
+                    f"wafer range {scale} cannot allocate one wafer to every Recipe"
+                )
+            if self.periodic_fraction > 0:
+                for recipe_count in self.recipe_counts:
+                    for ratio in PERIODIC_RATIOS[recipe_count]:
+                        ratio_total = sum(ratio)
+                        minimum_repeats = math.ceil(
+                            interval.minimum / ratio_total
+                        )
+                        maximum_repeats = interval.maximum // ratio_total
+                        if maximum_repeats < minimum_repeats:
+                            raise ValueError(
+                                f"wafer range {scale} cannot fit periodic ratio "
+                                f"{ratio}"
+                            )
         if set(self.route_pattern_weights) - {
             "local",
             "single_transition",

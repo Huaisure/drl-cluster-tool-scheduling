@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "run_id": "local-topology-canary-v1",
+  "master_seed": 20260824,
+  "instance_count": 32,
+  "topology_count": 32,
+  "cell_count_weights": {
+    "1": 0.125,
+    "2": 0.5,
+    "3": 0.375
+  },
+  "wafer_ranges": {
+    "small": {
+      "minimum": 10,
+      "maximum": 25
+    },
+    "medium": {
+      "minimum": 26,
+      "maximum": 50
+    },
+    "large": {
+      "minimum": 51,
+      "maximum": 100
+    },
+    "xlarge": {
+      "minimum": 101,
+      "maximum": 200
+    }
+  },
+  "max_parallel_tasks": 8,
+  "cpsat_workers": 1,
+  "budgets": {
+    "direct_short_seconds": 2,
+    "direct_long_seconds": 2,
+    "periodic_cycle_short_seconds": 2,
+    "periodic_cycle_long_seconds": 2,
+    "periodic_transition_short_seconds": 2,
+    "periodic_transition_long_seconds": 2,
+    "genetic_seconds": 2,
+    "branch_search_seconds": 2,
+    "hard_kill_grace_seconds": 2
+  }
+}

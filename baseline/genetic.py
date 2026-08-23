@@ -19,6 +19,10 @@ from cluster_toolkit.cluster_generator.problem_adapter import to_cluster_problem
 from cluster_toolkit.validator import ValidatorSuite
 
 
+SOLVER_NAME = "genetic"
+SOLVER_VERSION = "0.2.0"
+
+
 @dataclass(frozen=True, slots=True)
 class GeneticResult:
     """Best successful schedule found by the genetic algorithm."""

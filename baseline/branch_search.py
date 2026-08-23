@@ -37,7 +37,11 @@ from cluster_toolkit.validator import ValidatorSuite
 
 
 SOLVER_NAME = "branch_search"
-SOLVER_VERSION = "0.1.0"
+SOLVER_VERSION = "0.1.1"
+
+
+class BranchSearchExhaustedError(RuntimeError):
+    """The bounded policy search ended normally without a safe incumbent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +123,9 @@ def solve(
     nodes_expanded = 0
 
     if not _advance_until_decision(engine, safety_filter):
-        raise RuntimeError("initial state has no safe feasible continuation")
+        raise BranchSearchExhaustedError(
+            "initial state has no safe feasible continuation"
+        )
 
     while not engine.is_complete():
         _check_deadline(deadline)
@@ -137,7 +143,7 @@ def solve(
             raise RuntimeError("branch search selected an internal Advance action")
         actions.append(MappingProxyType(record.to_dict()))
         if not _advance_until_decision(engine, safety_filter):
-            raise RuntimeError(
+            raise BranchSearchExhaustedError(
                 "branch search reached a deadlock before completing all wafers"
             )
 
@@ -220,7 +226,7 @@ def _choose_first_action(
             stack.append((next_engine, depth + 1, (*path, action)))
 
     if best_first_action is None:
-        raise RuntimeError(
+        raise BranchSearchExhaustedError(
             "no safe feasible branch found within the planning horizon"
         )
     return _SearchChoice(

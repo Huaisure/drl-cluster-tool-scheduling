@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from baseline import solve_branch_search_instance
+from baseline.branch_search import BranchSearchExhaustedError
 from baseline.__main__ import main as baseline_main
 from cluster_toolkit.cluster_generator import (
     InstanceGenerationRequest,
@@ -78,6 +79,26 @@ def test_branch_search_solves_generated_instance_reproducibly() -> None:
 def test_branch_search_rejects_invalid_configuration(kwargs, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         solve_branch_search_instance(_generated_instance(), **kwargs)
+
+
+def test_branch_search_reports_bounded_exhaustion_as_solver_outcome() -> None:
+    catalog = PipelineCatalog.load(
+        REPOSITORY_ROOT / "topologies",
+        REPOSITORY_ROOT / "recipe_generation_profiles",
+    )
+    instance = InstanceGenerator(catalog).generate(
+        InstanceGenerationRequest(
+            topology_id="atmospheric-triple_asymmetric-ddd-26e79295",
+            profile_id="atmospheric_linear_default",
+            recipe_count=1,
+            wafer_scale="small",
+            seed=2780701674,
+            route_pattern="single_transition",
+        )
+    ).instance
+
+    with pytest.raises(BranchSearchExhaustedError, match="no safe feasible branch"):
+        solve_branch_search_instance(instance, planning_horizon=1)
 
 
 def test_branch_search_cli_reads_generated_problem_and_writes_actions(

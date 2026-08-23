@@ -40,6 +40,17 @@ def default_run_id(master_seed: int, instance_count: int) -> str:
 def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> ProductionPlan:
     """Create immutable topology snapshots and strictly validated instances."""
 
+    source_catalog = PipelineCatalog.load(
+        Path(__file__).parents[2] / "topologies",
+        Path(__file__).parents[2] / "recipe_generation_profiles",
+    )
+    profile = source_catalog.profile(spec.profile_id)
+    selected_topologies = (
+        _selected_catalog_topologies(spec, source_catalog)
+        if spec.schema_version == 2
+        else ()
+    )
+
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
     spec_path = root / RUN_SPEC_FILE
@@ -54,11 +65,6 @@ def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> Productio
     topology_dir.mkdir(exist_ok=True)
     profile_dir = root / "profiles"
     profile_dir.mkdir(exist_ok=True)
-    source_catalog = PipelineCatalog.load(
-        Path(__file__).parents[2] / "topologies",
-        Path(__file__).parents[2] / "recipe_generation_profiles",
-    )
-    profile = source_catalog.profile(spec.profile_id)
     _write_model_snapshot(
         profile_dir / f"{profile.profile_id}.json",
         profile.model_dump(mode="json"),
@@ -88,7 +94,6 @@ def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> Productio
             topologies.append(topology)
             topology_seeds[topology.topology_id] = topology_seed
     else:
-        selected_topologies = _selected_catalog_topologies(spec, source_catalog)
         for index, topology in enumerate(selected_topologies):
             topology_seed = _derived_seed(spec.master_seed, "topology", index)
             _write_model_snapshot(
