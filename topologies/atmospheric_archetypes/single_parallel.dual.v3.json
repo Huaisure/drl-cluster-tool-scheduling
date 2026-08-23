@@ -1,0 +1,107 @@
+{
+  "archetype_id": "single_parallel",
+  "arm_profile_id": "dual",
+  "cell_order": [
+    "C0"
+  ],
+  "family_id": "atmospheric_linear",
+  "modules": {
+    "C0_AL": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "AL"
+      ]
+    },
+    "C0_P0": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P1": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P2": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P3": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P4": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P5": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "IO": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "IO",
+      "load_lock": null,
+      "tags": []
+    }
+  },
+  "robots": {
+    "TM0": {
+      "arm_kind": "dual_arm",
+      "cell_id": "C0",
+      "module_ids": [
+        "C0_AL",
+        "C0_P0",
+        "C0_P1",
+        "C0_P2",
+        "C0_P3",
+        "C0_P4",
+        "C0_P5",
+        "IO"
+      ]
+    }
+  },
+  "schema_version": 2,
+  "topology_id": "atmospheric-single_parallel-dual-596ed787",
+  "topology_version": "3.0.0"
+}

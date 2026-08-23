@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "profile_id": "atmospheric_linear_default",
+  "profile_version": "2.0.0",
+  "applies_to": [],
+  "applies_to_families": ["atmospheric_linear"],
+  "compiler": "atmospheric_linear",
+  "pm_step_count_weights": {
+    "1": 0.05,
+    "2": 0.20,
+    "3": 0.35,
+    "4": 0.25,
+    "5": 0.15
+  },
+  "candidate_pm_count_weights": {
+    "1": 0.45,
+    "2": 0.40,
+    "3": 0.15
+  },
+  "reentry_probability": 0.15,
+  "process_time_anchor_weights": {
+    "30": 0.20,
+    "50": 0.30,
+    "300": 0.30,
+    "600": 0.20
+  },
+  "process_time_jitter": 0.10,
+  "robot_time": {"minimum": 8, "maximum": 15},
+  "ll_transition_time": {"minimum": 10, "maximum": 30},
+  "alignment_probability": 0.50,
+  "alignment_time": {"minimum": 10, "maximum": 30},
+  "buffer_hold_time": {"minimum": 0, "maximum": 5},
+  "route_pattern_weights": {
+    "local": 0.30,
+    "single_transition": 0.40,
+    "multi_transition": 0.30
+  }
+}

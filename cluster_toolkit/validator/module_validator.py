@@ -39,11 +39,13 @@ class ModuleValidator:
         config: Module,
         actions: Sequence[ActionRecord],
         initial_occupants: Iterable[WaferKey] = (),
+        check_occupant_identity: bool = False,
     ) -> None:
         self.module_id = module_id
         self.config = config
         self.actions = tuple(sorted(actions, key=lambda action: action.sort_key))
         self.initial_occupants = frozenset(initial_occupants)
+        self.check_occupant_identity = check_occupant_identity
 
     @property
     def capacity(self) -> int:
@@ -57,7 +59,27 @@ class ModuleValidator:
 
         for event in self._capacity_events():
             if not event.occupies:
-                occupants.discard(event.wafer_key)
+                if event.wafer_key not in occupants:
+                    if self.check_occupant_identity:
+                        report.issues.append(
+                            ValidationIssue(
+                                constraint_id="module.occupant_identity",
+                                subject_kind="module",
+                                subject_id=self.module_id,
+                                message=(
+                                    f"Module {self.module_id} cannot release wafer "
+                                    f"{event.wafer_key!r}; it is not an occupant"
+                                ),
+                                action_index=event.action.index,
+                                context={
+                                    "time": event.time,
+                                    "occupants_before": sorted(occupants),
+                                    "picked_wafer": event.wafer_key,
+                                },
+                            )
+                        )
+                    continue
+                occupants.remove(event.wafer_key)
                 continue
 
             if event.wafer_key not in occupants and len(occupants) >= self.capacity:

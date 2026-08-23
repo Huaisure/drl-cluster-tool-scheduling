@@ -311,6 +311,13 @@ class ClusterEngine:
             return False
         if wafer.module_id not in self.problem.ClusterTool[robot_id].module_ids:
             return False
+        if (
+            wafer.last_place_robot_id is not None
+            and wafer.last_place_robot_id != robot_id
+            and self.problem.Modules[wafer.module_id].type
+            not in {ModuleType.BUFFER, ModuleType.LL}
+        ):
+            return False
         if wafer_key not in state.module_occupants[wafer.module_id]:
             return False
         return self._ll_pick_allowed(wafer.module_id, robot_id)
@@ -460,6 +467,7 @@ class ClusterEngine:
         wafer.step_index += 1
         wafer.module_id = operation.module_id
         wafer.robot_id = None
+        wafer.last_place_robot_id = operation.robot_id
         robot.holding.remove(operation.wafer_key)
         wafer.ready_at = operation.end + self._process_time(wafer)
         if operation.module_id in state.load_locks:

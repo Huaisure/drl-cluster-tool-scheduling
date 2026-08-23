@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "profile_id": "direct_single_cell_default",
+  "profile_version": "1.0.0",
+  "applies_to": ["direct_single_cell_4pm_dual_arm"],
+  "compiler": "direct_single_cell",
+  "pm_step_count_weights": {
+    "1": 0.10,
+    "2": 0.30,
+    "3": 0.35,
+    "4": 0.20,
+    "5": 0.05
+  },
+  "candidate_pm_count_weights": {
+    "1": 0.40,
+    "2": 0.45,
+    "3": 0.15
+  },
+  "reentry_probability": 0.10,
+  "process_time_anchor_weights": {
+    "30": 0.20,
+    "50": 0.30,
+    "300": 0.30,
+    "600": 0.20
+  },
+  "process_time_jitter": 0.10,
+  "robot_time": {"minimum": 8, "maximum": 15},
+  "ll_transition_time": {"minimum": 10, "maximum": 30}
+}

@@ -1,0 +1,63 @@
+{
+  "archetype_id": "single_compact",
+  "arm_profile_id": "single",
+  "cell_order": [
+    "C0"
+  ],
+  "family_id": "atmospheric_linear",
+  "modules": {
+    "C0_AL": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "AL"
+      ]
+    },
+    "C0_P0": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P1": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "IO": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "IO",
+      "load_lock": null,
+      "tags": []
+    }
+  },
+  "robots": {
+    "TM0": {
+      "arm_kind": "single_arm",
+      "cell_id": "C0",
+      "module_ids": [
+        "C0_AL",
+        "C0_P0",
+        "C0_P1",
+        "IO"
+      ]
+    }
+  },
+  "schema_version": 2,
+  "topology_id": "atmospheric-single_compact-single-6bb40910",
+  "topology_version": "3.0.0"
+}

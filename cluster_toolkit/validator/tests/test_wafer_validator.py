@@ -273,7 +273,7 @@ def test_just_in_time_is_not_checked_yet() -> None:
     assert report.ok
 
 
-def test_load_lock_process_time_is_not_checked_yet() -> None:
+def test_load_lock_process_time_blocks_an_early_pick() -> None:
     problem = parse_problem(
         {
             "Modules": {
@@ -323,4 +323,7 @@ def test_load_lock_process_time_is_not_checked_yet() -> None:
 
     report = ValidatorSuite(problem).validate(actions)
 
-    assert report.ok
+    assert any(
+        issue.constraint_id == "wafer.interval_overlap"
+        for issue in report.issues
+    )

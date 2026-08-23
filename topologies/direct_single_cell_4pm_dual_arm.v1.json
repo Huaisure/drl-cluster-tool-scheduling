@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "topology_id": "direct_single_cell_4pm_dual_arm",
+  "topology_version": "1.0.0",
+  "modules": {
+    "IO1": {"kind": "IO", "cell_id": "CELL1"},
+    "PM1": {"kind": "PM", "cell_id": "CELL1"},
+    "PM2": {"kind": "PM", "cell_id": "CELL1"},
+    "PM3": {"kind": "PM", "cell_id": "CELL1"},
+    "PM4": {"kind": "PM", "cell_id": "CELL1"}
+  },
+  "robots": {
+    "TM1": {
+      "module_ids": ["IO1", "PM1", "PM2", "PM3", "PM4"],
+      "arm_kind": "dual_arm"
+    }
+  }
+}

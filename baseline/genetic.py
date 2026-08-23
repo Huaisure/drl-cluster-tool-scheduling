@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,9 @@ import numpy as np
 
 from cluster_rl.cluster_env import ClusterEnv
 from cluster_toolkit.problem import ClusterProblem, load_problem
+from cluster_toolkit.cluster_generator.pipeline_models import SchedulingInstance
+from cluster_toolkit.cluster_generator.problem_adapter import to_cluster_problem
+from cluster_toolkit.validator import ValidatorSuite
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +28,15 @@ class GeneticResult:
     generations_run: int
     evaluations: int
     seed: int
+    runtime_seconds: float
+    termination_reason: str
+
+
+def solve_instance(
+    instance: SchedulingInstance,
+    **kwargs,
+) -> GeneticResult:
+    return solve(to_cluster_problem(instance), **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +54,7 @@ def solve(
     generations: int = 100,
     patience: int = 20,
     seed: int = 0,
+    time_limit_seconds: float | None = None,
 ) -> GeneticResult:
     """Minimize makespan with a random-key genetic algorithm."""
 
@@ -47,7 +62,18 @@ def solve(
     _require_integer("generations", generations)
     _require_integer("patience", patience)
     _require_integer("seed", seed, minimum=0)
+    if time_limit_seconds is not None and (
+        isinstance(time_limit_seconds, bool)
+        or not isinstance(time_limit_seconds, (int, float))
+        or not math.isfinite(float(time_limit_seconds))
+        or float(time_limit_seconds) <= 0
+    ):
+        raise ValueError("time_limit_seconds must be a positive finite number")
 
+    started = time.monotonic()
+    deadline = (
+        None if time_limit_seconds is None else started + float(time_limit_seconds)
+    )
     env = ClusterEnv(problem)
     gene_count = sum(
         2 * (len(problem.routes[route_id].visits) + 1)
@@ -62,10 +88,22 @@ def solve(
     best_cost = np.inf
     stale_generations = 0
     evaluations = 0
+    timed_out = False
 
     for generation in range(1, generations + 1):
-        decoded = [_decode(env, chromosome) for chromosome in population]
-        evaluations += population_size
+        decoded = []
+        evaluated_population = []
+        for chromosome in population:
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                break
+            decoded.append(_decode(env, chromosome))
+            evaluated_population.append(chromosome)
+            evaluations += 1
+        if not decoded:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
         costs = np.asarray([item.cost for item in decoded])
         order = np.argsort(costs, kind="stable")
         current = decoded[int(order[0])]
@@ -79,31 +117,45 @@ def solve(
 
         if stale_generations >= patience or generation == generations:
             break
+        if timed_out:
+            break
 
         elite_count = max(1, population_size // 16)
         next_population = [
             chromosome.copy()
-            for chromosome in population[order[:elite_count]]
+            for chromosome in np.asarray(evaluated_population)[order[:elite_count]]
         ]
         while len(next_population) < population_size:
-            left = _select_parent(population, costs, rng)
-            right = _select_parent(population, costs, rng)
+            evaluated_array = np.asarray(evaluated_population)
+            left = _select_parent(evaluated_array, costs, rng)
+            right = _select_parent(evaluated_array, costs, rng)
             child = np.where(rng.random(gene_count) < 0.5, left, right)
             child[rng.integers(gene_count)] = rng.random()
             next_population.append(child)
         population = np.asarray(next_population)
 
     if best is None or not best.success:
-        raise RuntimeError(
+        error_type = TimeoutError if timed_out else RuntimeError
+        raise error_type(
             "Genetic algorithm did not find a successful schedule "
             "within the configured budget"
         )
+    report = ValidatorSuite(problem).validate(
+        best.actions,
+        require_complete=True,
+        exact_action_durations=True,
+    )
+    if not report.ok:
+        details = "; ".join(issue.message for issue in report.issues[:5])
+        raise RuntimeError(f"genetic algorithm produced an invalid schedule: {details}")
     return GeneticResult(
         actions=best.actions,
         makespan=best.makespan,
         generations_run=generation,
         evaluations=evaluations,
         seed=seed,
+        runtime_seconds=time.monotonic() - started,
+        termination_reason="TIME_LIMIT" if timed_out else "NORMAL",
     )
 
 
@@ -201,6 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--generations", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--time-limit-seconds", type=float)
     args = parser.parse_args(argv)
 
     if args.problem.resolve() == args.output.resolve():
@@ -213,6 +266,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             generations=args.generations,
             patience=args.patience,
             seed=args.seed,
+            time_limit_seconds=args.time_limit_seconds,
         )
         args.output.write_text(
             json.dumps(

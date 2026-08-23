@@ -91,7 +91,11 @@ def build_safe_reference_schedule(problem: ClusterProblem) -> HeuristicResult:
 
     if not engine.is_complete():
         raise RuntimeError("safe reference scheduler did not complete the problem")
-    validator_report = ValidatorSuite(problem).validate(actions)
+    validator_report = ValidatorSuite(problem).validate(
+        actions,
+        require_complete=True,
+        exact_action_durations=True,
+    )
     if not validator_report.ok:
         raise RuntimeError(
             f"ValidatorSuite rejected safe reference schedule: {validator_report.issues}"

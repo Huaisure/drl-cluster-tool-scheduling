@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from cluster_toolkit.problem import (
     JustInTimeConstraint,
     ModuleLocation,
+    ModuleType,
     RobotLocation,
     Route,
     WaferInitialState,
@@ -37,16 +38,18 @@ class WaferValidator:
         initial_wafer: WaferInitialState,
         return_module_id: str | None,
         source_module_ids: frozenset[str],
-        pm_module_ids: frozenset[str],
+        module_types: Mapping[str, ModuleType],
+        require_complete: bool = False,
     ) -> None:
         self.wafer_key = wafer_key
         self.route = route
         self.just_in_time = just_in_time
         self.source_module_ids = source_module_ids
-        self.pm_module_ids = pm_module_ids
+        self.module_types = dict(module_types)
         self.actions = tuple(sorted(actions, key=lambda action: action.sort_key))
         self.initial_wafer = initial_wafer
         self.return_module_id = return_module_id
+        self.require_complete = require_complete
 
     def validate(self) -> ValidationReport:
         """Validate route order and mutually exclusive wafer intervals."""
@@ -55,12 +58,17 @@ class WaferValidator:
         order_issue = self._validate_process_order()
         if order_issue is not None:
             report.issues.append(order_issue)
+        elif self.require_complete:
+            completion_issue = self._validate_completion()
+            if completion_issue is not None:
+                report.issues.append(completion_issue)
         report.issues.extend(self._validate_interval_overlaps())
         return report
 
     def _validate_process_order(self) -> ValidationIssue | None:
         step_index = self.initial_wafer.step_index
         location = self.initial_wafer.location
+        last_place_robot_id: str | None = None
 
         for action in self._transfer_actions():
             action_type = action.action_type
@@ -87,6 +95,18 @@ class WaferValidator:
                     return self._order_issue(
                         action,
                         f"expected step {step_index} at {location.module_id}",
+                    )
+                if (
+                    last_place_robot_id is not None
+                    and robot_id != last_place_robot_id
+                    and self.module_types.get(location.module_id)
+                    not in {ModuleType.BUFFER, ModuleType.LL}
+                ):
+                    return self._order_issue(
+                        action,
+                        "Robot handoff is allowed only through a BUFFER; "
+                        f"{last_place_robot_id} placed into {location.module_id}, "
+                        f"but {robot_id} picks from it",
                     )
                 location = RobotLocation(
                     robot_id=robot_id,
@@ -135,8 +155,48 @@ class WaferValidator:
 
             step_index = next_step
             location = ModuleLocation(module_id=module_id)
+            last_place_robot_id = robot_id
 
         return None
+
+    def _validate_completion(self) -> ValidationIssue | None:
+        step_index = self.initial_wafer.step_index
+        location = self.initial_wafer.location
+        for action in self._transfer_actions():
+            if action.action_type == PICK:
+                location = RobotLocation(
+                    robot_id=action.tm_id or "unknown",
+                    arm_id=action.arm_id or "arm0",
+                )
+                continue
+            step_index = int(action.step_index)
+            location = ModuleLocation(module_id=action.module_id or "unknown")
+
+        expected_step = len(self.route.visits) + 1
+        if (
+            step_index == expected_step
+            and isinstance(location, ModuleLocation)
+            and (
+                self.return_module_id is None
+                or location.module_id == self.return_module_id
+            )
+        ):
+            return None
+        return ValidationIssue(
+            constraint_id="wafer.completeness",
+            subject_kind="wafer",
+            subject_id=self.wafer_key,
+            message=(
+                f"Wafer {self.wafer_key!r} is incomplete: expected step "
+                f"{expected_step} at {self.return_module_id}, got step "
+                f"{step_index} at {location!r}"
+            ),
+            context={
+                "expected_step_index": expected_step,
+                "actual_step_index": step_index,
+                "return_module_id": self.return_module_id,
+            },
+        )
 
     def _validate_interval_overlaps(self) -> list[ValidationIssue]:
         intervals = self._wafer_intervals()
@@ -173,7 +233,6 @@ class WaferValidator:
 
         if (
             isinstance(self.initial_wafer.location, ModuleLocation)
-            and self.initial_wafer.location.module_id in self.pm_module_ids
             and self.initial_wafer.process_end_time is not None
             and self.initial_wafer.process_end_time > 0
         ):
@@ -213,7 +272,6 @@ class WaferValidator:
             visit = self.route.visits[step_index - 1]
             if (
                 module_id not in visit.module_ids
-                or module_id not in self.pm_module_ids
                 or not visit.process_time
             ):
                 continue

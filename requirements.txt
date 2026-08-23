@@ -2,6 +2,7 @@ gymnasium>=1,<2
 matplotlib>=3.8,<4
 numpy>=1.26,<3
 pydantic>=2,<3
+ortools>=9.10,<10
 pytest>=8,<10
 torch>=2,<3
 torch-geometric>=2.8,<3

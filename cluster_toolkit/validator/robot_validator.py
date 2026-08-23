@@ -42,6 +42,7 @@ class RobotValidator:
         actions: Sequence[ActionRecord],
         initial_position_module_id: str | None = None,
         initial_arms: Mapping[str, WaferKey] | None = None,
+        exact_action_durations: bool = False,
     ) -> None:
         self.robot_id = robot_id
         self.config = config
@@ -50,6 +51,7 @@ class RobotValidator:
         self.initial_arms = MappingProxyType(
             dict(initial_arms or {}),
         )
+        self.exact_action_durations = exact_action_durations
 
     @property
     def capacity(self) -> int:
@@ -61,11 +63,32 @@ class RobotValidator:
         """Validate action mutual exclusion and total wafer capacity."""
 
         report = ValidationReport(checked_subjects={"robot": 1})
+        report.issues.extend(self._validate_reachability())
         report.issues.extend(self._validate_action_overlaps())
         report.issues.extend(self._validate_action_durations())
         report.issues.extend(self._validate_movement_times())
         report.issues.extend(self._validate_capacity())
         return report
+
+    def _validate_reachability(self) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        reachable = set(self.config.module_ids)
+        for action in self.actions:
+            if action.module_id is None or action.module_id in reachable:
+                continue
+            issues.append(
+                ValidationIssue(
+                    constraint_id="robot.reachability",
+                    subject_kind="robot",
+                    subject_id=self.robot_id,
+                    message=(
+                        f"Robot {self.robot_id} cannot reach Module {action.module_id}"
+                    ),
+                    action_index=action.index,
+                    context={"module_id": action.module_id},
+                )
+            )
+        return issues
 
     def _validate_action_overlaps(self) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
@@ -112,15 +135,21 @@ class RobotValidator:
                 continue
 
             actual_time = action.end - action.start
-            if actual_time < required_time:
+            invalid = (
+                actual_time != required_time
+                if self.exact_action_durations
+                else actual_time < required_time
+            )
+            if invalid:
                 issues.append(
                     ValidationIssue(
                         constraint_id="robot.action_duration",
                         subject_kind="robot",
                         subject_id=self.robot_id,
                         message=(
-                            f"Robot {self.robot_id} {action.action_type} action needs at least "
-                            f"{required_time} time, but only {actual_time} is provided"
+                            f"Robot {self.robot_id} {action.action_type} action needs "
+                            f"{'exactly' if self.exact_action_durations else 'at least'} "
+                            f"{required_time} time, but {actual_time} is provided"
                         ),
                         action_index=action.index,
                         context={

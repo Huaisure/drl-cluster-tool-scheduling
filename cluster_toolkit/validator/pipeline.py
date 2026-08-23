@@ -44,12 +44,30 @@ class ValidatorSuite:
         self.robot_validators: list[RobotValidator] = []
         self.wafer_validators: list[WaferValidator] = []
 
-    def validate(self, actions: Sequence[Mapping[str, Any]]) -> ValidationReport:
+    def validate(
+        self,
+        actions: Sequence[Mapping[str, Any]],
+        *,
+        require_complete: bool = False,
+        exact_action_durations: bool = False,
+    ) -> ValidationReport:
         parsed_actions = parse_actions(actions)
         initial_snapshot = self.problem.initial_state.to_snapshot()
-        self._create_module_validators(parsed_actions, initial_snapshot)
-        self._create_robot_validators(parsed_actions, initial_snapshot)
-        self._create_wafer_validators(parsed_actions, initial_snapshot)
+        self._create_module_validators(
+            parsed_actions,
+            initial_snapshot,
+            check_occupant_identity=require_complete,
+        )
+        self._create_robot_validators(
+            parsed_actions,
+            initial_snapshot,
+            exact_action_durations=exact_action_durations,
+        )
+        self._create_wafer_validators(
+            parsed_actions,
+            initial_snapshot,
+            require_complete=require_complete,
+        )
 
         report = ValidationReport()
         for validator in self.module_validators:
@@ -64,6 +82,8 @@ class ValidatorSuite:
         self,
         actions: Sequence[ActionRecord],
         initial_snapshot: InitialSnapshot,
+        *,
+        check_occupant_identity: bool,
     ) -> None:
         grouped = group_actions(actions, _module_ids_for_action)
         configured_ids = set(self.problem.Modules)
@@ -81,6 +101,7 @@ class ValidatorSuite:
                         module_id,
                         frozenset(),
                     ),
+                    check_occupant_identity=check_occupant_identity,
                 )
             )
 
@@ -88,6 +109,8 @@ class ValidatorSuite:
         self,
         actions: Sequence[ActionRecord],
         initial_snapshot: InitialSnapshot,
+        *,
+        exact_action_durations: bool,
     ) -> None:
         grouped = group_actions(actions, _robot_ids_for_action)
         configured_ids = set(self.problem.ClusterTool)
@@ -100,6 +123,7 @@ class ValidatorSuite:
                 actions=grouped.get(robot_id, ()),
                 initial_position_module_id=initial_snapshot.tm_positions.get(robot_id),
                 initial_arms=initial_snapshot.tm_arms.get(robot_id),
+                exact_action_durations=exact_action_durations,
             )
             for robot_id in sorted(configured_ids)
         ]
@@ -108,6 +132,8 @@ class ValidatorSuite:
         self,
         actions: Sequence[ActionRecord],
         initial_snapshot: InitialSnapshot,
+        *,
+        require_complete: bool,
     ) -> None:
         grouped = group_actions(actions, _wafer_keys_for_action)
         configured_keys = set(initial_snapshot.wafers_by_key)
@@ -116,11 +142,10 @@ class ValidatorSuite:
             for module_id, module in self.problem.Modules.items()
             if module.type in {ModuleType.IO, ModuleType.LP}
         )
-        pm_module_ids = frozenset(
-            module_id
+        module_types = {
+            module_id: module.type
             for module_id, module in self.problem.Modules.items()
-            if module.type is ModuleType.PM
-        )
+        }
         _reject_unknown_subjects("Wafer", grouped, configured_keys)
 
         self.wafer_validators = [
@@ -138,7 +163,8 @@ class ValidatorSuite:
                     else None
                 ),
                 source_module_ids=source_module_ids,
-                pm_module_ids=pm_module_ids,
+                module_types=module_types,
+                require_complete=require_complete,
             )
             for wafer_key in sorted(configured_keys)
         ]

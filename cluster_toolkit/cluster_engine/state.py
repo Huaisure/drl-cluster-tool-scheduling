@@ -18,6 +18,7 @@ class WaferState:
     robot_id: str | None
     ready_at: float
     return_module_id: str
+    last_place_robot_id: str | None = None
 
     @property
     def wafer_key(self) -> WaferKey:

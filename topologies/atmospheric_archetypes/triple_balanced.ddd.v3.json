@@ -1,0 +1,184 @@
+{
+  "archetype_id": "triple_balanced",
+  "arm_profile_id": "ddd",
+  "cell_order": [
+    "C0",
+    "C1",
+    "C2"
+  ],
+  "family_id": "atmospheric_linear",
+  "modules": {
+    "B0_0": {
+      "capacity": 1,
+      "cell_id": null,
+      "connected_cell_ids": [
+        "C0",
+        "C1"
+      ],
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "BUFFER"
+      ]
+    },
+    "B1_0": {
+      "capacity": 1,
+      "cell_id": null,
+      "connected_cell_ids": [
+        "C1",
+        "C2"
+      ],
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "BUFFER"
+      ]
+    },
+    "C0_AL": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "AL"
+      ]
+    },
+    "C0_P0": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P1": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C0_P2": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C1_P0": {
+      "capacity": 1,
+      "cell_id": "C1",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C1_P1": {
+      "capacity": 1,
+      "cell_id": "C1",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C1_P2": {
+      "capacity": 1,
+      "cell_id": "C1",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C2_P0": {
+      "capacity": 1,
+      "cell_id": "C2",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C2_P1": {
+      "capacity": 1,
+      "cell_id": "C2",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "C2_P2": {
+      "capacity": 1,
+      "cell_id": "C2",
+      "connected_cell_ids": null,
+      "kind": "CHAMBER",
+      "load_lock": null,
+      "tags": [
+        "PM"
+      ]
+    },
+    "IO": {
+      "capacity": 1,
+      "cell_id": "C0",
+      "connected_cell_ids": null,
+      "kind": "IO",
+      "load_lock": null,
+      "tags": []
+    }
+  },
+  "robots": {
+    "TM0": {
+      "arm_kind": "dual_arm",
+      "cell_id": "C0",
+      "module_ids": [
+        "B0_0",
+        "C0_AL",
+        "C0_P0",
+        "C0_P1",
+        "C0_P2",
+        "IO"
+      ]
+    },
+    "TM1": {
+      "arm_kind": "dual_arm",
+      "cell_id": "C1",
+      "module_ids": [
+        "B0_0",
+        "B1_0",
+        "C1_P0",
+        "C1_P1",
+        "C1_P2"
+      ]
+    },
+    "TM2": {
+      "arm_kind": "dual_arm",
+      "cell_id": "C2",
+      "module_ids": [
+        "B1_0",
+        "C2_P0",
+        "C2_P1",
+        "C2_P2"
+      ]
+    }
+  },
+  "schema_version": 2,
+  "topology_id": "atmospheric-triple_balanced-ddd-f04c1558",
+  "topology_version": "3.0.0"
+}

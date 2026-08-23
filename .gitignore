@@ -42,3 +42,13 @@ dist/
 *.tmp
 tmp/
 temp/
+
+# backup files
+*.bak
+*.backup
+
+# data files
+/datasets/*
+!/datasets/README.md
+!/datasets/fixtures/
+!/datasets/fixtures/**``
