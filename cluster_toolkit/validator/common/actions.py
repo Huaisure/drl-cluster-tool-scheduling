@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
-from ..models import ActionRecord
+from ..models import PICK, PLACE, ActionRecord, TimeValue, WaferKey
 
 
 SubjectSelector = Callable[[ActionRecord], Iterable[Hashable]]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapacityEvent:
+    time: TimeValue
+    occupies: bool
+    action: ActionRecord
+    wafer_key: WaferKey
 
 
 def parse_actions(actions: Sequence[Mapping[str, Any]]) -> tuple[ActionRecord, ...]:
@@ -33,3 +42,29 @@ def group_actions(
     for subject_actions in grouped.values():
         subject_actions.sort(key=lambda action: action.sort_key)
     return dict(grouped)
+
+
+def capacity_events(
+    actions: Sequence[ActionRecord],
+    occupying_action_type: str,
+) -> list[_CapacityEvent]:
+    """Return capacity changes with releases ordered before claims."""
+
+    events = [
+        _CapacityEvent(
+            time=(
+                action.start
+                if action.action_type == occupying_action_type
+                else action.end
+            ),
+            occupies=action.action_type == occupying_action_type,
+            action=action,
+            wafer_key=action.wafer_key,
+        )
+        for action in actions
+        if action.action_type in {PICK, PLACE} and action.wafer_key is not None
+    ]
+    return sorted(
+        events,
+        key=lambda event: (event.time, event.occupies, event.action.index),
+    )

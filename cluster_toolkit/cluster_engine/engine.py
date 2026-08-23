@@ -254,7 +254,7 @@ class ClusterEngine:
         )
 
         for module_id, runtime in state.load_locks.items():
-            if state.module_occupants[module_id] or self._has_place_reservation(module_id):
+            if self._reserved_occupancy(module_id):
                 continue
             opposite = self._opposite_side(runtime.last_pick_side)
             ready_at = runtime.last_pick_end + self._ll_transition_duration(
@@ -620,12 +620,6 @@ class ClusterEngine:
             operation.action_type == "place"
             and operation.module_id == module_id
             and not operation.started
-            for operation in self.state.pending_operations
-        )
-
-    def _has_place_reservation(self, module_id: str) -> bool:
-        return any(
-            operation.action_type == "place" and operation.module_id == module_id
             for operation in self.state.pending_operations
         )
 

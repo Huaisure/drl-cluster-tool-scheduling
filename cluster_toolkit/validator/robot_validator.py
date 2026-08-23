@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from cluster_toolkit.problem import ClusterCell, TMArmType
 
 from .common import Interval, intervals_overlap
+from .common.actions import capacity_events
 from .models import (
     PICK,
     PLACE,
@@ -16,20 +16,6 @@ from .models import (
     ValidationReport,
     WaferKey,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _CapacityEvent:
-    time: TimeValue
-    occupies: bool
-    action: ActionRecord
-    wafer_key: WaferKey
-
-    @property
-    def sort_key(self) -> tuple[TimeValue, int, int]:
-        # At the same time, Place.end releases capacity before Pick.start uses it.
-        priority = 1 if self.occupies else 0
-        return self.time, priority, self.action.index
 
 
 class RobotValidator:
@@ -209,7 +195,7 @@ class RobotValidator:
         issues: list[ValidationIssue] = []
         held_wafers = set(self.initial_arms.values())
 
-        for event in self._capacity_events():
+        for event in capacity_events(self.actions, PICK):
             if not event.occupies:
                 held_wafers.discard(event.wafer_key)
                 continue
@@ -237,25 +223,3 @@ class RobotValidator:
             held_wafers.add(event.wafer_key)
 
         return issues
-
-    def _capacity_events(self) -> list[_CapacityEvent]:
-        events: list[_CapacityEvent] = []
-
-        for action in self.actions:
-            if action.action_type not in {PICK, PLACE}:
-                continue
-
-            if action.wafer_key is None:
-                continue
-
-            events.append(
-                _CapacityEvent(
-                    time=action.start if action.action_type == PICK else action.end,
-                    occupies=action.action_type == PICK,
-                    action=action,
-                    wafer_key=action.wafer_key,
-                )
-            )
-
-        events.sort(key=lambda event: event.sort_key)
-        return events

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import random
-import tempfile
 from pathlib import Path
 
-from .corpus import InstanceCorpus
+from cluster_toolkit.validator import ValidatorSuite
+
+from .corpus import InstanceCorpus, _json_bytes, _write_new_atomic
 from .heuristic import build_safe_reference_schedule
 from .pipeline import GeneratedInstance, InstanceGenerator, PERIODIC_RATIOS
 from .pipeline_catalog import PipelineCatalog
@@ -23,7 +22,6 @@ from .topology_family import (
     AtmosphericTopologyRequest,
     generate_atmospheric_topology,
 )
-from cluster_toolkit.validator import ValidatorSuite
 
 
 RUN_SPEC_FILE = "run_spec.json"
@@ -424,24 +422,3 @@ def _write_model_snapshot(path: Path, value: object) -> None:
             raise FileExistsError(f"immutable snapshot differs: {path}")
         return
     _write_new_atomic(path, payload)
-
-
-def _json_bytes(value: object) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-
-
-def _write_new_atomic(path: Path, payload: bytes) -> None:
-    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-        try:
-            os.link(temp_path, path)
-        except FileExistsError:
-            if path.read_bytes() != payload:
-                raise
-    finally:
-        temp_path.unlink(missing_ok=True)

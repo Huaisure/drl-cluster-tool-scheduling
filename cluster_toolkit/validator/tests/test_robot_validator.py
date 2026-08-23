@@ -89,6 +89,18 @@ def test_touching_robot_actions_do_not_overlap() -> None:
     assert validator.validate().ok
 
 
+def test_place_end_releases_arm_before_pick_at_the_same_time() -> None:
+    validator = _validator(
+        [
+            _action(0, "load", wafer_index=0, start=0, end=1),
+            _action(1, "unload", wafer_index=1, start=1, end=2),
+        ],
+        initial_arms={"arm0": ("A", 0)},
+    )
+
+    assert validator.validate().ok
+
+
 def test_single_arm_rejects_second_held_wafer() -> None:
     validator = _validator(
         [

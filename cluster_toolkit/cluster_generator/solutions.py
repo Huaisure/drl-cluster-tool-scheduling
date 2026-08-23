@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import gzip
 import hashlib
+import json
 import math
 import os
 import re
@@ -19,6 +19,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from .corpus import _json_bytes, _write_new_atomic
 
 
 class _StrictModel(BaseModel):
@@ -450,27 +452,6 @@ class InstanceSolutions:
             _json_bytes(index.model_dump(mode="json")),
         )
         return index
-
-
-def _json_bytes(value: object) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-
-
-def _write_new_atomic(path: Path, payload: bytes) -> None:
-    file_descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(file_descriptor, "wb") as stream:
-            stream.write(payload)
-        try:
-            os.link(temp_path, path)
-        except FileExistsError:
-            if path.read_bytes() != payload:
-                raise
-    finally:
-        temp_path.unlink(missing_ok=True)
 
 
 def _replace_atomic(path: Path, payload: bytes) -> None:

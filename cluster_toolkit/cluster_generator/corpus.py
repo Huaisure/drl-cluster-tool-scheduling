@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -12,6 +13,21 @@ def _json_bytes(value: object) -> bytes:
     return (
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def _write_new_atomic(path: Path, payload: bytes) -> None:
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class InstanceCorpus:

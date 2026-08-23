@@ -1,33 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from cluster_toolkit.problem import Module
 
+from .common.actions import capacity_events
 from .models import (
-    PICK,
     PLACE,
     ActionRecord,
-    TimeValue,
     ValidationIssue,
     ValidationReport,
     WaferKey,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _CapacityEvent:
-    time: TimeValue
-    occupies: bool
-    action: ActionRecord
-    wafer_key: WaferKey
-
-    @property
-    def sort_key(self) -> tuple[TimeValue, int, int]:
-        # At the same time, Pick.end releases capacity before Place.start uses it.
-        priority = 1 if self.occupies else 0
-        return self.time, priority, self.action.index
 
 
 class ModuleValidator:
@@ -57,7 +41,7 @@ class ModuleValidator:
         report = ValidationReport(checked_subjects={"module": 1})
         occupants = set(self.initial_occupants)
 
-        for event in self._capacity_events():
+        for event in capacity_events(self.actions, PLACE):
             if not event.occupies:
                 if event.wafer_key not in occupants:
                     if self.check_occupant_identity:
@@ -105,25 +89,3 @@ class ModuleValidator:
             occupants.add(event.wafer_key)
 
         return report
-
-    def _capacity_events(self) -> list[_CapacityEvent]:
-        events: list[_CapacityEvent] = []
-
-        for action in self.actions:
-            if action.action_type not in {PICK, PLACE}:
-                continue
-
-            if action.wafer_key is None:
-                continue
-
-            events.append(
-                _CapacityEvent(
-                    time=action.start if action.action_type == PLACE else action.end,
-                    occupies=action.action_type == PLACE,
-                    action=action,
-                    wafer_key=action.wafer_key,
-                )
-            )
-
-        events.sort(key=lambda event: event.sort_key)
-        return events
