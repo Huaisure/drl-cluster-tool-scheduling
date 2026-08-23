@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cluster Tool 调度数据生成与训练框架组会汇报">
+  <title>Cluster Tool 调度数据生成与训练框架</title>
+  <style>
+    :root {
+      --bg: #f7f7f5;
+      --surface: #fff;
+      --text: #202124;
+      --muted: #62676d;
+      --line: #d8dcdf;
+      --line-strong: #aeb4b9;
+      --blue: #315f7d;
+      --blue-soft: #edf3f6;
+      --green: #3e7055;
+      --green-soft: #eef5f0;
+      --orange: #9a5b2f;
+      --orange-soft: #f8f1eb;
+      --red: #9b4742;
+      --red-soft: #f8eeee;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+    }
+
+    a { color: var(--blue); }
+    a:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+    code {
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: #eef0f1;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: .9em;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 54px 0 86px;
+    }
+
+    header {
+      padding-bottom: 32px;
+      border-bottom: 1px solid var(--line-strong);
+    }
+
+    .overline {
+      margin: 0 0 10px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      margin-bottom: 14px;
+      font-size: clamp(34px, 5vw, 47px);
+      font-weight: 650;
+      line-height: 1.2;
+      letter-spacing: -.025em;
+    }
+    h2 {
+      margin: 0 0 22px;
+      font-size: 27px;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+    h3 {
+      margin-bottom: 9px;
+      font-size: 18px;
+      font-weight: 650;
+      line-height: 1.45;
+    }
+
+    .subtitle {
+      max-width: 880px;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 19px;
+    }
+
+    .toc {
+      margin-top: 26px;
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .toc strong { display: block; margin-bottom: 7px; }
+    .toc-links { display: flex; flex-wrap: wrap; gap: 5px 18px; }
+    .toc a { color: var(--muted); font-size: 14px; text-decoration: none; }
+    .toc a:hover { color: var(--blue); text-decoration: underline; }
+
+    main {
+      display: flex;
+      flex-direction: column;
+    }
+
+    #framework { order: 1; }
+    #questions { order: 2; }
+    #topology { order: 3; }
+    #algorithms { order: 4; }
+    #effects { order: 5; }
+    #training { order: 6; }
+    #experiment { order: 7; }
+    #boundary { order: 8; }
+
+    main > section {
+      padding: 46px 0;
+      border-bottom: 1px solid var(--line);
+      scroll-margin-top: 16px;
+    }
+    main > section:last-child { border-bottom: 0; }
+
+    .section-intro {
+      max-width: 900px;
+      margin-bottom: 25px;
+      color: var(--muted);
+    }
+
+    .grid-2, .grid-3, .question-grid, .comparison-summary {
+      display: grid;
+      gap: 20px;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .question-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .comparison-summary { grid-template-columns: .9fr 1.1fr; }
+
+    .grid-2 > *, .grid-3 > *, .question-grid > *, .comparison-summary > *, .framework-main > * { min-width: 0; }
+
+    .panel {
+      padding: 20px 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .panel p:last-child, .panel ul:last-child { margin-bottom: 0; }
+    .panel-blue { border-top: 3px solid var(--blue); }
+    .panel-green { border-top: 3px solid var(--green); }
+    .panel-orange { border-top: 3px solid var(--orange); }
+    .panel-red { border-top: 3px solid var(--red); }
+
+    .compact {
+      margin: 0;
+      padding-left: 19px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .compact li { margin: 6px 0; }
+
+    .note {
+      margin-top: 22px;
+      padding: 15px 18px;
+      border-left: 4px solid var(--blue);
+      background: var(--blue-soft);
+    }
+    .note.green { border-left-color: var(--green); background: var(--green-soft); }
+    .note.orange { border-left-color: var(--orange); background: var(--orange-soft); }
+    .note.red { border-left-color: var(--red); background: var(--red-soft); }
+    .note p:last-child { margin-bottom: 0; }
+
+    .question {
+      padding: 18px 20px;
+      border-left: 3px solid var(--blue);
+      background: var(--surface);
+    }
+    .question strong { display: block; margin-bottom: 5px; }
+    .question span { color: var(--muted); font-size: 14px; }
+
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      font-size: 14px;
+    }
+    th, td {
+      padding: 12px 13px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      background: #f1f2f2;
+      font-weight: 650;
+    }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child, th:first-child { width: 18%; }
+
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: #fafafa;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    /* The single framework diagram */
+    .framework {
+      margin: 26px 0 0;
+      padding: 24px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+    }
+    .framework figcaption {
+      margin-bottom: 22px;
+      font-size: 16px;
+      font-weight: 650;
+    }
+    .foundation {
+      display: grid;
+      grid-template-columns: 135px 1fr 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin-bottom: 18px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .foundation-title {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      color: var(--blue);
+      background: var(--blue-soft);
+      font-weight: 650;
+    }
+    .foundation-item {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: #fafafa;
+      font-size: 13px;
+    }
+    .foundation-item strong { display: block; }
+    .foundation-item span { color: var(--muted); }
+    .framework-main {
+      display: grid;
+      grid-template-columns: 1fr 24px 1.1fr 24px 1.2fr 24px 1.05fr;
+      align-items: center;
+      gap: 9px;
+    }
+    .flow-group {
+      min-width: 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      background: #fafafa;
+    }
+    .flow-group h3 {
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    .flow-stack { display: grid; gap: 8px; }
+    .flow-box {
+      padding: 9px 10px;
+      border-left: 3px solid var(--blue);
+      background: var(--blue-soft);
+      font-size: 13px;
+    }
+    .flow-box.green { border-left-color: var(--green); background: var(--green-soft); }
+    .flow-box.orange { border-left-color: var(--orange); background: var(--orange-soft); }
+    .flow-box strong { display: block; }
+    .flow-box span { color: var(--muted); font-size: 12px; }
+    .flow-arrow { color: var(--line-strong); font-size: 23px; text-align: center; }
+    .framework-footer {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+    .framework-note {
+      padding: 11px 13px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .framework-note strong { display: block; color: var(--blue); }
+    .framework-note span { color: var(--muted); }
+
+    .algorithm {
+      padding: 20px 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .algorithm h3 { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .algorithm h3 span { color: var(--muted); font-size: 12px; font-weight: 500; }
+    .algorithm dl { margin: 14px 0 0; }
+    .algorithm dt { margin-top: 10px; font-weight: 650; font-size: 14px; }
+    .algorithm dd { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+
+    .known, .unknown {
+      padding: 20px 22px;
+      border-top: 3px solid var(--green);
+      background: var(--surface);
+    }
+    .unknown { border-top-color: var(--orange); }
+    .known ul, .unknown ul { margin-bottom: 0; }
+
+    .hypotheses {
+      margin: 24px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: hypothesis;
+    }
+    .hypotheses li {
+      counter-increment: hypothesis;
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .hypotheses li:last-child { border-bottom: 0; }
+    .hypotheses li::before {
+      content: "H" counter(hypothesis);
+      color: var(--blue);
+      font-weight: 700;
+    }
+    .hypotheses span { color: var(--muted); font-size: 14px; }
+
+    .training-step {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 13px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .training-step:last-child { border-bottom: 0; }
+    .training-step b {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--blue);
+      font-size: 13px;
+    }
+    .training-step strong { display: block; }
+    .training-step span { color: var(--muted); font-size: 14px; }
+
+    .metric-list {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 22px;
+    }
+    .metric {
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .metric strong { display: block; color: var(--blue); }
+    .metric span { color: var(--muted); font-size: 13px; }
+
+    footer {
+      padding-top: 28px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 920px) {
+      .page { width: min(100% - 28px, 760px); padding-top: 32px; }
+      main > section { padding: 38px 0; }
+      .grid-2, .grid-3, .question-grid, .comparison-summary { grid-template-columns: 1fr; }
+      .foundation { grid-template-columns: 1fr; }
+      .framework-main { grid-template-columns: 1fr; }
+      .flow-arrow { transform: rotate(90deg); }
+      .framework-footer, .metric-list { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 520px) {
+      body { font-size: 15px; }
+      h1 { font-size: 32px; }
+      h2 { font-size: 23px; }
+      .framework { padding: 15px; }
+      .algorithm h3 { display: block; }
+      table { font-size: 13px; }
+      th, td { padding: 9px 10px; }
+    }
+
+    @media print {
+      @page { size: A4; margin: 16mm; }
+      body { background: #fff; font-size: 10.5pt; }
+      .page { width: 100%; padding: 0; }
+      .toc { display: none; }
+      main > section { padding: 22px 0; }
+      .panel, .framework, .algorithm, table { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <p class="overline">Group meeting · Research framework</p>
+      <h1>Cluster Tool 调度数据生成与训练框架</h1>
+      <p class="subtitle">汇报重点不是数据如何存储，而是为什么采用受控的问题生成方式、为什么组合多类调度算法，以及这些数据如何支持下一步的学习型调度。</p>
+
+      <nav class="toc" aria-label="目录">
+        <strong>内容导航</strong>
+        <div class="toc-links">
+          <a href="#framework">整体目的与框架</a>
+          <a href="#questions">为什么需要这套框架</a>
+          <a href="#topology">为什么固定拓扑</a>
+          <a href="#algorithms">为什么选择这些算法</a>
+          <a href="#effects">算法效果如何评价</a>
+          <a href="#training">怎样用于训练</a>
+          <a href="#experiment">下一步实验</a>
+          <a href="#boundary">边界与结论</a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section id="questions">
+        <h2>2. 为什么需要这套数据生成框架</h2>
+        <p class="section-intro">目标不是生成尽可能多的随机实例，而是构造一批接近实际设备分布、覆盖关键调度难点、又能被不同算法统一求解和比较的问题，最终为学习型调度提供可靠训练信号。</p>
+
+        <div class="question-grid">
+          <article class="question">
+            <strong>数据是否接近真实机台？</strong>
+            <span>如果拓扑、可达关系和腔室数量完全随机，生成的大量问题在真实设备上并不存在。</span>
+          </article>
+          <article class="question">
+            <strong>标签是否足够可靠和多样？</strong>
+            <span>单一算法会把自身偏好带入数据；只保留一个结果也无法判断解的质量与问题难度。</span>
+          </article>
+          <article class="question">
+            <strong>数据能否转化为学习信号？</strong>
+            <span>最终需要的不只是 makespan，还包括合法动作轨迹、参考尺度、难度信息和泛化测试问题。</span>
+          </article>
+        </div>
+
+        <div class="note">
+          <p><strong>基本思路：</strong>用有限、真实的硬件结构约束问题分布；在每种结构内部随机化 Recipe、加工时间和 workload；再通过不同类型算法产生互补的解与质量信息。</p>
+        </div>
+      </section>
+
+      <section id="topology">
+        <h2>3. 为什么固定拓扑结构</h2>
+        <p class="section-intro">实际产线中的 Cluster Tool 并不是任意图。Cell 数量、每个 Cell 的 PM 数量、Robot 配置和跨 Cell 的 BUFFER 连接通常来自有限的设备设计。因此，完全随机拓扑虽然增加了形式上的多样性，却会把训练分布推离真实机台。</p>
+
+        <div class="grid-2">
+          <article class="panel panel-blue">
+            <h3>固定的是硬件结构</h3>
+            <ul class="compact">
+              <li>Cell 数量与相邻关系；</li>
+              <li>每个 Cell 的 PM、AL、BUFFER 数量；</li>
+              <li>Robot 的单双臂配置与可达范围；</li>
+              <li>跨 Cell 搬运必须经过的物理连接。</li>
+            </ul>
+          </article>
+          <article class="panel panel-green">
+            <h3>随机的是生产任务</h3>
+            <ul class="compact">
+              <li>Recipe 数量、步骤数与经过的 Cell；</li>
+              <li>每一步的候选 PM、重入与是否经过 AL；</li>
+              <li>加工、搬运和对准时间；</li>
+              <li>各 Recipe 的 wafer 数量与混合比例。</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="table-wrap" style="margin-top: 22px;">
+          <table>
+            <thead>
+              <tr><th>方案</th><th>优点</th><th>主要问题</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>完全随机拓扑</td><td>形式多样，容易扩充数量</td><td>容易生成现实中不存在或极少出现的设备结构，训练分布与实际应用脱节</td></tr>
+              <tr><td>只使用单一拓扑</td><td>问题简单、便于调试</td><td>模型容易记住固定结构，难以判断跨设备泛化能力</td></tr>
+              <tr><td><strong>有限拓扑族 + 任务随机化</strong></td><td>保持物理真实性，同时覆盖不同负载、工艺和瓶颈</td><td>需要后续用真实设备统计继续调整各类拓扑与任务的采样权重</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note green">
+          <p><strong>这里固定拓扑不是为了降低问题难度，</strong>而是为了让数据多样性发生在真实会变化的部分：Recipe、加工时间、产品组合和投片规模。</p>
+        </div>
+      </section>
+
+      <section id="framework">
+        <h2>1. 整体目的与总体框架</h2>
+        <p class="section-intro">前期已经建立了事件驱动的调度环境和独立 Validator，统一了状态演化、合法动作、设备占用与时间约束。在这一基础上，当前工作的整体目的是构造接近真实机台分布的调度问题，用多种互补算法产生可信且多样的标签，再把这些标签转化为模仿学习样本、强化学习参考和统一评测基准。</p>
+
+        <figure class="framework" aria-labelledby="framework-caption">
+          <figcaption id="framework-caption">从机台先验到学习型调度的总体框架</figcaption>
+          <div class="foundation" aria-label="前期已经完成的基础能力">
+            <div class="foundation-title">前期基础</div>
+            <div class="foundation-item"><strong>事件驱动调度环境</strong><span>统一表达设备状态、合法 Pick/Place 动作和时间推进，为不同算法提供同一个执行语义。</span></div>
+            <div class="foundation-item"><strong>独立 Validator</strong><span>回放完整动作序列，检查资源占用、wafer 身份、工艺顺序与时间一致性，保证不同算法的结果可比较。</span></div>
+          </div>
+          <div class="framework-main">
+            <div class="flow-group">
+              <h3>现实约束</h3>
+              <div class="flow-stack">
+                <div class="flow-box"><strong>有限拓扑族</strong><span>来源于实际可出现的机台结构</span></div>
+                <div class="flow-box"><strong>物理调度语义</strong><span>可达、占用、搬运、工艺顺序</span></div>
+              </div>
+            </div>
+
+            <div class="flow-arrow" aria-hidden="true">→</div>
+
+            <div class="flow-group">
+              <h3>受控问题生成</h3>
+              <div class="flow-stack">
+                <div class="flow-box"><strong>Recipe</strong><span>步骤、候选 PM、重入、Cell 路径</span></div>
+                <div class="flow-box"><strong>Timing</strong><span>加工、Pick/Place、移动时间</span></div>
+                <div class="flow-box"><strong>Workload</strong><span>产品混合与 wafer 规模</span></div>
+                <div class="flow-box green"><strong>可行性检查</strong><span>确保问题在物理上可以完成</span></div>
+              </div>
+            </div>
+
+            <div class="flow-arrow" aria-hidden="true">→</div>
+
+            <div class="flow-group">
+              <h3>多算法标注</h3>
+              <div class="flow-stack">
+                <div class="flow-box orange"><strong>非周期 CP-SAT</strong><span>完整有限批次与最优性信息</span></div>
+                <div class="flow-box orange"><strong>周期 CP-SAT</strong><span>利用重复生产结构</span></div>
+                <div class="flow-box orange"><strong>遗传算法</strong><span>快速搜索多样化可行解</span></div>
+                <div class="flow-box orange"><strong>分支搜索</strong><span>可解释的有限前瞻基线</span></div>
+                <div class="flow-box green"><strong>统一验证与比较</strong><span>只接收物理合法的完整调度</span></div>
+              </div>
+            </div>
+
+            <div class="flow-arrow" aria-hidden="true">→</div>
+
+            <div class="flow-group">
+              <h3>训练与评测</h3>
+              <div class="flow-stack">
+                <div class="flow-box"><strong>模仿学习</strong><span>从合法动作轨迹学习初始策略</span></div>
+                <div class="flow-box"><strong>强化学习</strong><span>继续优化长期 makespan</span></div>
+                <div class="flow-box"><strong>Curriculum</strong><span>按实测难度安排训练顺序</span></div>
+                <div class="flow-box"><strong>泛化评测</strong><span>新 Recipe、新拓扑与更大规模</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="framework-footer">
+            <div class="framework-note"><strong>问题层</strong><span>真实结构上的受控随机，而不是任意随机。</span></div>
+            <div class="framework-note"><strong>标注层</strong><span>多算法互补，不把单一算法当作绝对真值。</span></div>
+            <div class="framework-note"><strong>学习层</strong><span>动作轨迹用于学习，最优性信息用于评价。</span></div>
+          </div>
+        </figure>
+      </section>
+
+      <section id="algorithms">
+        <h2>4. 为什么选择这四类算法</h2>
+        <p class="section-intro">四类算法不是简单重复求同一个答案，而是分别覆盖精确求解、结构化求解、全局启发式搜索和局部前瞻。它们共同提供“解的质量、求解速度、最优性信息和策略多样性”。</p>
+
+        <div class="grid-2">
+          <article class="algorithm panel-blue">
+            <h3>非周期 CP-SAT <span>完整有限批次</span></h3>
+            <dl>
+              <dt>为什么选</dt>
+              <dd>它直接描述完整批次中的资源冲突、动作顺序与候选腔选择，是最清晰的精确优化基线。</dd>
+              <dt>预期效果</dt>
+              <dd>在小中规模问题上应提供质量较高的解，并可能给出全问题下界或最优性证明。</dd>
+              <dt>局限</dt>
+              <dd>随着 wafer 数和动作数增加，模型规模快速增长；大问题上可能主要提供 incumbent，而无法在预算内证明最优。</dd>
+            </dl>
+          </article>
+
+          <article class="algorithm panel-orange">
+            <h3>周期 CP-SAT <span>重复生产结构</span></h3>
+            <dl>
+              <dt>为什么选</dt>
+              <dd>量产场景往往重复处理稳定的产品组合。周期模型直接优化稳态节拍，避免把大量相似 wafer 全部展开后再求解。</dd>
+              <dt>预期效果</dt>
+              <dd>在重复性强、批量较大的场景中，求解规模对 wafer 总数更不敏感，有机会更快获得高吞吐调度。</dd>
+              <dt>局限</dt>
+              <dd>启动、稳态和排空需要组合；子问题最优不代表整个有限批次全局最优，对非重复 workload 也不适用。</dd>
+            </dl>
+          </article>
+
+          <article class="algorithm panel-green">
+            <h3>遗传算法 <span>随机化全局搜索</span></h3>
+            <dl>
+              <dt>为什么选</dt>
+              <dd>它不依赖精确模型的证明过程，容易在固定时间内探索不同调度顺序，并通过多次 seed 获得策略多样性。</dd>
+              <dt>预期效果</dt>
+              <dd>适合作为较大问题的可行解来源，也能补充 CP-SAT 未探索到的不同动作轨迹。</dd>
+              <dt>局限</dt>
+              <dd>解质量和稳定性依赖种群、代数与随机 seed；没有下界，无法证明离最优还有多远。</dd>
+            </dl>
+          </article>
+
+          <article class="algorithm panel-red">
+            <h3>分支搜索 <span>有限前瞻决策</span></h3>
+            <dl>
+              <dt>为什么选</dt>
+              <dd>它在每个决策点向前枚举有限步，再执行第一步，行为直观，适合回答“多看几步是否比贪心更好”。</dd>
+              <dt>预期效果</dt>
+              <dd>可提供一个可解释、与在线决策更接近的基线；不同 horizon 能直接体现前瞻深度的收益与代价。</dd>
+              <dt>局限</dt>
+              <dd>搜索树随 horizon 增长很快，局部最优不保证全局质量；有限前瞻仍可能找不到安全延续。</dd>
+            </dl>
+          </article>
+        </div>
+
+        <div class="note">
+          <p><strong>组合这些算法的原因：</strong>CP-SAT 提供质量与证明信息，周期法利用生产结构，遗传算法补充全局随机探索，分支搜索提供可解释的在线决策基线。最终训练数据不必只来自某一个算法，而应从所有合法结果中选择或组合。</p>
+        </div>
+      </section>
+
+      <section id="effects">
+        <h2>5. 这些算法目前效果如何</h2>
+        <p class="section-intro">当前仓库已经完成四类求解路径的可行性和统一验证接入，但尚未在覆盖主要拓扑、Recipe 数和 wafer 规模的统一数据集上完成系统 benchmark。因此，现在可以说明算法机制和适用场景，不能提前宣称哪一种算法整体最好。</p>
+
+        <div class="comparison-summary">
+          <article class="known">
+            <h3>当前已经能够确认</h3>
+            <ul class="compact">
+              <li>四类方法都按照同一物理语义产生完整调度；</li>
+              <li>候选结果都经过同一个严格 Validator；</li>
+              <li>非周期 CP-SAT 可以提供完整问题的下界与最优性状态；</li>
+              <li>周期法可以构造可验证的启动、稳态与排空调度；</li>
+              <li>遗传与分支搜索能够提供不同机制的启发式基线。</li>
+            </ul>
+          </article>
+          <article class="unknown">
+            <h3>当前还不能下结论</h3>
+            <ul class="compact">
+              <li>不同规模下哪种算法的有效解率最高；</li>
+              <li>在相同时间预算下，谁的 makespan 更低；</li>
+              <li>周期法从多大批量开始优于完整展开；</li>
+              <li>遗传算法多 seed 的收益是否值得额外计算；</li>
+              <li>分支搜索增加 horizon 后，质量提升是否抵得上节点增长。</li>
+            </ul>
+          </article>
+        </div>
+
+        <h3 style="margin-top: 28px;">需要验证的工作假设</h3>
+        <ol class="hypotheses">
+          <li><div><strong>小中规模问题中，非周期 CP-SAT 应是解质量和最优性证明的主要来源。</strong><br><span>验证方式：比较 best-makespan win rate、certified gap 和规定预算内的最优率。</span></div></li>
+          <li><div><strong>在重复性强的大批量 workload 中，周期法应比完整展开更容易扩展。</strong><br><span>验证方式：随 wafer 数增加比较运行时间、首次可行解时间与最终 makespan。</span></div></li>
+          <li><div><strong>遗传算法应能较稳定地产生可行解，但质量方差会随 seed 和问题结构变化。</strong><br><span>验证方式：报告多 seed 的中位数、分位数和相对 portfolio best 的 gap。</span></div></li>
+          <li><div><strong>分支搜索的浅 horizon 适合作为快速基线，深 horizon 可能改善局部选择但计算量快速增加。</strong><br><span>验证方式：比较 horizon、展开节点数、运行时间和 makespan 的变化。</span></div></li>
+        </ol>
+
+        <div class="metric-list" aria-label="算法比较指标">
+          <div class="metric"><strong>有效解率</strong><span>在预算内得到合法完整调度的比例</span></div>
+          <div class="metric"><strong>解质量</strong><span>相对 portfolio best 的 makespan gap</span></div>
+          <div class="metric"><strong>首次可行时间</strong><span>多久能产生第一条可用轨迹</span></div>
+          <div class="metric"><strong>最终运行时间</strong><span>达到最终 incumbent 或终止的耗时</span></div>
+          <div class="metric"><strong>证明能力</strong><span>最优率、下界和 certified gap</span></div>
+          <div class="metric"><strong>规模敏感性</strong><span>随 wafer、Route 和拓扑复杂度的退化</span></div>
+        </div>
+      </section>
+
+      <section id="training">
+        <h2>6. 生成的数据怎样用于下一步训练</h2>
+        <p class="section-intro">每个实例最终提供两类信息：一类是问题本身，用于重建调度环境；另一类是经过验证的调度结果，用于提供动作示范、参考 makespan 和经验难度。它们可以分别进入模仿学习、强化学习和评测。</p>
+
+        <div class="grid-2">
+          <article class="panel panel-blue">
+            <h3>从调度结果提取监督信号</h3>
+            <div class="training-step"><b>1</b><div><strong>回放合法调度轨迹</strong><span>在每个决策时刻恢复设备状态与当时的合法动作集合。</span></div></div>
+            <div class="training-step"><b>2</b><div><strong>构造 state–action 样本</strong><span>把 solver 选择的 Pick、Place 或 Advance 作为监督标签。</span></div></div>
+            <div class="training-step"><b>3</b><div><strong>模仿学习预训练</strong><span>先让策略学会基本调度行为，减少 RL 初期的无效探索和死锁。</span></div></div>
+          </article>
+
+          <article class="panel panel-green">
+            <h3>从结果质量提取强化学习信号</h3>
+            <div class="training-step"><b>1</b><div><strong>参考 makespan</strong><span>用当前最好合法解作为实例尺度，构造跨问题可比较的 normalized cost。</span></div></div>
+            <div class="training-step"><b>2</b><div><strong>PPO 继续优化</strong><span>策略不必复制 solver，可以在合法动作空间内寻找比示范更好的动作组合。</span></div></div>
+            <div class="training-step"><b>3</b><div><strong>独立验证策略输出</strong><span>完整 rollout 再经 Validator 检查，评价 success、makespan 与 deadlock。</span></div></div>
+          </article>
+        </div>
+
+        <div class="table-wrap" style="margin-top: 22px;">
+          <table>
+            <thead><tr><th>数据内容</th><th>在训练中的用途</th><th>使用原则</th></tr></thead>
+            <tbody>
+              <tr><td>问题结构</td><td>构造环境状态、异构图和合法动作集合</td><td>策略只看到调度状态，不需要知道标签来自哪个 solver</td></tr>
+              <tr><td>完整合法动作轨迹</td><td>行为克隆、离线预训练、动作价值辅助任务</td><td>可保留多个高质量轨迹，避免只模仿一种调度风格</td></tr>
+              <tr><td>最好合法 makespan</td><td>奖励归一化、模型选择和结果对比</td><td>它是当前已知最好值；没有证明时不能当作真实最优值</td></tr>
+              <tr><td>下界与 gap</td><td>判断参考标签质量，区分“已证明好”和“当前最好”</td><td>只使用完整问题有效下界，不混用周期子问题下界</td></tr>
+              <tr><td>求解状态与耗时</td><td>构造 curriculum，识别对不同算法困难的实例</td><td>难度由实测结果定义，而不是只按 wafer 数预设</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note orange">
+          <p><strong>建议的训练顺序：</strong>先用多算法产生的高质量合法轨迹做行为克隆，使策略掌握基本动作选择；再用 PPO 在环境中优化长期 makespan；最后在未见 Recipe、未见拓扑和更大 workload 上评估泛化。</p>
+        </div>
+      </section>
+
+      <section id="experiment">
+        <h2>7. 下一步最重要的实验</h2>
+        <p class="section-intro">下一阶段的重点不是继续增加 Pipeline 功能，而是用统一实验回答两个问题：四类算法在什么问题上各自有效？这些标签是否真的能提升学习策略？</p>
+
+        <div class="grid-2">
+          <article class="panel panel-blue">
+            <h3>实验 A：求解器横向比较</h3>
+            <ul class="compact">
+              <li>按拓扑、Recipe 数和 wafer 规模分层抽取 pilot；</li>
+              <li>对四类方法设置可比较的时间预算；</li>
+              <li>报告有效解率、makespan gap、首次可行时间和最终耗时；</li>
+              <li>单独分析周期适用场景与一般非周期场景；</li>
+              <li>给出每类问题的 winner 分布，而不是只报全局平均值。</li>
+            </ul>
+          </article>
+          <article class="panel panel-green">
+            <h3>实验 B：标签对训练的贡献</h3>
+            <ul class="compact">
+              <li>从零开始 PPO vs 行为克隆预训练 + PPO；</li>
+              <li>只用单一 solver 轨迹 vs 使用多 solver 高质量轨迹；</li>
+              <li>只用最好轨迹 vs 保留 top-k 多样化轨迹；</li>
+              <li>随机采样训练 vs 按实测难度做 curriculum；</li>
+              <li>比较 success、normalized makespan、deadlock 和 OOD 泛化。</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="note green">
+          <p><strong>最终希望得到的不是“某算法永远最好”，</strong>而是一张问题特征到算法表现的经验地图，以及一套被证明能改善 RL 训练的标签选择策略。</p>
+        </div>
+      </section>
+
+      <section id="boundary">
+        <h2>8. 当前边界与汇报结论</h2>
+        <div class="grid-2">
+          <article class="panel">
+            <h3>当前已经具备</h3>
+            <ul class="compact">
+              <li>有限真实拓扑族上的受控问题生成；</li>
+              <li>Recipe、时间和 workload 的多样化采样；</li>
+              <li>四类调度算法与统一物理合法性验证；</li>
+              <li>将动作轨迹和参考 makespan 接入学习系统的基础条件。</li>
+            </ul>
+          </article>
+          <article class="panel panel-orange">
+            <h3>当前最需要补齐</h3>
+            <ul class="compact">
+              <li>四类算法在统一 pilot 上的系统效果对比；</li>
+              <li>标签质量、多样性与 RL 收敛之间的实证关系；</li>
+              <li>根据真实机台数据调整拓扑和任务采样权重；</li>
+              <li>后续再扩展清洗、LOAD_LOCK、residency 等复杂约束。</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="note">
+          <p><strong>结论：</strong>当前工作的核心价值，是把“接近真实分布的问题生成”“互补算法提供标签”和“学习型调度训练”连接成一个可以验证的研究闭环。下一步的重点应从工程完善转向算法 benchmark 与训练收益验证。</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>本页按当前数据生成 Pipeline 的实现与研究目标整理。算法效果部分明确区分已完成的能力验证、基于机制的工作假设和仍需补充的系统实验。</p>
+    </footer>
+  </div>
+</body>
+</html>
