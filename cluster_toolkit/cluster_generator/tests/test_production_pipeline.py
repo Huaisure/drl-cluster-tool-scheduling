@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import cluster_toolkit.cluster_generator.heuristic as heuristic_module
+import cluster_toolkit.cluster_generator.production as production_module
 from cluster_toolkit.cluster_generator.labeling import (
     SolverTask,
     _write_terminal_failure,
@@ -228,6 +230,87 @@ def test_plan_does_not_depend_on_json_mapping_order(tmp_path: Path) -> None:
     second = materialize_plan(tmp_path / "second", reloaded)
 
     assert first == second
+
+
+def test_plan_uses_bounded_process_pool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _tiny_spec().model_copy(
+        update={"instance_count": 4, "max_parallel_tasks": 4}
+    )
+    observed: dict[str, int] = {}
+
+    class RecordingExecutor:
+        def __init__(self, *, max_workers, mp_context):
+            observed["max_workers"] = max_workers
+            observed["start_method_is_spawn"] = int(
+                mp_context.get_start_method() == "spawn"
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def map(self, function, tasks):
+            materialized_tasks = tuple(tasks)
+            observed["task_count"] = len(materialized_tasks)
+            return map(function, materialized_tasks)
+
+    monkeypatch.setattr(production_module, "ProcessPoolExecutor", RecordingExecutor)
+
+    plan = materialize_plan(tmp_path, spec)
+
+    assert len(plan.entries) == 4
+    assert observed == {
+        "max_workers": 4,
+        "start_method_is_spawn": 1,
+        "task_count": 4,
+    }
+
+
+def test_parallel_plan_matches_single_worker_output(tmp_path: Path) -> None:
+    raw = _tiny_spec().model_dump(mode="python")
+    raw.update({"instance_count": 4, "max_parallel_tasks": 1})
+    serial_spec = ProductionRunSpec.model_validate(raw)
+    raw["max_parallel_tasks"] = 4
+    parallel_spec = ProductionRunSpec.model_validate(raw)
+
+    serial_plan = materialize_plan(tmp_path / "serial", serial_spec)
+    parallel_plan = materialize_plan(tmp_path / "parallel", parallel_spec)
+
+    assert serial_plan == parallel_plan
+    for entry in serial_plan.entries:
+        serial_instance = tmp_path / "serial" / "instances" / entry.instance_id
+        parallel_instance = tmp_path / "parallel" / "instances" / entry.instance_id
+        assert (serial_instance / "problem.json").read_bytes() == (
+            parallel_instance / "problem.json"
+        ).read_bytes()
+        assert (serial_instance / "metadata.json").read_bytes() == (
+            parallel_instance / "metadata.json"
+        ).read_bytes()
+
+
+def test_plan_validates_each_serial_witness_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_suite = heuristic_module.ValidatorSuite
+    validation_count = 0
+
+    class CountingValidatorSuite(original_suite):
+        def validate(self, *args, **kwargs):
+            nonlocal validation_count
+            validation_count += 1
+            return super().validate(*args, **kwargs)
+
+    monkeypatch.setattr(heuristic_module, "ValidatorSuite", CountingValidatorSuite)
+
+    materialize_plan(tmp_path, _tiny_spec())
+
+    assert validation_count == 1
 
 
 def test_run_resume_reduce_and_status_are_idempotent(tmp_path: Path) -> None:

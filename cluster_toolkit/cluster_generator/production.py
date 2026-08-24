@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import random
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-
-from cluster_toolkit.validator import ValidatorSuite
 
 from .corpus import InstanceCorpus, _json_bytes, _write_new_atomic
 from .heuristic import build_safe_reference_schedule
 from .pipeline import GeneratedInstance, InstanceGenerator, PERIODIC_RATIOS
 from .pipeline_catalog import PipelineCatalog
-from .pipeline_models import InstanceGenerationRequest, TopologyTemplate
+from .pipeline_models import (
+    InstanceGenerationRequest,
+    RecipeGenerationProfile,
+    TopologyTemplate,
+)
 from .problem_adapter import to_cluster_problem
 from .production_models import (
     ProductionPlan,
@@ -26,6 +31,21 @@ from .topology_family import (
 
 RUN_SPEC_FILE = "run_spec.json"
 RUN_PLAN_FILE = "plan.json"
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanInstanceTask:
+    run_root: Path
+    run_id: str
+    master_seed: int
+    ordinal: int
+    topology: TopologyTemplate
+    topology_seed: int
+    profile: RecipeGenerationProfile
+    wafer_ranges: dict[str, tuple[int, int]]
+    request: InstanceGenerationRequest
+    periodic_requested: bool
+    route_pattern: str
 
 
 def default_run_id(master_seed: int, instance_count: int) -> str:
@@ -109,19 +129,11 @@ def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> Productio
     else:
         instance_topologies = _assign_instance_topologies(spec, topologies, rng)
 
-    catalog = PipelineCatalog(
-        topologies={topology.topology_id: topology for topology in topologies},
-        profiles={profile.profile_id: profile},
-    )
-    generator = InstanceGenerator(
-        catalog,
-        wafer_ranges={
-            scale: (interval.minimum, interval.maximum)
-            for scale, interval in spec.wafer_ranges.items()
-        },
-    )
-    corpus = InstanceCorpus(root)
-    entries: list[ProductionPlanEntry] = []
+    wafer_ranges = {
+        scale: (interval.minimum, interval.maximum)
+        for scale, interval in spec.wafer_ranges.items()
+    }
+    tasks: list[_PlanInstanceTask] = []
     periodic_count = round(spec.instance_count * spec.periodic_fraction)
     periodic_flags = [True] * periodic_count + [False] * (
         spec.instance_count - periodic_count
@@ -161,50 +173,23 @@ def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> Productio
             periodic_ratio=periodic_ratio,
             route_pattern=route_pattern,
         )
-        generated = generator.generate(request)
-        problem = to_cluster_problem(generated.instance)
-        witness = build_safe_reference_schedule(problem)
-        report = ValidatorSuite(problem).validate(
-            witness.actions,
-            require_complete=True,
-            exact_action_durations=True,
-        )
-        if not report.ok:
-            details = "; ".join(issue.message for issue in report.issues[:8])
-            raise RuntimeError(
-                f"generated instance {generated.instance_id} failed serial witness: "
-                f"{details}"
-            )
-        generated = GeneratedInstance(
-            instance=generated.instance,
-            metadata={
-                **generated.metadata,
-                "generation_validation": "VALID",
-                "serial_witness_saved": False,
-                "topology_cell_count": len(topology.cell_order),
-                "run_id": spec.run_id,
-                "master_seed": spec.master_seed,
-                "generation_ordinal": ordinal,
-                "topology_seed": topology_seeds[topology.topology_id],
-                "topology_archetype_id": topology.archetype_id,
-                "robot_arm_profile_id": topology.arm_profile_id,
-                "instance_seed": request.seed,
-            },
-        )
-        corpus.materialize(generated)
-        entries.append(
-            ProductionPlanEntry(
+        tasks.append(
+            _PlanInstanceTask(
+                run_root=root,
+                run_id=spec.run_id,
+                master_seed=spec.master_seed,
                 ordinal=ordinal,
-                request=request,
-                instance_id=generated.instance_id,
-                topology_cell_count=len(topology.cell_order),
+                topology=topology,
                 topology_seed=topology_seeds[topology.topology_id],
-                topology_archetype_id=topology.archetype_id,
-                robot_arm_profile_id=topology.arm_profile_id,
+                profile=profile,
+                wafer_ranges=wafer_ranges,
+                request=request,
                 periodic_requested=periodic_requested,
                 route_pattern=route_pattern,
             )
         )
+
+    entries = list(_materialize_instance_tasks(tasks, spec.max_parallel_tasks))
 
     plan = ProductionPlan(run_id=spec.run_id, entries=tuple(entries))
     plan_path = root / RUN_PLAN_FILE
@@ -215,6 +200,63 @@ def materialize_plan(run_root: str | Path, spec: ProductionRunSpec) -> Productio
     else:
         _write_new_atomic(plan_path, plan_bytes)
     return plan
+
+
+def _materialize_instance_tasks(
+    tasks: list[_PlanInstanceTask],
+    max_parallel_tasks: int,
+) -> tuple[ProductionPlanEntry, ...]:
+    if len(tasks) <= 1 or max_parallel_tasks == 1:
+        return tuple(_materialize_instance_task(task) for task in tasks)
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=min(max_parallel_tasks, len(tasks)),
+        mp_context=context,
+    ) as executor:
+        return tuple(executor.map(_materialize_instance_task, tasks))
+
+
+def _materialize_instance_task(task: _PlanInstanceTask) -> ProductionPlanEntry:
+    catalog = PipelineCatalog(
+        topologies={task.topology.topology_id: task.topology},
+        profiles={task.profile.profile_id: task.profile},
+    )
+    generated = InstanceGenerator(
+        catalog,
+        wafer_ranges=task.wafer_ranges,
+    ).generate(task.request)
+    problem = to_cluster_problem(generated.instance)
+    # This builder performs the one required strict, complete ValidatorSuite
+    # replay before returning.  The witness is intentionally not persisted.
+    build_safe_reference_schedule(problem)
+    generated = GeneratedInstance(
+        instance=generated.instance,
+        metadata={
+            **generated.metadata,
+            "generation_validation": "VALID",
+            "serial_witness_saved": False,
+            "topology_cell_count": len(task.topology.cell_order),
+            "run_id": task.run_id,
+            "master_seed": task.master_seed,
+            "generation_ordinal": task.ordinal,
+            "topology_seed": task.topology_seed,
+            "topology_archetype_id": task.topology.archetype_id,
+            "robot_arm_profile_id": task.topology.arm_profile_id,
+            "instance_seed": task.request.seed,
+        },
+    )
+    InstanceCorpus(task.run_root).materialize(generated)
+    return ProductionPlanEntry(
+        ordinal=task.ordinal,
+        request=task.request,
+        instance_id=generated.instance_id,
+        topology_cell_count=len(task.topology.cell_order),
+        topology_seed=task.topology_seed,
+        topology_archetype_id=task.topology.archetype_id,
+        robot_arm_profile_id=task.topology.arm_profile_id,
+        periodic_requested=task.periodic_requested,
+        route_pattern=task.route_pattern,
+    )
 
 
 def load_run(run_root: str | Path) -> tuple[ProductionRunSpec, ProductionPlan]:
