@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import copy
+from dataclasses import dataclass
 
 from cluster_toolkit.cluster_engine import (
     ADVANCE,
@@ -12,9 +13,16 @@ from cluster_toolkit.cluster_engine import (
     PickAction,
     PlaceAction,
     RobotState,
-    WaferState,
 )
 from cluster_toolkit.problem import ClusterProblem, ModuleType, TMArmType, WaferKey
+
+
+@dataclass(frozen=True)
+class _PendingContext:
+    robot_ids: frozenset[str]
+    pick_wafer_keys: frozenset[WaferKey]
+    pick_module_ids: frozenset[str]
+    place_wafer_keys_by_module: dict[str, frozenset[WaferKey]]
 
 
 class ActionSafetyFilter:
@@ -52,12 +60,21 @@ class ActionSafetyFilter:
             )
             for robot_id in self._robot_ids
         }
+        self._single_arm_robot_ids = tuple(
+            robot_id
+            for robot_id in self._robot_ids
+            if self._arm_capacities[robot_id] == 1
+        )
         self._transfer_robots_cache: dict[
             tuple[str, int, str, str, str | None],
             frozenset[str],
         ] = {}
         self._cached_state_signature: tuple[object, ...] | None = None
         self._cached_safe_actions: tuple[EngineAction, ...] = ()
+        self._cached_available_state_signature: tuple[object, ...] | None = None
+        self._cached_available_actions: tuple[EngineAction, ...] = ()
+        self._cached_pending_state_revision: int | None = None
+        self._cached_pending_context: _PendingContext | None = None
 
     def available_actions(
         self,
@@ -65,7 +82,20 @@ class ActionSafetyFilter:
     ) -> tuple[EngineAction, ...]:
         """Apply the Env same-Recipe source-wafer admission order."""
 
-        actions = engine.available_actions()
+        return self._available_actions_for_signature(
+            engine,
+            self._state_signature(engine),
+        )
+
+    def _available_actions_for_signature(
+        self,
+        engine: ClusterEngine,
+        state_signature: tuple[object, ...],
+    ) -> tuple[EngineAction, ...]:
+        if state_signature == self._cached_available_state_signature:
+            return self._cached_available_actions
+
+        actions = engine._available_actions(recipe_fifo=True)
         source_picks = [
             action
             for action in actions
@@ -80,7 +110,7 @@ class ActionSafetyFilter:
                 minimum_indexes.get(key, initial.wafer_index),
                 initial.wafer_index,
             )
-        return tuple(
+        admitted = tuple(
             action
             for action in actions
             if not isinstance(action, PickAction)
@@ -93,16 +123,19 @@ class ActionSafetyFilter:
                 )
             ]
         )
+        self._cached_available_state_signature = state_signature
+        self._cached_available_actions = admitted
+        return admitted
 
     def safe_actions(
         self,
         engine: ClusterEngine,
     ) -> tuple[EngineAction, ...]:
-        state_signature = self.state_signature(engine)
+        state_signature = self._state_signature(engine)
         if state_signature == self._cached_state_signature:
             return self._cached_safe_actions
 
-        actions = self.static_safe_actions(engine)
+        actions = self._static_safe_actions(engine, state_signature)
         if self.lookahead_depth == 0:
             safe_actions = actions
         else:
@@ -125,9 +158,19 @@ class ActionSafetyFilter:
         self,
         engine: ClusterEngine,
     ) -> tuple[EngineAction, ...]:
+        return self._static_safe_actions(engine, self._state_signature(engine))
+
+    def _static_safe_actions(
+        self,
+        engine: ClusterEngine,
+        state_signature: tuple[object, ...],
+    ) -> tuple[EngineAction, ...]:
         return tuple(
             action
-            for action in self.available_actions(engine)
+            for action in self._available_actions_for_signature(
+                engine,
+                state_signature,
+            )
             if not isinstance(action, PickAction)
             or (
                 self.robot_can_reach_next_target(engine, action)
@@ -161,11 +204,12 @@ class ActionSafetyFilter:
         watched_module_ids: frozenset[str],
         memo: dict[tuple[object, ...], bool],
     ) -> bool:
+        state_signature = self._state_signature(engine)
         key = (
             focus_robot_id,
             watched_module_ids,
             remaining_by_robot,
-            self.state_signature(engine),
+            state_signature,
         )
         if key in memo:
             return memo[key]
@@ -176,6 +220,7 @@ class ActionSafetyFilter:
             focus_robot_id,
             watched_module_ids,
             memo,
+            state_signature,
         )
         memo[key] = result
         return result
@@ -187,13 +232,14 @@ class ActionSafetyFilter:
         focus_robot_id: str | None,
         watched_module_ids: frozenset[str],
         memo: dict[tuple[object, ...], bool],
+        state_signature: tuple[object, ...],
     ) -> bool:
         if engine.is_complete():
             return True
         if self.has_deadlock_proof(engine):
             return False
 
-        static_actions = self.static_safe_actions(engine)
+        static_actions = self._static_safe_actions(engine, state_signature)
         actions = tuple(
             action
             for action in static_actions
@@ -302,6 +348,26 @@ class ActionSafetyFilter:
         """Return an exact immutable key for one Engine runtime state."""
 
         state = engine.state
+        return ActionSafetyFilter._build_state_signature(
+            state,
+            wafer_keys=tuple(sorted(state.wafers)),
+            robot_ids=tuple(sorted(state.robots)),
+            module_ids=tuple(sorted(state.module_occupants)),
+            load_lock_ids=tuple(sorted(state.load_locks)),
+        )
+
+    def _state_signature(self, engine: ClusterEngine) -> tuple[object, ...]:
+        return engine._state_cache_key()
+
+    @staticmethod
+    def _build_state_signature(
+        state: ClusterState,
+        *,
+        wafer_keys: tuple[WaferKey, ...],
+        robot_ids: tuple[str, ...],
+        module_ids: tuple[str, ...],
+        load_lock_ids: tuple[str, ...],
+    ) -> tuple[object, ...]:
         return (
             state.time,
             tuple(
@@ -311,8 +377,10 @@ class ActionSafetyFilter:
                     wafer.module_id,
                     wafer.robot_id,
                     wafer.ready_at,
+                    wafer.last_place_robot_id,
                 )
-                for wafer_key, wafer in sorted(state.wafers.items())
+                for wafer_key in wafer_keys
+                for wafer in (state.wafers[wafer_key],)
             ),
             tuple(
                 (
@@ -321,13 +389,13 @@ class ActionSafetyFilter:
                     robot.ready_at,
                     tuple(robot.holding),
                 )
-                for robot_id, robot in sorted(state.robots.items())
+                for robot_id in robot_ids
+                for robot in (state.robots[robot_id],)
             ),
             tuple(
                 (module_id, tuple(sorted(occupants)))
-                for module_id, occupants in sorted(
-                    state.module_occupants.items()
-                )
+                for module_id in module_ids
+                for occupants in (state.module_occupants[module_id],)
             ),
             tuple(
                 (
@@ -339,7 +407,8 @@ class ActionSafetyFilter:
                     runtime.occupied_transition_start,
                     runtime.occupied_transition_duration,
                 )
-                for module_id, runtime in sorted(state.load_locks.items())
+                for module_id in load_lock_ids
+                for runtime in (state.load_locks[module_id],)
             ),
             tuple(
                 (
@@ -369,38 +438,30 @@ class ActionSafetyFilter:
     ) -> frozenset[str]:
         """Find full Module sets that one single-arm Robot cannot drain."""
 
-        pending_picks = {
-            operation.wafer_key
-            for operation in engine.state.pending_operations
-            if operation.action_type == "pick"
-        }
-        pending_places = {
-            operation.wafer_key: operation.module_id
-            for operation in engine.state.pending_operations
-            if operation.action_type == "place"
-        }
-        occupants = {
-            module_id: {
+        if not self._single_arm_robot_ids:
+            return frozenset()
+
+        pending = self._pending_context(engine)
+        occupants: dict[str, dict[WaferKey, int]] = {}
+        for module_id, wafer_keys in engine.state.module_occupants.items():
+            wafer_steps = {
                 wafer_key: engine.state.wafers[wafer_key].step_index
                 for wafer_key in wafer_keys
-                if wafer_key not in pending_picks
+                if wafer_key not in pending.pick_wafer_keys
             }
-            for module_id, wafer_keys in engine.state.module_occupants.items()
-        }
-        for wafer_key, module_id in pending_places.items():
-            occupants[module_id][wafer_key] = (
-                engine.state.wafers[wafer_key].step_index + 1
-            )
+            for wafer_key in pending.place_wafer_keys_by_module.get(
+                module_id,
+                (),
+            ):
+                wafer_steps[wafer_key] = (
+                    engine.state.wafers[wafer_key].step_index + 1
+                )
+            if len(wafer_steps) >= self.problem.Modules[module_id].capacity:
+                occupants[module_id] = wafer_steps
 
-        full_modules = {
-            module_id
-            for module_id, wafer_steps in occupants.items()
-            if len(wafer_steps) >= self.problem.Modules[module_id].capacity
-        }
+        full_modules = frozenset(occupants)
         closed_modules: set[str] = set()
-        for robot_id in self._robot_ids:
-            if self._arm_capacities[robot_id] != 1:
-                continue
+        for robot_id in self._single_arm_robot_ids:
             candidates = {
                 module_id
                 for module_id in full_modules
@@ -464,13 +525,17 @@ class ActionSafetyFilter:
         """Return full Robots that remain in a closed resource wait graph."""
 
         holding_overrides = holding_overrides or {}
-        pending_robot_ids = {
-            operation.robot_id
-            for operation in engine.state.pending_operations
-        }
+        if not any(
+            len(holding_overrides.get(robot_id, robot.holding))
+            >= self._arm_capacities[robot_id]
+            for robot_id, robot in engine.state.robots.items()
+        ):
+            return frozenset()
+
+        pending = self._pending_context(engine)
         holding_by_robot: dict[str, tuple[WaferKey, ...]] = {}
         for robot_id, robot in engine.state.robots.items():
-            if robot_id in pending_robot_ids:
+            if robot_id in pending.robot_ids:
                 continue
             holding = holding_overrides.get(robot_id, tuple(robot.holding))
             if len(holding) >= self._arm_capacities[robot_id]:
@@ -487,6 +552,7 @@ class ActionSafetyFilter:
                         wafer_key,
                         blocked_robot_ids,
                         released_wafer_key,
+                        pending,
                     )
                     for wafer_key in holding_by_robot[robot_id]
                 )
@@ -501,6 +567,7 @@ class ActionSafetyFilter:
         wafer_key: WaferKey,
         blocked_robot_ids: set[str],
         released_wafer_key: WaferKey | None,
+        pending: _PendingContext,
     ) -> bool:
         return any(
             self._target_has_external_capacity(
@@ -508,6 +575,7 @@ class ActionSafetyFilter:
                 target_id,
                 blocked_robot_ids,
                 released_wafer_key,
+                pending,
             )
             for target_id in self.next_targets_for_wafer(engine, wafer_key)
         )
@@ -518,19 +586,13 @@ class ActionSafetyFilter:
         module_id: str,
         blocked_robot_ids: set[str],
         released_wafer_key: WaferKey | None,
+        pending: _PendingContext,
     ) -> bool:
-        pending_places = {
-            operation.wafer_key: operation
-            for operation in engine.state.pending_operations
-            if operation.action_type == "place" and operation.module_id == module_id
-        }
-        if any(
-            operation.action_type == "pick" and operation.module_id == module_id
-            for operation in engine.state.pending_operations
-        ):
+        if module_id in pending.pick_module_ids:
             return True
 
         blockers = set(engine.state.module_occupants[module_id])
+        pending_places = pending.place_wafer_keys_by_module.get(module_id, ())
         blockers.update(pending_places)
         if released_wafer_key is not None:
             blockers.discard(released_wafer_key)
@@ -564,12 +626,7 @@ class ActionSafetyFilter:
         wafer = engine.state.wafers[wafer_key]
         module = self.problem.Modules[source_module_id]
         selected_step_index = wafer.step_index if step_index is None else step_index
-        has_pending_place = any(
-            operation.action_type == "place"
-            and operation.module_id == source_module_id
-            and operation.wafer_key == wafer_key
-            for operation in engine.state.pending_operations
-        )
+        has_pending_place = wafer.module_id != source_module_id
         exit_side = (
             engine.state.load_locks[source_module_id].occupied_exit_side
             if module.load_lock is not None
@@ -607,6 +664,41 @@ class ActionSafetyFilter:
                 )
             )
         return self._transfer_robots_cache[key]
+
+    def _pending_context(self, engine: ClusterEngine) -> _PendingContext:
+        state_revision = engine._state_revision
+        if (
+            state_revision == self._cached_pending_state_revision
+            and self._cached_pending_context is not None
+        ):
+            return self._cached_pending_context
+
+        robot_ids: set[str] = set()
+        pick_wafer_keys: set[WaferKey] = set()
+        pick_module_ids: set[str] = set()
+        mutable_places_by_module: dict[str, set[WaferKey]] = {}
+        for operation in engine.state.pending_operations:
+            robot_ids.add(operation.robot_id)
+            if operation.action_type == "pick":
+                pick_wafer_keys.add(operation.wafer_key)
+                pick_module_ids.add(operation.module_id)
+            else:
+                mutable_places_by_module.setdefault(operation.module_id, set()).add(
+                    operation.wafer_key
+                )
+
+        context = _PendingContext(
+            robot_ids=frozenset(robot_ids),
+            pick_wafer_keys=frozenset(pick_wafer_keys),
+            pick_module_ids=frozenset(pick_module_ids),
+            place_wafer_keys_by_module={
+                module_id: frozenset(wafer_keys)
+                for module_id, wafer_keys in mutable_places_by_module.items()
+            },
+        )
+        self._cached_pending_state_revision = state_revision
+        self._cached_pending_context = context
+        return context
 
     def robot_can_reach_next_target(
         self,
@@ -702,18 +794,10 @@ class ActionSafetyFilter:
         state = engine.state
         fork._state = ClusterState(
             time=state.time,
-            wafers={
-                wafer_key: WaferState(
-                    route_id=wafer.route_id,
-                    wafer_index=wafer.wafer_index,
-                    step_index=wafer.step_index,
-                    module_id=wafer.module_id,
-                    robot_id=wafer.robot_id,
-                    ready_at=wafer.ready_at,
-                    return_module_id=wafer.return_module_id,
-                )
-                for wafer_key, wafer in state.wafers.items()
-            },
+            # Wafer records and occupancy sets dominate large-instance fork
+            # cost.  The Engine clones either object on its first mutation,
+            # so speculative lookahead can share the untouched majority.
+            wafers=dict(state.wafers),
             robots={
                 robot_id: RobotState(
                     module_id=robot.module_id,
@@ -722,10 +806,7 @@ class ActionSafetyFilter:
                 )
                 for robot_id, robot in state.robots.items()
             },
-            module_occupants={
-                module_id: set(occupants)
-                for module_id, occupants in state.module_occupants.items()
-            },
+            module_occupants=dict(state.module_occupants),
             load_locks={
                 module_id: LoadLockRuntimeState(
                     last_pick_side=runtime.last_pick_side,
@@ -750,4 +831,6 @@ class ActionSafetyFilter:
                 for operation in state.pending_operations
             ],
         )
+        fork._shared_wafer_keys = set(state.wafers)
+        fork._shared_module_occupant_ids = set(state.module_occupants)
         return fork

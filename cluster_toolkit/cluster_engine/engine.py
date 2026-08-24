@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import count
+
 from cluster_toolkit.problem import (
     ClusterProblem,
     LoadLockState,
@@ -32,6 +34,7 @@ from .state import (
 
 
 EPS = 1e-9
+_STATE_REVISION_COUNTER = count()
 
 
 class ClusterEngine:
@@ -40,7 +43,45 @@ class ClusterEngine:
     def __init__(self, problem: ClusterProblem) -> None:
         self.problem = problem
         self._initial_wafers = problem.initial_state.to_snapshot().wafers_by_key
+        self._wafer_keys = tuple(sorted(self._initial_wafers))
+        self._robot_ids = tuple(sorted(problem.ClusterTool))
+        self._route_visit_counts = {
+            route_id: len(route.visits)
+            for route_id, route in problem.routes.items()
+        }
+        self._arm_capacities = {
+            robot_id: (
+                1
+                if problem.ClusterTool[robot_id].arm_type is TMArmType.SINGLE_ARM
+                else 2
+            )
+            for robot_id in self._robot_ids
+        }
+        self._robot_ids_by_module = {
+            module_id: tuple(
+                robot_id
+                for robot_id in self._robot_ids
+                if module_id in problem.ClusterTool[robot_id].module_ids
+            )
+            for module_id in problem.Modules
+        }
+        source_priorities: dict[int, list[WaferKey]] = {}
+        for wafer_key, initial in self._initial_wafers.items():
+            if (
+                initial.step_index == 0
+                and isinstance(initial.location, ModuleLocation)
+                and problem.Modules[initial.location.module_id].type
+                in {ModuleType.IO, ModuleType.LP}
+            ):
+                source_priorities.setdefault(initial.priority, []).append(wafer_key)
+        self._source_wafer_keys_by_priority = tuple(
+            (priority, tuple(sorted(wafer_keys)))
+            for priority, wafer_keys in sorted(source_priorities.items())
+        )
         self._state: ClusterState | None = None
+        self._state_revision = next(_STATE_REVISION_COUNTER)
+        self._shared_wafer_keys: set[WaferKey] = set()
+        self._shared_module_occupant_ids: set[str] = set()
 
     @property
     def state(self) -> ClusterState:
@@ -117,7 +158,38 @@ class ClusterEngine:
             },
             load_locks=load_locks,
         )
+        self._shared_wafer_keys.clear()
+        self._shared_module_occupant_ids.clear()
+        self._touch_state()
         return self._state
+
+    def _touch_state(self) -> None:
+        self._state_revision = next(_STATE_REVISION_COUNTER)
+
+    def _state_cache_key(self) -> tuple[object, ...]:
+        """Return a compact key for Engine-managed state plus common mutations.
+
+        Pending operations, wafers, occupants, and Load Locks are covered by
+        ``_state_revision``.  Time and Robot fields stay in the key because
+        callers historically adjust those public runtime fields directly in
+        diagnostics and tests.
+        """
+
+        state = self.state
+        return (
+            self._state_revision,
+            state.time,
+            tuple(
+                (
+                    robot_id,
+                    robot.module_id,
+                    robot.ready_at,
+                    tuple(robot.holding),
+                )
+                for robot_id in self._robot_ids
+                for robot in (state.robots[robot_id],)
+            ),
+        )
 
     def load_lock_observation(self, module_id: str) -> LoadLockObservation:
         """Return a model-facing snapshot for one conversion Load Lock.
@@ -170,53 +242,123 @@ class ClusterEngine:
     def available_actions(self) -> tuple[EngineAction, ...]:
         """Return semantic actions allowed by physics and admission priority."""
 
+        return self._available_actions(recipe_fifo=False)
+
+    def _available_actions(
+        self,
+        *,
+        recipe_fifo: bool,
+    ) -> tuple[EngineAction, ...]:
+        """Build actions, optionally applying Env same-Recipe admission early."""
+
         state = self.state
         if self.is_complete():
             return ()
 
-        pick_actions: list[PickAction] = []
+        pending_robot_ids = {
+            operation.robot_id for operation in state.pending_operations
+        }
+        reserved_pick_wafer_keys = {
+            operation.wafer_key
+            for operation in state.pending_operations
+            if operation.action_type == "pick"
+        }
+        reserved_place_counts: dict[str, int] = {}
+        for operation in state.pending_operations:
+            if operation.action_type == "place" and not operation.started:
+                reserved_place_counts[operation.module_id] = (
+                    reserved_place_counts.get(operation.module_id, 0) + 1
+                )
+        idle_robot_ids = {
+            robot_id
+            for robot_id, robot in state.robots.items()
+            if robot_id not in pending_robot_ids
+            and robot.ready_at <= state.time + EPS
+        }
+        pick_capable_robot_ids = {
+            robot_id
+            for robot_id in idle_robot_ids
+            if len(state.robots[robot_id].holding) < self._arm_capacities[robot_id]
+        }
 
-        for wafer_key, wafer in sorted(state.wafers.items()):
-            for robot_id in sorted(state.robots):
-                if not self._can_pick(wafer_key, robot_id):
+        pick_entries: list[tuple[PickAction, bool, int]] = []
+        minimum_source_priority: int | None = None
+        admitted_source_groups: set[tuple[int, str]] = set()
+        candidate_wafer_keys = sorted(
+            wafer_key
+            for occupants in state.module_occupants.values()
+            for wafer_key in occupants
+            if state.wafers[wafer_key].module_id is not None
+        )
+        for wafer_key in candidate_wafer_keys:
+            wafer = state.wafers[wafer_key]
+            module_id = wafer.module_id
+            assert module_id is not None
+            if (
+                wafer.step_index >= self._route_visit_counts[wafer.route_id] + 1
+                or wafer.ready_at > state.time + EPS
+                or wafer_key in reserved_pick_wafer_keys
+            ):
+                continue
+            is_source = self._is_initial_source_wafer(wafer)
+            priority = self._initial_wafer(wafer_key).priority
+            source_group = (priority, wafer.route_id)
+            if recipe_fifo and is_source and source_group in admitted_source_groups:
+                continue
+            source_action_found = False
+            for robot_id in self._robot_ids_by_module[module_id]:
+                if robot_id not in pick_capable_robot_ids:
                     continue
-                pick_actions.append(
-                    PickAction(robot_id=robot_id, wafer_key=wafer_key)
-                )
-
-        source_picks = [
-            action
-            for action in pick_actions
-            if self._is_initial_source_wafer(state.wafers[action.wafer_key])
-        ]
-        if source_picks:
-            minimum_priority = min(
-                self._initial_wafer(action.wafer_key).priority
-                for action in source_picks
-            )
-            pick_actions = [
-                action
-                for action in pick_actions
                 if (
-                    action not in source_picks
-                    or self._initial_wafer(action.wafer_key).priority
-                    == minimum_priority
-                )
-            ]
+                    wafer.last_place_robot_id is not None
+                    and wafer.last_place_robot_id != robot_id
+                    and self.problem.Modules[module_id].type
+                    not in {ModuleType.BUFFER, ModuleType.LL}
+                ):
+                    continue
+                if not self._ll_pick_allowed(module_id, robot_id):
+                    continue
+                action = PickAction(robot_id=robot_id, wafer_key=wafer_key)
+                pick_entries.append((action, is_source, priority))
+                if is_source:
+                    source_action_found = True
+                    minimum_source_priority = (
+                        priority
+                        if minimum_source_priority is None
+                        else min(minimum_source_priority, priority)
+                    )
+            if recipe_fifo and source_action_found:
+                admitted_source_groups.add(source_group)
+
+        pick_actions = [
+            action
+            for action, is_source, priority in pick_entries
+            if not is_source or priority == minimum_source_priority
+        ]
 
         actions: list[EngineAction] = list(pick_actions)
 
-        for robot_id, robot in sorted(state.robots.items()):
+        for robot_id in self._robot_ids:
+            robot = state.robots[robot_id]
+            if robot_id not in idle_robot_ids:
+                continue
             for wafer_key in tuple(robot.holding):
                 wafer = state.wafers[wafer_key]
                 for module_id in self._next_targets(wafer):
-                    if self._can_place(wafer_key, module_id):
-                        actions.append(
-                            PlaceAction(
-                                wafer_key=wafer_key,
-                                target_module_id=module_id,
-                            )
+                    if module_id not in self.problem.ClusterTool[robot_id].module_ids:
+                        continue
+                    occupancy = len(state.module_occupants[module_id])
+                    occupancy += reserved_place_counts.get(module_id, 0)
+                    if occupancy >= self.problem.Modules[module_id].capacity:
+                        continue
+                    if not self._ll_place_allowed(module_id, robot_id):
+                        continue
+                    actions.append(
+                        PlaceAction(
+                            wafer_key=wafer_key,
+                            target_module_id=module_id,
                         )
+                    )
 
         if self.next_event_time() is not None:
             actions.append(ADVANCE)
@@ -225,16 +367,37 @@ class ClusterEngine:
     def step(self, action: EngineAction) -> DispatchRecord | None:
         """Apply one available action to this Engine in place."""
 
-        if action not in self.available_actions():
-            raise IllegalActionError(f"action is not available: {action!r}")
         if isinstance(action, PickAction):
+            if not self._can_pick(action.wafer_key, action.robot_id):
+                raise IllegalActionError(f"action is not available: {action!r}")
+            if not self._source_priority_allows(action):
+                raise IllegalActionError(f"action is not available: {action!r}")
             return self._dispatch_pick(action)
         if isinstance(action, PlaceAction):
+            if not self._can_place(action.wafer_key, action.target_module_id):
+                raise IllegalActionError(f"action is not available: {action!r}")
             return self._dispatch_place(action)
         if isinstance(action, AdvanceAction):
             self._advance()
             return None
         raise TypeError(f"unsupported action: {action!r}")
+
+    def _source_priority_allows(self, action: PickAction) -> bool:
+        wafer = self.state.wafers[action.wafer_key]
+        if not self._is_initial_source_wafer(wafer):
+            return True
+        priority = self._initial_wafer(action.wafer_key).priority
+        for lower_priority, wafer_keys in self._source_wafer_keys_by_priority:
+            if lower_priority >= priority:
+                break
+            for wafer_key in wafer_keys:
+                source = self.state.wafers[wafer_key]
+                if not self._is_initial_source_wafer(source):
+                    continue
+                for robot_id in self._robot_ids_by_module[source.module_id]:
+                    if self._can_pick(wafer_key, robot_id):
+                        return False
+        return True
 
     def next_event_time(self) -> float | None:
         """Return the next future boundary that can change action availability."""
@@ -357,6 +520,7 @@ class ClusterEngine:
         robot.ready_at = end
         state.pending_operations.append(operation)
         self._apply_events_at(state.time)
+        self._touch_state()
         return DispatchRecord(
             action_type="pick",
             robot_id=action.robot_id,
@@ -386,6 +550,7 @@ class ClusterEngine:
         robot.ready_at = end
         state.pending_operations.append(operation)
         self._apply_events_at(state.time)
+        self._touch_state()
         return DispatchRecord(
             action_type="place",
             robot_id=robot_id,
@@ -397,13 +562,17 @@ class ClusterEngine:
         )
 
     def _advance(self) -> None:
-        state = self.state
-        self._apply_events_at(state.time)
+        self._apply_events_at(self.state.time)
         next_time = self.next_event_time()
         if next_time is None:
             raise IllegalActionError("Advance has no future event")
+        self._advance_to(next_time)
+
+    def _advance_to(self, next_time: float) -> None:
+        state = self.state
         state.time = next_time
         self._apply_events_at(next_time)
+        self._touch_state()
 
     def _apply_events_at(self, event_time: float) -> None:
         state = self.state
@@ -440,15 +609,19 @@ class ClusterEngine:
         if operation.action_type == "pick":
             robot.holding.append(operation.wafer_key)
         else:
-            state.module_occupants[operation.module_id].add(operation.wafer_key)
+            self._mutable_module_occupants(operation.module_id).add(
+                operation.wafer_key
+            )
         operation.started = True
 
     def _finish_operation(self, operation: PendingOperation) -> None:
         state = self.state
-        wafer = state.wafers[operation.wafer_key]
+        wafer = self._mutable_wafer(operation.wafer_key)
         robot = state.robots[operation.robot_id]
         if operation.action_type == "pick":
-            state.module_occupants[operation.module_id].remove(operation.wafer_key)
+            self._mutable_module_occupants(operation.module_id).remove(
+                operation.wafer_key
+            )
             wafer.module_id = None
             wafer.robot_id = operation.robot_id
             if operation.module_id in state.load_locks:
@@ -472,6 +645,33 @@ class ClusterEngine:
         wafer.ready_at = operation.end + self._process_time(wafer)
         if operation.module_id in state.load_locks:
             self._configure_occupied_load_lock(operation, wafer)
+
+    def _mutable_wafer(self, wafer_key: WaferKey) -> WaferState:
+        wafer = self.state.wafers[wafer_key]
+        if wafer_key not in self._shared_wafer_keys:
+            return wafer
+        wafer = WaferState(
+            route_id=wafer.route_id,
+            wafer_index=wafer.wafer_index,
+            step_index=wafer.step_index,
+            module_id=wafer.module_id,
+            robot_id=wafer.robot_id,
+            ready_at=wafer.ready_at,
+            return_module_id=wafer.return_module_id,
+            last_place_robot_id=wafer.last_place_robot_id,
+        )
+        self.state.wafers[wafer_key] = wafer
+        self._shared_wafer_keys.remove(wafer_key)
+        return wafer
+
+    def _mutable_module_occupants(self, module_id: str) -> set[WaferKey]:
+        occupants = self.state.module_occupants[module_id]
+        if module_id not in self._shared_module_occupant_ids:
+            return occupants
+        occupants = set(occupants)
+        self.state.module_occupants[module_id] = occupants
+        self._shared_module_occupant_ids.remove(module_id)
+        return occupants
 
     def _configure_occupied_load_lock(
         self,

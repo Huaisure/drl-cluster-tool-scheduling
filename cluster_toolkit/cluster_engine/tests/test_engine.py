@@ -63,6 +63,49 @@ def _advance_until(engine: ClusterEngine, predicate) -> None:
     raise AssertionError("predicate did not become true")
 
 
+def _legacy_available_actions(engine: ClusterEngine):
+    """Reference the original exhaustive action enumeration."""
+
+    state = engine.state
+    if engine.is_complete():
+        return ()
+
+    pick_actions = [
+        PickAction(robot_id=robot_id, wafer_key=wafer_key)
+        for wafer_key in sorted(state.wafers)
+        for robot_id in sorted(state.robots)
+        if engine._can_pick(wafer_key, robot_id)
+    ]
+    source_picks = [
+        action
+        for action in pick_actions
+        if engine._is_initial_source_wafer(state.wafers[action.wafer_key])
+    ]
+    if source_picks:
+        minimum_priority = min(
+            engine._initial_wafer(action.wafer_key).priority
+            for action in source_picks
+        )
+        pick_actions = [
+            action
+            for action in pick_actions
+            if action not in source_picks
+            or engine._initial_wafer(action.wafer_key).priority
+            == minimum_priority
+        ]
+
+    actions = list(pick_actions)
+    for _, robot in sorted(state.robots.items()):
+        for wafer_key in tuple(robot.holding):
+            wafer = state.wafers[wafer_key]
+            for module_id in engine._next_targets(wafer):
+                if engine._can_place(wafer_key, module_id):
+                    actions.append(PlaceAction(wafer_key, module_id))
+    if engine.next_event_time() is not None:
+        actions.append(ADVANCE)
+    return tuple(actions)
+
+
 def test_stateful_dispatch_and_advance_keep_original_travel_semantics() -> None:
     engine = ClusterEngine(_simple_problem())
     state = engine.reset()
@@ -86,6 +129,38 @@ def test_stateful_dispatch_and_advance_keep_original_travel_semantics() -> None:
     assert state.time == 3.0
     assert state.wafers[("A", 0)].robot_id == "TM1"
     assert PlaceAction(("A", 0), "PM1") in engine.available_actions()
+
+
+def test_step_validates_one_action_without_enumerating_the_action_space() -> None:
+    engine = ClusterEngine(_simple_problem(wafer_count=20))
+    engine.reset()
+
+    def fail_if_enumerated():
+        raise AssertionError("step() rebuilt the full action set")
+
+    engine.available_actions = fail_if_enumerated  # type: ignore[method-assign]
+
+    record = engine.step(PickAction("TM1", ("A", 0)))
+
+    assert record is not None
+    assert record.wafer_key == ("A", 0)
+
+
+def test_indexed_action_enumeration_matches_original_exhaustive_semantics() -> None:
+    engine = ClusterEngine(_simple_problem(wafer_count=4, arm_type="dual_arm"))
+    engine.reset()
+
+    for _ in range(500):
+        actions = engine.available_actions()
+        assert actions == _legacy_available_actions(engine)
+        if engine.is_complete():
+            break
+        places = [action for action in actions if isinstance(action, PlaceAction)]
+        engine.step(places[0] if places else actions[0])
+    else:
+        raise AssertionError("comparison episode did not complete")
+
+    assert engine.is_complete()
 
 
 def test_place_explicitly_selects_which_dual_arm_wafer_to_move() -> None:

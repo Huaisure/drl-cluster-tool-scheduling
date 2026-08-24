@@ -5,10 +5,12 @@ from collections import Counter
 import numpy as np
 import pytest
 
+from cluster_rl.action_mask import ActionSafetyFilter
 from cluster_rl.cluster_env import ClusterEnv, LoadLockSide
+from cluster_toolkit.cluster_engine import ADVANCE, ClusterEngine, PickAction
 from cluster_toolkit.problem import parse_problem
-from tests.problem_fixtures import load_lock_problem
 from cluster_toolkit.validator import ValidatorSuite
+from tests.problem_fixtures import load_lock_problem
 
 
 def _raw_problem(
@@ -97,6 +99,12 @@ def test_reset_uses_explicit_pick_place_action_layout_and_static_features() -> N
     assert observation["wafer_index"].tolist() == [0.0, 1.0]
     assert info == {"time": 0.0}
 
+    observation["wafer_priority"][0] = 1.0
+    observation["wafer_index"][0] = 1.0
+    next_observation = env._observation()
+    assert next_observation["wafer_priority"].tolist() == [0.0, 0.0]
+    assert next_observation["wafer_index"].tolist() == [0.0, 1.0]
+
 
 def test_engine_priority_then_env_recipe_index_tie_break() -> None:
     env = ClusterEnv(
@@ -143,6 +151,38 @@ def test_action_decode_and_explicit_place_selects_the_wafer() -> None:
 
     env.step(place_1)
     assert env.actions[-1]["wafer_index"] == 1
+
+
+def test_speculative_engine_fork_is_copy_on_write_and_parent_isolated() -> None:
+    problem = _problem(wafer_routes=("A", "A"), arm_type="dual_arm")
+    engine = ClusterEngine(problem)
+    engine.reset()
+    fork = ActionSafetyFilter.fork_engine(engine)
+    wafer_key = ("A", 0)
+
+    assert fork.state.wafers[wafer_key] is engine.state.wafers[wafer_key]
+    assert fork.state.module_occupants["IO1"] is engine.state.module_occupants["IO1"]
+
+    fork.step(PickAction("TM1", wafer_key))
+    while fork.state.wafers[wafer_key].robot_id is None:
+        fork.step(ADVANCE)
+
+    assert engine.state.time == 0
+    assert not engine.state.pending_operations
+    assert engine.state.wafers[wafer_key].module_id == "IO1"
+    assert wafer_key in engine.state.module_occupants["IO1"]
+    assert fork.state.wafers[wafer_key] is not engine.state.wafers[wafer_key]
+    assert fork.state.module_occupants["IO1"] is not engine.state.module_occupants["IO1"]
+
+
+def test_public_state_signature_tracks_robot_handoff_constraint() -> None:
+    engine = ClusterEngine(_problem())
+    engine.reset()
+    before = ActionSafetyFilter.state_signature(engine)
+
+    engine.state.wafers[("A", 0)].last_place_robot_id = "TM1"
+
+    assert ActionSafetyFilter.state_signature(engine) != before
 
 
 def test_pick_and_advance_preserve_engine_event_boundaries() -> None:

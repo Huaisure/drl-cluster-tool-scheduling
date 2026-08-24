@@ -100,6 +100,10 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
             problem.return_module_id(snapshot.wafers_by_key[key])
             for key in self._wafer_keys
         )
+        self._normalized_priority_values = self._build_normalized_priorities()
+        self._normalized_wafer_index_values = (
+            self._build_normalized_wafer_indexes()
+        )
 
         wafer_count = len(self._wafer_keys)
         robot_count = len(self._robot_ids)
@@ -411,6 +415,9 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         }
 
     def _normalized_priorities(self) -> np.ndarray:
+        return self._normalized_priority_values.copy()
+
+    def _build_normalized_priorities(self) -> np.ndarray:
         priorities = np.asarray(
             [self._initial_wafers[key].priority for key in self._wafer_keys],
             dtype=np.float32,
@@ -419,6 +426,9 @@ class ClusterEnv(gym.Env[dict[str, Any], int]):
         return priorities / max(1.0, maximum)
 
     def _normalized_wafer_indexes(self) -> np.ndarray:
+        return self._normalized_wafer_index_values.copy()
+
+    def _build_normalized_wafer_indexes(self) -> np.ndarray:
         recipe_maximums: dict[str, int] = {}
         for route_id, wafer_index in self._wafer_keys:
             recipe_maximums[route_id] = max(

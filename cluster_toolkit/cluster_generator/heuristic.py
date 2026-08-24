@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cluster_toolkit.cluster_engine import ADVANCE, ClusterEngine, PickAction, PlaceAction
+from cluster_toolkit.cluster_engine import (
+    ADVANCE,
+    ClusterEngine,
+    EngineAction,
+    PickAction,
+    PlaceAction,
+)
 from cluster_toolkit.problem import ClusterProblem, ModuleType, WaferKey
 from cluster_toolkit.validator import ValidatorSuite
 
@@ -68,24 +74,26 @@ def build_safe_reference_schedule(problem: ClusterProblem) -> HeuristicResult:
                 pm_loads[target_module] += float(visit.process_time or 0.0)
 
             pick = PickAction(robot_id=robot_id, wafer_key=key)
-            _advance_for_action(engine, pick)
-            legal_action_counts.append(len(engine.available_actions()))
+            available = _advance_for_action(engine, pick)
+            legal_action_counts.append(len(available))
             pick_record = engine.step(pick)
             assert pick_record is not None
             actions.append(pick_record.to_dict())
             while state.wafers[key].robot_id is None:
-                if ADVANCE not in engine.available_actions():
+                available = engine.available_actions()
+                if ADVANCE not in available:
                     raise RuntimeError(f"reference scheduler cannot finish Pick for {key!r}")
                 engine.step(ADVANCE)
 
             place = PlaceAction(wafer_key=key, target_module_id=target_module)
-            _advance_for_action(engine, place)
-            legal_action_counts.append(len(engine.available_actions()))
+            available = _advance_for_action(engine, place)
+            legal_action_counts.append(len(available))
             place_record = engine.step(place)
             assert place_record is not None
             actions.append(place_record.to_dict())
             while state.wafers[key].module_id != target_module:
-                if ADVANCE not in engine.available_actions():
+                available = engine.available_actions()
+                if ADVANCE not in available:
                     raise RuntimeError(f"reference scheduler cannot finish Place for {key!r}")
                 engine.step(ADVANCE)
 
@@ -165,11 +173,12 @@ def _select_transfer(
 def _advance_for_action(
     engine: ClusterEngine,
     action: PickAction | PlaceAction,
-) -> None:
+) -> tuple[EngineAction, ...]:
     for _ in range(100_000):
-        if action in engine.available_actions():
-            return
-        if ADVANCE not in engine.available_actions():
+        available = engine.available_actions()
+        if action in available:
+            return available
+        if ADVANCE not in available:
             raise RuntimeError(f"safe heuristic cannot dispatch action: {action!r}")
         engine.step(ADVANCE)
     raise RuntimeError(f"safe heuristic timed out waiting for action: {action!r}")

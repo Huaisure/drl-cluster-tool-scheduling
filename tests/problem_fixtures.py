@@ -44,6 +44,9 @@ def load_lock_problem() -> ClusterProblem:
                 "A": [
                     {"module_id": "LL1", "process_time": 0},
                     {"module_id": "PM1", "process_time": 0},
+                    # Return through the Load Lock; VTM cannot hand the wafer
+                    # directly to ATM or reach IO1.
+                    {"module_id": "LL1", "process_time": 0},
                 ]
             },
             "initial_state": {
