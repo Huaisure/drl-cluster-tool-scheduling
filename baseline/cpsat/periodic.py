@@ -47,7 +47,7 @@ from .transitions import TransitionSolveResult, solve_closedown, solve_startup
 
 
 SOLVER_NAME = "cpsat_periodic"
-SOLVER_VERSION = "0.2.0"
+SOLVER_VERSION = "0.2.1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1103,6 +1103,18 @@ def _select_cycle_boundaries(
             repeat_count,
             rotated,
         )
+        # A feasible cyclic incumbent can place an entire ratio batch inside
+        # one period.  That finite unroll is valid, but it has no explicit
+        # boundary transition and therefore does not satisfy this solver's
+        # explicit startup + closedown result contract.  A short finite batch
+        # may legitimately have no steady actions, so only the two transitions
+        # are required here.  CP-SAT may return a zero-depth incumbent on one
+        # platform and an overlapping one on another, so enforce the contract
+        # before ranking candidates by makespan.
+        if depth <= 0 or any(
+            phase_counts[phase] <= 0 for phase in ("startup", "closedown")
+        ):
+            continue
         report = ValidatorSuite(problem).validate(
             actions,
             require_complete=True,

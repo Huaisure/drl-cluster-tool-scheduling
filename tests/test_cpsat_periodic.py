@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import baseline.cpsat.periodic as periodic_module
 from baseline.cpsat import (
     periodic_ratio,
     solve_cpsat_instance,
@@ -102,6 +105,80 @@ def test_periodic_pipeline_materializes_valid_startup_steady_and_closedown(
         item.wafer_count * (len(problem.routes[item.recipe_id].visits) + 1)
         for item in instance.workload
     )
+
+
+def test_boundary_selection_rejects_empty_transition_phases(
+    generator: InstanceGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = _periodic_instance(
+        generator,
+        recipe_count=1,
+        ratio=(1,),
+        seed=5,
+    )
+    solved = periodic_module._SolvedCycle(
+        status="FEASIBLE",
+        period=10,
+        best_bound=5,
+        runtime_seconds=0.1,
+        actions=(
+            {"start": 0, "end": 1},
+            {"start": 2, "end": 3},
+        ),
+        transfer_wraps={},
+        process_wraps={},
+    )
+
+    def fake_rotate(instance, ratio, solved, shift):
+        del instance, ratio
+        return replace(
+            solved,
+            actions=({"start": shift, "end": shift + 1, "shift": shift},),
+        )
+
+    def fake_materialize(instance, ratio, repeat_count, solved):
+        del instance, ratio, repeat_count
+        shift = int(solved.actions[0]["shift"])
+        if shift == 0:
+            return (
+                ({"start": 0, "end": 1},),
+                {"startup": 0, "steady": 1, "closedown": 0},
+                0,
+            )
+        return (
+            ({"start": 0, "end": 10 + shift},),
+            {"startup": 1, "steady": 1, "closedown": 1},
+            1,
+        )
+
+    class AlwaysValid:
+        def __init__(self, problem):
+            del problem
+
+        def validate(self, actions, **kwargs):
+            del actions, kwargs
+            return SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(periodic_module, "_rotate_cycle_boundary", fake_rotate)
+    monkeypatch.setattr(
+        periodic_module,
+        "_materialize_finite_schedule",
+        fake_materialize,
+    )
+    monkeypatch.setattr(periodic_module, "ValidatorSuite", AlwaysValid)
+
+    candidates, _ = periodic_module._select_cycle_boundaries(
+        instance,
+        (1,),
+        3,
+        solved,
+    )
+
+    assert candidates
+    assert all(candidate.pipeline_depth > 0 for candidate in candidates)
+    assert all(candidate.phase_counts["startup"] > 0 for candidate in candidates)
+    assert all(candidate.phase_counts["closedown"] > 0 for candidate in candidates)
 
 
 def test_unsupported_ratio_is_skipped_and_portfolio_uses_direct(
