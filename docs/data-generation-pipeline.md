@@ -461,6 +461,18 @@ python -m cluster_toolkit.run_data_pipeline status datasets/raw/run-001
 python -m cluster_toolkit.run_data_pipeline resume datasets/raw/run-001
 ```
 
+Labeling 支持按求解器分阶段执行。下面先生成遗传算法和分支搜索的可行轨迹，后续再向同一批不可变 instance 中补充 CP-SAT 结果：
+
+```bash
+python -m cluster_toolkit.run_data_pipeline run datasets/raw/run-001 \
+  --solvers genetic branch_search
+python -m cluster_toolkit.run_data_pipeline resume datasets/raw/run-001 \
+  --solvers cpsat_direct cpsat_periodic
+python -m cluster_toolkit.run_data_pipeline reduce datasets/raw/run-001
+```
+
+各求解器写入独立 solution 目录；`resume` 跳过已经存在的 attempt，`reduce` 始终聚合磁盘上的全部结果，因此后补 CP-SAT 不会覆盖或浪费已有启发式结果。`status --solvers ...` 可查看单个阶段的完成状态，不带 `--solvers` 时仍检查全部求解器。
+
 对一个已物化 canonical problem 自动选择 CP-SAT 方法并输出完整动作：
 
 ```bash

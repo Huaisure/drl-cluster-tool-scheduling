@@ -8,7 +8,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from baseline.branch_search import (
     SOLVER_VERSION as BRANCH_SEARCH_VERSION,
@@ -48,12 +48,24 @@ from .solutions import (
 
 VALIDATOR_NAME = "validator_suite"
 VALIDATOR_VERSION = "2.0.0"
+SolverName = Literal[
+    "cpsat_direct",
+    "cpsat_periodic",
+    "genetic",
+    "branch_search",
+]
+ALL_SOLVERS: tuple[SolverName, ...] = (
+    "cpsat_direct",
+    "cpsat_periodic",
+    "genetic",
+    "branch_search",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class SolverTask:
     instance_id: str
-    solver_name: Literal["cpsat_direct", "cpsat_periodic", "genetic", "branch_search"]
+    solver_name: SolverName
     attempt: Literal["short", "long"]
     seed: int
     time_limit_seconds: float
@@ -88,14 +100,19 @@ class SolverTask:
         return self.time_limit_seconds
 
 
-def run_labeling(run_root: str | Path) -> dict[str, int]:
-    """Run every missing short attempt, eligible promotion, then reduce."""
+def run_labeling(
+    run_root: str | Path,
+    *,
+    solvers: Sequence[str] | None = None,
+) -> dict[str, int]:
+    """Run selected missing attempts, eligible promotions, then reduce."""
 
     root = Path(run_root)
     spec, plan = load_run(root)
-    short_tasks = _short_tasks(root, spec, plan)
+    selected_solvers = _normalize_solvers(solvers)
+    short_tasks = _short_tasks(root, spec, plan, selected_solvers)
     short_completed = _run_tasks(root, spec, short_tasks)
-    long_tasks = _long_tasks(root, spec, plan)
+    long_tasks = _long_tasks(root, spec, plan, selected_solvers)
     long_completed = _run_tasks(root, spec, long_tasks)
     reduced = reduce_run(root)
     return {
@@ -113,11 +130,16 @@ def reduce_run(run_root: str | Path) -> int:
     return len(plan.entries)
 
 
-def run_status(run_root: str | Path) -> dict[str, object]:
+def run_status(
+    run_root: str | Path,
+    *,
+    solvers: Sequence[str] | None = None,
+) -> dict[str, object]:
     root = Path(run_root)
     spec, plan = load_run(root)
-    short = _short_tasks(root, spec, plan)
-    long = _long_tasks(root, spec, plan)
+    selected_solvers = _normalize_solvers(solvers)
+    short = _short_tasks(root, spec, plan, selected_solvers)
+    long = _long_tasks(root, spec, plan, selected_solvers)
     expected = [*short, *long]
     existing = sum(_record_path(root, task).is_file() for task in expected)
     usable = 0
@@ -131,6 +153,7 @@ def run_status(run_root: str | Path) -> dict[str, object]:
         quarantined += bool(index.get("quarantined"))
     return {
         "run_id": spec.run_id,
+        "solvers": list(selected_solvers),
         "instance_count": len(plan.entries),
         "expected_attempt_count": len(expected),
         "terminal_attempt_count": existing,
@@ -145,21 +168,27 @@ def _short_tasks(
     root: Path,
     spec: ProductionRunSpec,
     plan: ProductionPlan,
+    solvers: Sequence[SolverName] = ALL_SOLVERS,
 ) -> list[SolverTask]:
+    selected = frozenset(solvers)
     tasks: list[SolverTask] = []
     for entry in plan.entries:
-        tasks.append(
-            SolverTask(
-                instance_id=entry.instance_id,
-                solver_name="cpsat_direct",
-                attempt="short",
-                seed=0,
-                time_limit_seconds=spec.budgets.direct_short_seconds,
-                num_search_workers=spec.cpsat_workers,
+        if "cpsat_direct" in selected:
+            tasks.append(
+                SolverTask(
+                    instance_id=entry.instance_id,
+                    solver_name="cpsat_direct",
+                    attempt="short",
+                    seed=0,
+                    time_limit_seconds=spec.budgets.direct_short_seconds,
+                    num_search_workers=spec.cpsat_workers,
+                )
             )
-        )
         instance = _load_instance(root, entry.instance_id)
-        if periodic_ratio(instance) is not None:
+        if (
+            "cpsat_periodic" in selected
+            and periodic_ratio(instance) is not None
+        ):
             tasks.append(
                 SolverTask(
                     instance_id=entry.instance_id,
@@ -178,27 +207,29 @@ def _short_tasks(
                     num_search_workers=spec.cpsat_workers,
                 )
             )
-        for seed in spec.genetic_seeds:
-            tasks.append(
-                SolverTask(
-                    instance_id=entry.instance_id,
-                    solver_name="genetic",
-                    attempt="short",
-                    seed=seed,
-                    time_limit_seconds=spec.budgets.genetic_seconds,
+        if "genetic" in selected:
+            for seed in spec.genetic_seeds:
+                tasks.append(
+                    SolverTask(
+                        instance_id=entry.instance_id,
+                        solver_name="genetic",
+                        attempt="short",
+                        seed=seed,
+                        time_limit_seconds=spec.budgets.genetic_seconds,
+                    )
                 )
-            )
-        for horizon in spec.branch_search_horizons:
-            tasks.append(
-                SolverTask(
-                    instance_id=entry.instance_id,
-                    solver_name="branch_search",
-                    attempt="short",
-                    seed=0,
-                    planning_horizon=horizon,
-                    time_limit_seconds=spec.budgets.branch_search_seconds,
+        if "branch_search" in selected:
+            for horizon in spec.branch_search_horizons:
+                tasks.append(
+                    SolverTask(
+                        instance_id=entry.instance_id,
+                        solver_name="branch_search",
+                        attempt="short",
+                        seed=0,
+                        planning_horizon=horizon,
+                        time_limit_seconds=spec.budgets.branch_search_seconds,
+                    )
                 )
-            )
     return tasks
 
 
@@ -206,22 +237,26 @@ def _long_tasks(
     root: Path,
     spec: ProductionRunSpec,
     plan: ProductionPlan,
+    solvers: Sequence[SolverName] = ALL_SOLVERS,
 ) -> list[SolverTask]:
+    selected = frozenset(solvers)
     tasks: list[SolverTask] = []
     for entry in plan.entries:
         instance = _load_instance(root, entry.instance_id)
         eligible = periodic_ratio(instance) is not None
-        direct_short = _load_record(
-            root,
-            SolverTask(
-                instance_id=entry.instance_id,
-                solver_name="cpsat_direct",
-                attempt="short",
-                seed=0,
-                time_limit_seconds=spec.budgets.direct_short_seconds,
-                num_search_workers=spec.cpsat_workers,
-            ),
-        )
+        direct_short = None
+        if "cpsat_direct" in selected:
+            direct_short = _load_record(
+                root,
+                SolverTask(
+                    instance_id=entry.instance_id,
+                    solver_name="cpsat_direct",
+                    attempt="short",
+                    seed=0,
+                    time_limit_seconds=spec.budgets.direct_short_seconds,
+                    num_search_workers=spec.cpsat_workers,
+                ),
+            )
         if (
             not eligible
             and direct_short is not None
@@ -240,7 +275,7 @@ def _long_tasks(
                     num_search_workers=spec.cpsat_workers,
                 )
             )
-        if eligible:
+        if "cpsat_periodic" in selected and eligible:
             periodic_short_task = SolverTask(
                 instance_id=entry.instance_id,
                 solver_name="cpsat_periodic",
@@ -284,6 +319,20 @@ def _long_tasks(
                     )
                 )
     return tasks
+
+
+def _normalize_solvers(
+    solvers: Sequence[str] | None,
+) -> tuple[SolverName, ...]:
+    if solvers is None:
+        return ALL_SOLVERS
+    requested = frozenset(solvers)
+    if not requested:
+        raise ValueError("at least one solver must be selected")
+    unknown = requested - frozenset(ALL_SOLVERS)
+    if unknown:
+        raise ValueError(f"unknown solvers: {', '.join(sorted(unknown))}")
+    return tuple(solver for solver in ALL_SOLVERS if solver in requested)
 
 
 def _run_tasks(

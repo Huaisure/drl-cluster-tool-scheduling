@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from cluster_toolkit.cluster_generator.labeling import (
+    ALL_SOLVERS,
     reduce_run,
     run_labeling,
     run_status,
@@ -49,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("run", "resume", "reduce", "status"):
         command = commands.add_parser(name)
         command.add_argument("run_root", type=Path)
+        if name != "reduce":
+            command.add_argument(
+                "--solvers",
+                nargs="+",
+                choices=ALL_SOLVERS,
+                help="run or inspect only these solvers (default: all)",
+            )
     return parser
 
 
@@ -91,11 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "run_root": str(args.output),
         }
     elif args.command in {"run", "resume"}:
-        result = run_labeling(args.run_root)
+        result = run_labeling(args.run_root, solvers=args.solvers)
     elif args.command == "reduce":
         result = {"instances_reduced": reduce_run(args.run_root)}
     else:
-        result = run_status(args.run_root)
+        result = run_status(args.run_root, solvers=args.solvers)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

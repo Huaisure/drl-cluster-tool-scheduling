@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 import cluster_toolkit.cluster_generator.heuristic as heuristic_module
 import cluster_toolkit.cluster_generator.production as production_module
+from cluster_toolkit.run_data_pipeline import build_parser
 from cluster_toolkit.cluster_generator.labeling import (
     SolverTask,
     _write_terminal_failure,
@@ -327,6 +328,71 @@ def test_run_resume_reduce_and_status_are_idempotent(tmp_path: Path) -> None:
     assert second["short_tasks_completed"] == 0
     assert second["long_tasks_completed"] == 0
     assert reduce_run(tmp_path) == 1
+
+
+def test_labeling_can_backfill_cpsat_without_rewriting_heuristic_results(
+    tmp_path: Path,
+) -> None:
+    plan = materialize_plan(tmp_path, _tiny_spec())
+    instance_id = plan.entries[0].instance_id
+
+    heuristic_result = run_labeling(
+        tmp_path,
+        solvers=("genetic", "branch_search"),
+    )
+    heuristic_status = run_status(
+        tmp_path,
+        solvers=("genetic", "branch_search"),
+    )
+    overall_before = run_status(tmp_path)
+    heuristic_files = sorted(
+        path
+        for solver in ("genetic", "branch_search")
+        for path in (
+            tmp_path / "instances" / instance_id / "solutions" / solver
+        ).glob("*")
+    )
+    heuristic_bytes = {path: path.read_bytes() for path in heuristic_files}
+
+    cpsat_result = run_labeling(
+        tmp_path,
+        solvers=("cpsat_direct", "cpsat_periodic"),
+    )
+    cpsat_status = run_status(
+        tmp_path,
+        solvers=("cpsat_direct", "cpsat_periodic"),
+    )
+    overall_after = run_status(tmp_path)
+
+    assert heuristic_result["short_tasks_completed"] == 4
+    assert heuristic_status["complete"] is True
+    assert heuristic_status["solvers"] == ["genetic", "branch_search"]
+    assert overall_before["complete"] is False
+    assert cpsat_result["short_tasks_completed"] == 1
+    assert cpsat_status["complete"] is True
+    assert overall_after["complete"] is True
+    assert heuristic_bytes
+    assert all(
+        path.read_bytes() == payload
+        for path, payload in heuristic_bytes.items()
+    )
+
+
+def test_run_cli_accepts_solver_subset() -> None:
+    args = build_parser().parse_args(
+        ["run", "run-directory", "--solvers", "genetic", "branch_search"]
+    )
+
+    assert args.solvers == ["genetic", "branch_search"]
+
+
+def test_status_rejects_unknown_or_empty_solver_selection(tmp_path: Path) -> None:
+    materialize_plan(tmp_path, _tiny_spec())
+
+    with pytest.raises(ValueError, match="at least one solver"):
+        run_status(tmp_path, solvers=())
+    with pytest.raises(ValueError, match="unknown solvers: mystery"):
+        run_status(tmp_path, solvers=("mystery",))
 
 
 def test_load_run_accepts_schema_v1_plan_without_topology_seed(
