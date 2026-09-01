@@ -414,7 +414,8 @@ Place：
 Conversion LL 编译为：
 
 - slot capacity resource；
-- atmosphere/vacuum/transitioning 状态变量；
+- 正交的压力状态：稳定压力位 `atmosphere/vacuum` 与转换过程 `idle/pumping/venting`；
+- wafer/slot 级的 cooling 或 thermal-readiness 状态，它可以与压力转换并行推进；
 - Pump 和 Vent Operator；
 - Pick/Place 的 side guard；
 - transition interval 对 LL/interface 的独占 claim；
@@ -422,6 +423,8 @@ Conversion LL 编译为：
 - 根据 route candidate side 产生的 obligation。
 
 IR 和 Schedule 中保留显式 Pump/Vent 事件。策略侧可以使用 transport macro Intent，但 Kernel 展开后仍生成完整事件，避免 Validator 看不到状态转换。
+
+压力转换与 wafer cooling 不能合并成一个 LL 枚举状态。比如 wafer 在 LL 中冷却时可以同时 Pump；`cooling.end` 和 `Pump.end` 分别更新各自的状态轴。只有具体设备禁止二者重叠时，才通过共享 resource claim 或 invariant 表达该限制，而不是增加 `pumping_and_cooling` 一类特殊状态或模型分支。
 
 Vacuum transfer LL 不包含 atmosphere/vacuum transition，只保留普通容量和可选 hold/cool obligation。
 
@@ -1099,4 +1102,3 @@ Constraint IR v1
 - [Graph Neural Networks are Dynamic Programmers](https://proceedings.neurips.cc/paper_files/paper/2022/hash/8248b1ded388fcdbbd121bcdfea3068c-Abstract-Conference.html)：图网络与动态规划式算法推理的结构关系。
 - [Conservative Q-Learning for Offline Reinforcement Learning](https://proceedings.neurips.cc/paper/2020/hash/0d2b2061826a5df3221116a5085a6052-Abstract.html)：静态数据离线 RL 的分布外价值高估问题。
 - [OR-Tools CP-SAT model interface](https://github.com/google/or-tools/blob/stable/ortools/sat/cp_model.h)：interval、NoOverlap、Cumulative 和 Automaton 等可组合约束原语。
-
