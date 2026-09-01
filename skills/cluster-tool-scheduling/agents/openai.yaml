@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cluster Tool Scheduling"
+  short_description: "Cluster tool scheduling rules"
+  default_prompt: "Use $cluster-tool-scheduling to analyze a cluster tool scheduling task."
