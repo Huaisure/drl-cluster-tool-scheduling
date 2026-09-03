@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any
+
+
+class DiagnosticCode(str, Enum):
+    UNSUPPORTED_FEATURE = "UNSUPPORTED_FEATURE"
+    INVALID_PROBLEM = "INVALID_PROBLEM"
+    TIME_PRECISION_LOSS = "TIME_PRECISION_LOSS"
+    INVALID_TIME_VALUE = "INVALID_TIME_VALUE"
+    UNKNOWN_REFERENCE = "UNKNOWN_REFERENCE"
+    TYPE_MISMATCH = "TYPE_MISMATCH"
+    CONFLICTING_EFFECTS = "CONFLICTING_EFFECTS"
+    RESOURCE_OVER_CAPACITY = "RESOURCE_OVER_CAPACITY"
+    DEADLINE_MISSED = "DEADLINE_MISSED"
+    INVALID_LEASE = "INVALID_LEASE"
+    INVALID_SCHEDULE = "INVALID_SCHEDULE"
+    MISSING_AUTOMATIC_EVENT = "MISSING_AUTOMATIC_EVENT"
+    OPERATOR_CONFORMANCE_MISMATCH = "OPERATOR_CONFORMANCE_MISMATCH"
+    ALTERNATIVE_GROUP_CONFLICT = "ALTERNATIVE_GROUP_CONFLICT"
+    EFFECT_DIGEST_MISMATCH = "EFFECT_DIGEST_MISMATCH"
+    SNAPSHOT_PROBLEM_MISMATCH = "SNAPSHOT_PROBLEM_MISMATCH"
+    SNAPSHOT_STATE_MISMATCH = "SNAPSHOT_STATE_MISMATCH"
+    NON_TERMINAL_STATE = "NON_TERMINAL_STATE"
+    STALE_FRAME = "STALE_FRAME"
+    INTENT_NOT_COMMITTABLE = "INTENT_NOT_COMMITTABLE"
+    UNDER_SPECIFIED_PRIORITY = "UNDER_SPECIFIED_PRIORITY"
+    CANDIDATE_DIGEST_MISMATCH = "CANDIDATE_DIGEST_MISMATCH"
+    CHOICE_SCOPE_CONFLICT = "CHOICE_SCOPE_CONFLICT"
+    COMMIT_LOG_MISMATCH = "COMMIT_LOG_MISMATCH"
+
+
+class SemanticError(ValueError):
+    """Stable, structured failure raised by the reference semantic kernel."""
+
+    def __init__(
+        self,
+        code: DiagnosticCode,
+        message: str,
+        *,
+        path: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.details = {} if details is None else dict(details)

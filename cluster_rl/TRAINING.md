@@ -1,5 +1,7 @@
 # HGT + Transformer Decoder PPO 训练
 
+本文描述旧业务图模型。新的通用 Constraint IR 环境、匿名图模型和 PPO 入口已可运行，见 [ir/README.md](ir/README.md)；命令为 `python -m cluster_rl.ir.train`。两者共用 `cluster_rl/ppo.py` 的优势估计和裁剪损失，但输入协议与 checkpoint 不兼容。
+
 模型以 `ClusterHeteroGraphBuilder` 生成的异构图作为唯一状态输入：
 
 1. HGT encoder 在 `global`、`wafer`、`route_step`、`module` 和 `robot`

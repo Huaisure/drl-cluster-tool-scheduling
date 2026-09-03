@@ -11,7 +11,7 @@
 3. **Pump/Vent 在内部 Schedule 中显式存在**：模型可以选择较高层的 transport Intent（运输意图），但 Kernel 必须展开出可审计的 Pump/Vent 事件和区间。
 4. **Clean 在内部 Schedule 中显式存在**：清洗不是隐藏的时间修正或 reward penalty，而是具有资源占用、前置条件、效果和可验证边界的真实事件。
 5. **Process 是 Kernel 自动创建的显式区间**：它出现在状态和 Schedule 中，但不是策略直接选择的动作。满足 Place 等触发条件后，由 Kernel 按 IR 自动创建。
-6. **Pick/Place 采用 Multi-boundary Operator（多边界算子）**：策略提交一个完整运输 Intent，语义层一次性检查并承诺其声明的移动、资源预留和操作边界；模型不逐个控制内部边界。
+6. **Pick/Place 采用 Multi-boundary Operator（多边界算子）**：策略提交一个完整的 Operator boundary bundle，语义层一次性检查并承诺其声明的移动、资源预留和操作边界；模型不逐个控制内部边界。bundle 可以是 Direct transfer、Prefetch、Place continuation 或 Exchange；“完整”指全部声明边界被原子承诺，不要求每片 wafer 都在该 Intent 结束时到达 Module。
 
 这六项决策共同定义了一个关键边界：模型决定“承诺哪个通用意图”，Kernel 决定“该意图依法产生哪些物理事件”。
 
@@ -39,44 +39,56 @@ S = EquipmentState
 
 新增约束应优先编译成这些原语的组合，而不是增加模型特有的动作类型或神经网络分支。
 
-## 3. Load Lock 的正交状态
+## 3. 最少事实与通用活动（收敛后的合同）
 
-LL（Load Lock，装载锁）的压力变化与 wafer（晶圆）的冷却/热稳定过程必须分开建模。一个建议的最小状态分解是：
+持久动态事实只分为三类，另外保留时间与已承诺的事件/区间：
 
-```text
-LoadLock:
-  pressure_level      ∈ {atmosphere, vacuum}
-  pressure_transition ∈ {idle, pumping, venting}
-  slot_occupancy      : slot -> optional wafer_id
+| 基础 | 含义 | 例子 |
+|---|---|---|
+| StateCell（状态值） | 无法从其他记录推导、且后续约束确实需要的事实 | 压力值、工艺进度、累计使用次数 |
+| Lease（持有关系） | 谁持续占有哪个资源、多少容量 | 晶圆在槽位上、手臂持有晶圆 |
+| Obligation（待办要求） | 已产生但尚未满足的要求，可有截止时间 | 后续必须取走晶圆、必须完成某项维护 |
 
-WaferInLoadLock:
-  thermal_phase       ∈ {not_required, cooling, ready}
-  cooling_end_tick    : optional Tick
-```
+“正在运行”从 `[start,end)` 区间推导；“已经结束”从对应实例的结束边界推导，不能仅凭当前没有活动就判定已完成，因为它也可能尚未开始。Reservation 从已承诺的资源使用推导，不再建立独立的业务占用标志。持片位置以 Lease 为事实来源，不再同时维护一份可写 `wafer.location`。
 
-合法并行示例：
+基本修改归为三组，沿用已有显式实现，不新增同义包装类：
 
-```text
-t0: wafer Place.end 到达 LL，触发 cooling=[t0, t3)
-t1: Pump.start，pressure_transition=pumping
-t3: cooling.end，thermal_phase=ready；Pump 仍可继续
-t5: Pump.end，pressure_level=vacuum，pressure_transition=idle
-t5: 若其他 Guard 和资源条件满足，wafer 可从 vacuum side Pick
-```
+- **更新状态**：设置值、自增、记录当前 Tick；保留三者的写入规则与冲突检查。
+- **改变持有关系**：获取或释放 Lease；转移由同一声明 bundle 内的释放与获取表达。
+- **改变待办**：创建或满足 Obligation。
 
-因此不能定义 `pressure_state ∈ {atmosphere, vacuum, transitioning}` 后再把“正在冷却”塞进同一枚举，也不应产生 `vacuum_and_cooling`、`pumping_and_ready` 这类笛卡尔积状态。并发来自不同状态轴和不同资源区间的同时推进，而不是来自越来越多的特殊状态名。
+Activity（活动）由条件、资源区间、边界、依赖和上述修改组成。加工、冷却、清洗、取放、Pump/Vent 都通过同一套结构表达；业务名字仅用于配置和审计，不构成新的执行原语。
 
-LL 取片边界至少同时检查：
+### 3.1 LL 示例
+
+LL（Load Lock，装载锁）只需保留压力值，以及晶圆所在槽位的 Lease。冷却与 Pump 是两个独立活动：
 
 ```text
-pressure_transition == idle
-pressure_level == required_interface_side
-wafer.thermal_phase in {not_required, ready}
-slot contains the requested wafer
-robot and interface claims are available
+t0: Place.end，触发活动 A（此例业务名称为冷却），区间 [t0,t3)
+t1: Pump.start，压力转换区间 [t1,t5)
+t3: 活动 A.end；Pump 仍然运行
+t5: Pump.end，将 pressure_level 写为 vacuum
 ```
 
-如果具体设备允许在 Pump/Vent 期间继续冷却，二者可以重叠；如果某设备禁止重叠，应通过共享资源 Claim 或 Invariant 表达，而不是改动模型动作空间。
+不额外维护 `thermal_phase`、`cooling_end_tick` 或 `pressure_transition` 状态；它们在此例中均可从 Schedule 推导。若真实约束依赖具体温度，才增加温度这一普通 StateCell，而不是预置一套冷却专用状态机。
+
+LL 取片需要组合以下要求：本次访问所需活动已经结束、压力转换结束、压力侧匹配、槽位由目标晶圆持有、机械手与接口资源可用。前后活动的顺序使用边界依赖；跨 Intent 的重复访问识别和完整候选门控仍待实现，不能宣称 G06 已覆盖完整取片流程。
+
+设备允许冷却与 Pump/Vent 重叠时分配独立资源；禁止重叠时声明共享互斥资源。二者是否并行不改变活动类型。
+
+### 3.2 没有截止时间不等于没有要求
+
+`deadline_tick=None`（模板中 `deadline_offset=None`）表示待办仍须满足，但没有超时边界：不会创建人为的大时间值，不参加 Deadline 检查。它可以在部分 Schedule 中保持未完成；要求终态时仍必须清偿。若业务本来没有未来要求，则不创建 Obligation。
+
+同 Tick、同合并键仍先选最高优先级；最高优先级对应同一个待办时，取其中最早的有限截止时间，全部为 `None` 才保持 `None`。不同待办的最高优先级冲突仍报错。
+
+### 3.3 当前实现边界
+
+Reference slice 已落实 G06 的派生运行状态、可选 Deadline、同绑定重复实例、逐事件推进，以及已声明动态提交的独立审计，旧 Engine 和旧模型输入保持不变。审计逐次检查选择合法性、精确展开与最终状态，已接入恢复；它不保证候选集完整或排程必能完成。三组基本修改是现有 Effect 的语义归类。后续已独立实现[通用 IR 训练首版](./ir-training.md)，包括完整程序/状态/目标的匿名图和 PPO 接入；完整 RouteVisit/Obligation 发生身份、关系条件扩展及更大规模训练验证仍需后续完成。
+
+现已提供[现有问题到 IR 的首版 Compiler](./problem-to-ir.md)：单机械手、IO/LP＋单槽 PM、普通有限路线和重复访问、候选站点、自动加工与返回。每片仅增加一个进度值，位置仍以 Lease 为准；声明式终态检查进度和真实返回占位。LL、清洗、JIT、运行中初态等输入暂时明确拒绝，不把“通用原语可表达”误称为“全部业务已接通”。参考协议因终态声明和绑定规范化修正升级到 `1.2-reference`。
+
+候选提交前现可组合 StateCondition 与 LeaseCondition：直接读取指定资源是否持有指定对象，不增加 `wafer.location`。Lease 的“存在/不存在”不等于“唯一持有/资源空闲”，也不保证整个活动期间持续成立；持续持有和跨资源物理位置不变量仍待完善。
 
 ## 4. 时间与同 Tick 原子语义
 
@@ -93,13 +105,23 @@ robot and interface claims are available
 
 1. 结束已到期的区间并释放资源；
 2. 应用对应的结束 Effect；
-3. 触发自动 Process、cooling、obligation 等确定性后果；
-4. 检查该 Tick 到期的义务和不变量；
-5. 启动已经承诺且在该 Tick 生效的边界；
-6. 重复处理新产生的同 Tick 后果，直到状态不再变化；
-7. 仅在稳定态上计算 enabled/committable Intent。
+3. 启动已经预先承诺且在该 Tick 生效的边界，并应用开始 Effect；
+4. 触发自动 Process、cooling、obligation 等确定性后果；
+5. 重复处理新产生的同 Tick 后果，直到状态不再变化；
+6. 在该 Tick 的全部 Event 处理完后，检查到期义务和不变量；
+7. 仅在合法稳定态上计算 enabled/committable Intent。
+
+因此，恰好在 Deadline Tick 发生的满足事件是合法的，但它必须已经在之前的 commit 中得到承诺和预留；Kernel 不能先判定 Deadline 失败，再补执行一个同 Tick 的开始事件。
 
 这个顺序必须形成 conformance tests（语义一致性测试），不能只依赖实现中的回调先后顺序。
+
+### 4.1 当前时刻提交与下一事件推进
+
+`commit()` 保留整个未来 bundle 的承诺，但只执行当前 Tick 的效果；它不再把 Session 直接跳到最晚完成时刻。`advance_next()` 推进到最近的未来 Event、区间边界或有限 Deadline，之后由 `frame()` 重新提供候选。没有未来边界返回 `None`，不是“调度已完成”的证明。`advance_to(tick)` 仅保留作显式回放/调试，不作为模型动作。
+
+已预先承诺、在当前 Tick 到达的事件属于 `decision_round=0`。在其稳定态上作出的新提交，其当前 Tick 效果进入更高轮次；同一轮内部仍与事件列表排列无关。每轮应用状态/Lease/Obligation 后检查容量和 Deadline，避免后续一轮掩盖先前违规。轮次不增加物理时长，也不允许拆开已承诺 bundle。
+
+预检查未来资源与效果时，尚未安排满足操作的待办可保留，因为中间决策可能完成它；当前 Tick 和真实时间推进不放松截止检查，已明确排到截止时间之后的满足操作也始终非法。例如短活动 5 秒完成、待办 8 秒截止、后台活动 20 秒完成时，可以在第 5 秒提交一个第 7 秒完成的满足操作。
 
 ## 5. Operator、Intent 与 Event
 
@@ -130,9 +152,20 @@ TransportIntent(
   hand,
   route_candidate,
 )
+
+ExchangeIntent(
+  outgoing_wafer,
+  incoming_wafer,
+  module,
+  robot,
+  outgoing_hand,
+  incoming_hand,
+)
 ```
 
 Intent 不等于一个瞬时动作，也不等于一个 Event。它是对完整 Operator bundle（算子边界包）的承诺请求。
+
+完整 Operator bundle 不等于完整的单 wafer Module-to-Module 运输。Prefetch 可以结束于 hand，Place continuation 可以开始于 hand，Exchange 可以在同一个原子承诺内先 Pick-out 再 Place-in。具体生命周期和身份规则见 [动态 Intent 生命周期设计](./dynamic-intent-lifecycle.md)。
 
 ### 5.3 Event
 
@@ -184,4 +217,4 @@ Schedule 保存这些展开后的事件和对应区间，以便独立 Validator 
 
 ## 8. 下一步
 
-下一份可执行规格应是 `Constraint IR v1`：定义静态对象、状态变量、Operator Template、表达式、资源、Trigger、Obligation 和 Objective 的最小 schema；同时给出 5—10 个小型 golden cases，作为 Kernel 与独立 Validator 的共同语义基准。模型结构和训练数据 schema 应在这些 golden cases 通过后再定稿。
+下一份可执行规格是 [Constraint IR v1](./constraint-ir-v1.md)：定义静态对象、状态变量、Operator Template、表达式、资源、Trigger、Obligation 和 Objective 的最小 schema；配套的 [golden cases](./golden-cases/README.md) 作为 Kernel 与独立 Validator 的共同语义基准。模型结构和训练数据 schema 应在这些 golden cases 通过后再定稿。

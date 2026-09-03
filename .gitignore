@@ -43,6 +43,9 @@ dist/
 tmp/
 temp/
 
+# Generated experiments from the IR training workflow
+/runs/ir_*/
+
 # backup files
 *.bak
 *.backup

@@ -26,6 +26,10 @@ _Avoid_: Float time, simulation frame
 
 ## Scheduling language
 
+**Activity**:
+A time-consuming operation expressed by resource claims, event boundaries, prerequisites, and effects; processing, cooling, cleaning, and pressure transitions use the same activity semantics.
+_Avoid_: Cooling-specific state machine, business-specific execution primitive
+
 **Operator Template**:
 A declarative description of a reusable operation, including its boundaries, guards, resource claims, effects, triggers, and obligations.
 _Avoid_: Model action, hard-coded constraint branch
@@ -33,6 +37,34 @@ _Avoid_: Model action, hard-coded constraint branch
 **Intent**:
 A parameterized scheduling choice submitted at a decision epoch; one intent may expand into several operator boundaries and events.
 _Avoid_: Raw event, primitive action
+
+**Intent Candidate**:
+A frame-scoped, concretely bound scheduling choice derived from the current stable state; it has no validity outside that decision frame.
+_Avoid_: Persistent action, intent seed, operator instance
+
+**Committed Intent**:
+An immutable scheduling commitment created by accepting an intent candidate, including its bound choices and complete declared boundary bundle.
+_Avoid_: Candidate, mutable plan, primitive action
+
+**Choice Scope**:
+The identity shared by mutually exclusive intent candidates that advance the same current work; a claim can be permanent or reusable after a declared release boundary, and one composite candidate may claim several scopes.
+_Avoid_: Resource, alternative name, global one-shot flag
+
+**Operator Instance**:
+One concrete expansion of an operator template caused by a committed intent or an automatic trigger.
+_Avoid_: Operator template, intent candidate, event
+
+**Operation Occurrence**:
+One accepted execution of an operation with concrete participants; a later execution with the same participants is a different occurrence, even when its template is unchanged.
+_Avoid_: Template identity, permanent one-shot action
+
+**Decision Round**:
+The causal ordering of newly committed effects within one time tick, after previously scheduled consequences have settled; it does not add physical duration.
+_Avoid_: Additional time tick, arbitrary event-list order
+
+**Exchange Intent**:
+A composite intent that atomically removes an outgoing wafer from a holder and places an already-held incoming wafer into that holder using distinct robot hands.
+_Avoid_: Simultaneous swap event, two unrelated primitive actions
 
 **Event**:
 A concrete, timestamped boundary produced by expanding an accepted intent or by an automatic kernel transition.
@@ -45,6 +77,14 @@ _Avoid_: Action history, policy trace
 **Guard**:
 A condition that must hold at an operator boundary for the boundary to occur legally.
 _Avoid_: Constraint penalty, action mask rule
+
+**Admission Guard**:
+A condition evaluated in the stable state before accepting an intent, not a promise that the condition remains true throughout its activity.
+_Avoid_: Continuous invariant, future-boundary guard
+
+**Lease Condition**:
+A predicate on whether a particular resource-owner lease exists; its absence does not imply that the resource is empty or available.
+_Avoid_: Wafer location field, free-capacity test
 
 **Invariant**:
 A condition that must hold throughout every reachable scheduling state or claimed interval.
@@ -86,13 +126,17 @@ _Avoid_: Non-deadlocked state, enabled state
 
 ## Load-lock semantics
 
-**Pressure State**:
-The load lock's atmosphere/vacuum condition and any Pump or Vent transition currently changing it; it is independent of wafer thermal readiness.
-_Avoid_: Load-lock state, wafer state
+**Pressure Level**:
+The load lock's stable atmosphere or vacuum condition, retained while a separate pressure transition is in progress.
+_Avoid_: Load-lock state, wafer state, transition state
 
-**Wafer Thermal State**:
-A wafer-specific cooling or thermal-readiness condition while the wafer occupies a load-lock slot; it may progress concurrently with a pressure transition.
-_Avoid_: Pressure state, combined load-lock phase
+**Pressure Transition**:
+An active Pump or Vent activity changing a load lock's pressure level; its running phase is derived from its interval and may overlap an independent wafer activity.
+_Avoid_: Pressure level, cooling state
+
+**Cooling Activity**:
+A wafer activity governed by the same resource, duration, and completion rules as processing; physical temperature is a separate fact only when an actual constraint requires it.
+_Avoid_: Mandatory thermal phase, combined load-lock phase
 
 **Interface Side**:
 The atmosphere-side or vacuum-side accessibility required by a transfer boundary after the relevant pressure transition is complete.

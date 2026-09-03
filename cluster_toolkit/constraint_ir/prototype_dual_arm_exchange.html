@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — 双臂预取与 Exchange 状态机</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #65727e;
+      --line: #dce3e8;
+      --panel: #f7f9fa;
+      --accent: #176b5b;
+      --accent-soft: #e6f3ef;
+      --danger: #a23b32;
+      --danger-soft: #faecea;
+      --white: #ffffff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: #eef2f3;
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 56px;
+    }
+
+    header, section {
+      background: var(--white);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px;
+      margin-bottom: 16px;
+    }
+
+    .prototype-label {
+      display: inline-block;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .04em;
+    }
+
+    h1 { margin: 12px 0 8px; font-size: clamp(25px, 4vw, 38px); }
+    h2 { margin: 0 0 14px; font-size: 20px; }
+    h3 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 7px 0; }
+    .muted { color: var(--muted); }
+
+    .question {
+      max-width: 900px;
+      font-size: 17px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .card {
+      min-height: 124px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+    }
+
+    .card strong { display: block; margin-bottom: 6px; }
+    .value { font-size: 18px; font-weight: 720; }
+    .subvalue { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+    .status-line {
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      padding: 12px 14px;
+      margin-top: 14px;
+      border-radius: 7px;
+    }
+
+    .status-line.rejected {
+      border-left-color: var(--danger);
+      background: var(--danger-soft);
+    }
+
+    .candidate-list, .timeline {
+      display: grid;
+      gap: 9px;
+    }
+
+    .candidate, .event {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 11px 13px;
+      background: var(--white);
+    }
+
+    .candidate code, .event code {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid #aebbc2;
+      border-radius: 8px;
+      background: var(--white);
+      color: var(--ink);
+      padding: 9px 13px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    button:disabled { cursor: not-allowed; opacity: .42; }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      overflow-x: auto;
+    }
+
+    .tab.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+    .walkthrough-steps {
+      display: grid;
+      gap: 10px;
+      margin-top: 15px;
+    }
+
+    .walkthrough-step {
+      display: grid;
+      grid-template-columns: 32px 1fr auto;
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+    }
+
+    .walkthrough-step.current { border-color: var(--accent); background: var(--accent-soft); }
+    .step-number { color: var(--muted); font-weight: 750; text-align: center; }
+
+    .two-column {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 9px;
+      padding: 14px;
+    }
+
+    @media (max-width: 850px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+      .two-column { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 520px) {
+      main { width: min(100% - 18px, 1180px); margin-top: 10px; }
+      header, section { padding: 16px; }
+      .grid { grid-template-columns: 1fr; }
+      .walkthrough-step { grid-template-columns: 28px 1fr; }
+      .walkthrough-step button { grid-column: 2; justify-self: start; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <span class="prototype-label">THROWAWAY LOGIC PROTOTYPE</span>
+      <h1>双臂预取与 Exchange 状态机</h1>
+      <p class="question">
+        要验证的问题：把“预取 wafer2 到一只手，再在 wafer1 加工完成后，以一个完整承诺执行
+        Pick-out → Place-in”建模为候选，是否能保持 holder、PM 容量、加工时序和双臂状态一致？
+      </p>
+      <p class="muted">这是用于讨论语义的内存原型，不是生产调度器。刷新页面即可恢复初始状态。</p>
+    </header>
+
+    <section>
+      <h2>当前完整状态</h2>
+      <div id="state-grid" class="grid"></div>
+      <div id="last-result" class="status-line"></div>
+    </section>
+
+    <section>
+      <h2>当前系统生成的候选</h2>
+      <p class="muted">候选随状态重新计算。下方只显示当前合法候选；自由操作按钮始终可点，非法尝试会被拒绝且不改变状态。</p>
+      <div id="candidate-list" class="candidate-list"></div>
+    </section>
+
+    <section>
+      <h2>自由操作</h2>
+      <div id="free-actions" class="actions"></div>
+    </section>
+
+    <section>
+      <h2>引导场景</h2>
+      <div id="scenario-tabs" class="tabs"></div>
+      <div id="scenario-body"></div>
+    </section>
+
+    <section>
+      <h2>事件与承诺</h2>
+      <div class="two-column">
+        <div>
+          <h3>事件时间线</h3>
+          <div id="timeline" class="timeline"></div>
+        </div>
+        <div>
+          <h3>已提交的完整 bundle</h3>
+          <div id="commitments" class="timeline"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Pure logic module. It deliberately has no DOM access.
+    const ExchangeStateMachine = (() => {
+      const PROCESS_END = 5;
+      const WAFER2_PROCESS_TIME = 4;
+
+      function initialState() {
+        return {
+          tick: 0,
+          pm1: { occupant: "wafer1", process: "processing", readyAt: PROCESS_END },
+          io: { occupant: "wafer2" },
+          robot: { position: "PM1", arm0: null, arm1: null },
+          waferLocations: { wafer1: "PM1", wafer2: "IO" },
+          events: [{ tick: 0, text: "初始状态：wafer1 在 PM1 加工，wafer2 在 IO" }],
+          commitments: [],
+          lastResult: { ok: true, text: "已重置。先观察候选，再选择操作。" }
+        };
+      }
+
+      function clone(state) {
+        return JSON.parse(JSON.stringify(state));
+      }
+
+      function emptyHands(state) {
+        return ["arm0", "arm1"].filter(hand => state.robot[hand] === null);
+      }
+
+      function handHolding(state, wafer) {
+        return ["arm0", "arm1"].find(hand => state.robot[hand] === wafer) || null;
+      }
+
+      function refreshProcess(state) {
+        if (
+          state.pm1.occupant &&
+          state.pm1.process === "processing" &&
+          state.tick >= state.pm1.readyAt
+        ) {
+          state.pm1.process = "completed";
+        }
+      }
+
+      function candidates(state) {
+        const result = [];
+        const incomingHand = handHolding(state, "wafer2");
+        const freeHands = emptyHands(state);
+        const outgoingReady =
+          state.pm1.occupant === "wafer1" && state.pm1.process === "completed";
+
+        if (state.io.occupant === "wafer2" && freeHands.length > 0) {
+          result.push({
+            key: "prefetch-wafer2",
+            label: `预取 wafer2 到 ${freeHands[0]}`,
+            bundle: "MoveToIO → Pick wafer2 → 结束时 wafer2 留在 hand"
+          });
+        }
+        if (outgoingReady && incomingHand && freeHands.length > 0) {
+          result.push({
+            key: "exchange-pm1",
+            label: `Exchange：${freeHands[0]} 取 wafer1，${incomingHand} 放 wafer2`,
+            bundle: "MoveToPM1 → PickOut wafer1 → PlaceIn wafer2（一次完整承诺）"
+          });
+        }
+        if (outgoingReady && freeHands.length > 0) {
+          result.push({
+            key: "pick-out-wafer1",
+            label: `只取出 wafer1 到 ${freeHands[0]}`,
+            bundle: "MoveToPM1 → PickOut wafer1（结束后产生中间决策状态）"
+          });
+        }
+        if (state.pm1.occupant === null && incomingHand) {
+          result.push({
+            key: "place-in-wafer2",
+            label: `将 ${incomingHand} 的 wafer2 放入 PM1`,
+            bundle: "PlaceIn wafer2 → 自动开始 Process"
+          });
+        }
+        if (
+          state.pm1.occupant &&
+          state.pm1.process === "processing" &&
+          state.pm1.readyAt > state.tick
+        ) {
+          result.push({
+            key: "advance-next-boundary",
+            label: `推进到下个 Process.end（Tick ${state.pm1.readyAt}）`,
+            bundle: "Kernel 自动推进时间，不是模型选择任意 Tick"
+          });
+        }
+        return result;
+      }
+
+      function reject(state, text) {
+        const next = clone(state);
+        next.lastResult = { ok: false, text: `拒绝：${text}。状态保持不变。` };
+        return next;
+      }
+
+      function addEvent(state, tick, text) {
+        state.events.push({ tick, text });
+      }
+
+      function addCommitment(state, name, start, end, details) {
+        state.commitments.push({ name, start, end, details });
+      }
+
+      function dispatch(current, action) {
+        if (action === "reset") return initialState();
+
+        const state = clone(current);
+        refreshProcess(state);
+
+        if (action === "prefetch") {
+          if (state.io.occupant !== "wafer2") {
+            return reject(current, "wafer2 已不在 IO，不能再次预取");
+          }
+          const hand = emptyHands(state)[0];
+          if (!hand) return reject(current, "Robot 没有空 hand");
+
+          const start = state.tick;
+          addEvent(state, start, "Prefetch commit：一次承诺 MoveToIO＋Pick wafer2");
+          addEvent(state, start, "MoveToIO.start");
+          addEvent(state, start + 1, `MoveToIO.end；Pick wafer2.start；${hand} Lease 获得 wafer2`);
+          addEvent(state, start + 2, "Pick wafer2.end；IO Lease 释放 wafer2");
+          addCommitment(
+            state,
+            "Prefetch wafer2",
+            start,
+            start + 2,
+            `结束 holder：${hand}`
+          );
+          state.tick = start + 2;
+          state.robot.position = "IO";
+          state.robot[hand] = "wafer2";
+          state.io.occupant = null;
+          state.waferLocations.wafer2 = `VTM1.${hand}`;
+          refreshProcess(state);
+          state.lastResult = {
+            ok: true,
+            text: `Prefetch 完成：wafer2 已提前留在 ${hand}，PM1 中的 wafer1 仍未被打扰。`
+          };
+          return state;
+        }
+
+        if (action === "advance") {
+          if (
+            !state.pm1.occupant ||
+            state.pm1.process !== "processing" ||
+            state.pm1.readyAt <= state.tick
+          ) {
+            return reject(current, "当前没有未来的 Process.end 边界");
+          }
+          state.tick = state.pm1.readyAt;
+          state.pm1.process = "completed";
+          addEvent(state, state.tick, `Process.end(${state.pm1.occupant}, PM1)`);
+          state.lastResult = {
+            ok: true,
+            text: `Kernel 推进到 Tick ${state.tick}：${state.pm1.occupant} 已加工完成，候选已重新生成。`
+          };
+          return state;
+        }
+
+        if (action === "exchange") {
+          const incomingHand = handHolding(state, "wafer2");
+          const outgoingHand = emptyHands(state)[0];
+          if (state.pm1.occupant !== "wafer1") {
+            return reject(current, "PM1 当前并未持有 wafer1");
+          }
+          if (state.pm1.process !== "completed") {
+            return reject(current, "wafer1 尚未完成 Process，PickOut Guard 不成立");
+          }
+          if (!incomingHand) {
+            return reject(current, "没有 hand 持有 incoming wafer2，请先 Prefetch");
+          }
+          if (!outgoingHand) {
+            return reject(current, "没有另一只空 hand 可以接收 wafer1");
+          }
+
+          const move = state.robot.position === "PM1" ? 0 : 1;
+          const start = state.tick;
+          const pickStart = start + move;
+          const handoff = pickStart + 1;
+          const end = handoff + 1;
+          addEvent(state, start, "Exchange commit：完整 bundle 和 PM1 未来容量同时被预留");
+          if (move) {
+            addEvent(state, start, "MoveToPM1.start");
+            addEvent(state, pickStart, "MoveToPM1.end");
+          }
+          addEvent(state, pickStart, `PickOut.start；${outgoingHand} Lease 获得 wafer1`);
+          addEvent(
+            state,
+            handoff,
+            `PickOut.end 释放 PM1/wafer1；同 Tick PlaceIn.start 获取 PM1/wafer2`
+          );
+          addEvent(
+            state,
+            end,
+            `PlaceIn.end 释放 ${incomingHand}/wafer2；automatic Process.start(wafer2)`
+          );
+          addCommitment(
+            state,
+            "Exchange PM1",
+            start,
+            end,
+            `PickOut(${outgoingHand}) → PlaceIn(${incomingHand})`
+          );
+          state.tick = end;
+          state.robot.position = "PM1";
+          state.robot[outgoingHand] = "wafer1";
+          state.robot[incomingHand] = null;
+          state.pm1 = {
+            occupant: "wafer2",
+            process: "processing",
+            readyAt: end + WAFER2_PROCESS_TIME
+          };
+          state.waferLocations.wafer1 = `VTM1.${outgoingHand}`;
+          state.waferLocations.wafer2 = "PM1";
+          state.lastResult = {
+            ok: true,
+            text: "Exchange 完成：中间没有模型决策点，PM1 从 wafer1 原子衔接到 wafer2。"
+          };
+          return state;
+        }
+
+        if (action === "pick-out") {
+          if (state.pm1.occupant !== "wafer1") {
+            return reject(current, "PM1 当前没有可取的 wafer1");
+          }
+          if (state.pm1.process !== "completed") {
+            return reject(current, "wafer1 尚未完成 Process");
+          }
+          const hand = emptyHands(state)[0];
+          if (!hand) return reject(current, "没有空 hand");
+
+          const move = state.robot.position === "PM1" ? 0 : 1;
+          const start = state.tick;
+          const pickStart = start + move;
+          const end = pickStart + 1;
+          addEvent(state, start, "PickOut-only commit：只承诺取出 wafer1");
+          if (move) addEvent(state, start, "MoveToPM1.start");
+          addEvent(state, pickStart, `PickOut.start；${hand} Lease 获得 wafer1`);
+          addEvent(state, end, "PickOut.end；PM1 Lease 释放 wafer1");
+          addCommitment(state, "PickOut wafer1", start, end, `结束 holder：${hand}`);
+          state.tick = end;
+          state.robot.position = "PM1";
+          state.robot[hand] = "wafer1";
+          state.pm1 = { occupant: null, process: "idle", readyAt: null };
+          state.waferLocations.wafer1 = `VTM1.${hand}`;
+          state.lastResult = {
+            ok: true,
+            text: "wafer1 已取出，但 wafer2 尚未放入；这里产生了一个额外的模型决策点。"
+          };
+          return state;
+        }
+
+        if (action === "place-in") {
+          const hand = handHolding(state, "wafer2");
+          if (!hand) return reject(current, "没有 hand 持有 wafer2");
+          if (state.pm1.occupant !== null) {
+            return reject(current, `PM1 仍由 ${state.pm1.occupant} 占用`);
+          }
+
+          const move = state.robot.position === "PM1" ? 0 : 1;
+          const start = state.tick;
+          const placeStart = start + move;
+          const end = placeStart + 1;
+          addEvent(state, start, "PlaceIn commit：PM1 未来容量被预留给 wafer2");
+          if (move) addEvent(state, start, "MoveToPM1.start");
+          addEvent(state, placeStart, "PlaceIn.start；PM1 Lease 获得 wafer2");
+          addEvent(state, end, `PlaceIn.end；${hand} Lease 释放；automatic Process.start(wafer2)`);
+          addCommitment(state, "PlaceIn wafer2", start, end, `从 ${hand} 放入 PM1`);
+          state.tick = end;
+          state.robot.position = "PM1";
+          state.robot[hand] = null;
+          state.pm1 = {
+            occupant: "wafer2",
+            process: "processing",
+            readyAt: end + WAFER2_PROCESS_TIME
+          };
+          state.waferLocations.wafer2 = "PM1";
+          state.lastResult = {
+            ok: true,
+            text: "PlaceIn 完成：两步方案也合法，但比 Exchange 多暴露了一个决策点。"
+          };
+          return state;
+        }
+
+        return reject(current, `未知操作 ${action}`);
+      }
+
+      return { initialState, candidates, dispatch };
+    })();
+
+    // Throwaway page shell.
+    const actionDefinitions = [
+      ["prefetch", "预取 wafer2"],
+      ["advance", "推进到 Process.end"],
+      ["exchange", "执行 Exchange"],
+      ["pick-out", "只 PickOut wafer1"],
+      ["place-in", "只 PlaceIn wafer2"],
+      ["reset", "重置"]
+    ];
+
+    const scenarios = [
+      {
+        id: "happy",
+        title: "推荐：原子 Exchange",
+        description: "先预取 wafer2，等待 wafer1 完成，再用一个候选承诺 PickOut＋PlaceIn。观察 PM1 在同一 Tick 完成 holder 交接。",
+        steps: [
+          ["prefetch", "预取 wafer2 到空 hand"],
+          ["advance", "推进到 wafer1 加工完成"],
+          ["exchange", "提交完整 Exchange bundle"]
+        ]
+      },
+      {
+        id: "early",
+        title: "非法：过早 Exchange",
+        description: "预取并不允许提前取出仍在加工的 wafer1。非法尝试必须被 Guard 拒绝且状态完全不变。",
+        steps: [
+          ["prefetch", "预取 wafer2"],
+          ["exchange", "在 Process.end 前尝试 Exchange（应拒绝）"],
+          ["advance", "推进到合法边界"],
+          ["exchange", "再次提交 Exchange（应成功）"]
+        ]
+      },
+      {
+        id: "split",
+        title: "对照：拆成两个选择",
+        description: "同样的物理结果也能由两个独立选择完成，但 PickOut 后会暴露中间状态，模型可能改选其他动作。",
+        steps: [
+          ["prefetch", "预取 wafer2"],
+          ["advance", "推进到 wafer1 加工完成"],
+          ["pick-out", "只提交 PickOut"],
+          ["place-in", "再提交 PlaceIn"]
+        ]
+      }
+    ];
+
+    let state = ExchangeStateMachine.initialState();
+    let activeScenario = scenarios[0];
+    let scenarioStep = 0;
+
+    function display(value) {
+      return value === null ? "空" : value;
+    }
+
+    function renderState() {
+      const processText = state.pm1.occupant
+        ? `${state.pm1.process}${state.pm1.readyAt !== null ? `（ready @ ${state.pm1.readyAt}）` : ""}`
+        : "idle";
+      document.getElementById("state-grid").innerHTML = [
+        ["当前 Tick", state.tick, "所有候选以这个 Stable State 为准"],
+        ["PM1", display(state.pm1.occupant), `内部状态：${processText}`],
+        ["VTM1", `位置：${state.robot.position}`, `arm0：${display(state.robot.arm0)} · arm1：${display(state.robot.arm1)}`],
+        ["IO", display(state.io.occupant), `wafer1：${state.waferLocations.wafer1} · wafer2：${state.waferLocations.wafer2}`]
+      ].map(([label, value, sub]) => `
+        <div class="card">
+          <strong>${label}</strong>
+          <div class="value">${value}</div>
+          <div class="subvalue">${sub}</div>
+        </div>
+      `).join("");
+
+      const last = document.getElementById("last-result");
+      last.className = `status-line${state.lastResult.ok ? "" : " rejected"}`;
+      last.textContent = state.lastResult.text;
+    }
+
+    function renderCandidates() {
+      const values = ExchangeStateMachine.candidates(state);
+      document.getElementById("candidate-list").innerHTML = values.length
+        ? values.map(candidate => `
+            <div class="candidate">
+              <code>${candidate.label}</code>
+              <div class="muted">${candidate.bundle}</div>
+            </div>
+          `).join("")
+        : '<div class="empty">当前没有候选。这个原型只覆盖 Exchange 所需的最小状态链。</div>';
+    }
+
+    function renderFreeActions() {
+      document.getElementById("free-actions").innerHTML = actionDefinitions
+        .map(([action, label]) => `<button data-free-action="${action}"${action === "exchange" ? ' class="primary"' : ""}>${label}</button>`)
+        .join("");
+      document.querySelectorAll("[data-free-action]").forEach(button => {
+        button.addEventListener("click", () => {
+          state = ExchangeStateMachine.dispatch(state, button.dataset.freeAction);
+          renderAll(false);
+        });
+      });
+    }
+
+    function selectScenario(id) {
+      activeScenario = scenarios.find(item => item.id === id);
+      scenarioStep = 0;
+      state = ExchangeStateMachine.initialState();
+      state.lastResult = { ok: true, text: `已载入引导场景：${activeScenario.title}` };
+      renderAll(false);
+    }
+
+    function renderScenario() {
+      document.getElementById("scenario-tabs").innerHTML = scenarios
+        .map(item => `<button class="tab${item.id === activeScenario.id ? " active" : ""}" data-scenario="${item.id}">${item.title}</button>`)
+        .join("");
+      document.querySelectorAll("[data-scenario]").forEach(button => {
+        button.addEventListener("click", () => selectScenario(button.dataset.scenario));
+      });
+
+      document.getElementById("scenario-body").innerHTML = `
+        <p>${activeScenario.description}</p>
+        <div class="walkthrough-steps">
+          ${activeScenario.steps.map(([action, label], index) => `
+            <div class="walkthrough-step${index === scenarioStep ? " current" : ""}">
+              <div class="step-number">${index + 1}</div>
+              <div>${label}</div>
+              <button data-step="${index}" data-action="${action}" ${index !== scenarioStep ? "disabled" : ""}>
+                ${index < scenarioStep ? "已完成" : index === scenarioStep ? "执行这一步" : "等待"}
+              </button>
+            </div>
+          `).join("")}
+        </div>
+      `;
+
+      const activeButton = document.querySelector(`[data-step="${scenarioStep}"]`);
+      if (activeButton) {
+        activeButton.addEventListener("click", () => {
+          state = ExchangeStateMachine.dispatch(state, activeButton.dataset.action);
+          scenarioStep += 1;
+          renderAll(false);
+        });
+      }
+    }
+
+    function renderHistory() {
+      document.getElementById("timeline").innerHTML = state.events.length
+        ? state.events.map(event => `<div class="event"><code>Tick ${event.tick}</code><div>${event.text}</div></div>`).join("")
+        : '<div class="empty">尚无事件</div>';
+      document.getElementById("commitments").innerHTML = state.commitments.length
+        ? state.commitments.map(item => `
+            <div class="event">
+              <code>${item.name} [${item.start}, ${item.end})</code>
+              <div>${item.details}</div>
+            </div>
+          `).join("")
+        : '<div class="empty">尚未提交 bundle</div>';
+    }
+
+    function renderAll(includeFreeActions = true) {
+      renderState();
+      renderCandidates();
+      if (includeFreeActions) renderFreeActions();
+      renderScenario();
+      renderHistory();
+    }
+
+    renderAll();
+  </script>
+</body>
+</html>

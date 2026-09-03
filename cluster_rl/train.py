@@ -24,6 +24,11 @@ from torch import Tensor, nn
 from torch.distributions import Categorical
 
 from cluster_rl.cluster_env import ClusterEnv
+from cluster_rl.ppo import (
+    advantages as _advantages,
+    clipped_losses,
+    normalize_choice_advantages as _normalize_choice_advantages,
+)
 from examples.run_scenarios import (
     SCENARIO_DIR,
     network_greedy_selector,
@@ -722,52 +727,6 @@ def _flatten_encoded_steps(
     return tuple(encoded for step in steps for encoded in step)
 
 
-def _advantages(
-    rewards: Tensor,
-    dones: Tensor,
-    values: Tensor,
-    last_values: Tensor,
-    gamma: float,
-    gae_lambda: float,
-) -> Tensor:
-    result = torch.zeros_like(rewards)
-    advantage = torch.zeros_like(last_values)
-
-    for step in reversed(range(rewards.shape[0])):
-        next_values = (
-            last_values
-            if step == rewards.shape[0] - 1
-            else values[step + 1]
-        )
-        next_non_terminal = ~dones[step]
-        delta = (
-            rewards[step]
-            + gamma * next_values * next_non_terminal
-            - values[step]
-        )
-        advantage = (
-            delta
-            + gamma * gae_lambda * next_non_terminal * advantage
-        )
-        result[step] = advantage
-    return result
-
-
-def _normalize_choice_advantages(
-    advantages: Tensor,
-    choice_mask: Tensor,
-) -> Tensor:
-    """Normalize Actor advantages over states with an actual action choice."""
-
-    normalized = torch.zeros_like(advantages)
-    if choice_mask.any():
-        choice_advantages = advantages[choice_mask]
-        normalized[choice_mask] = (
-            choice_advantages - choice_advantages.mean()
-        ) / (choice_advantages.std(unbiased=False) + 1e-8)
-    return normalized
-
-
 def _normalized_reward(
     reward: float,
     reference_makespan: float,
@@ -1385,42 +1344,11 @@ def _ppo_update(
                 choice_fraction = has_choice.float().mean()
 
             with _measure(timer, "ppo.loss_gpu"):
-                if has_choice.any():
-                    minibatch_advantages = advantages[
-                        minibatch_indexes
-                    ][has_choice]
-                    choice_ratio = ratio[has_choice]
-                    unclipped_policy_loss = (
-                        -minibatch_advantages * choice_ratio
-                    )
-                    clipped_policy_loss = (
-                        -minibatch_advantages
-                        * choice_ratio.clamp(
-                            1.0 - config.clip_coefficient,
-                            1.0 + config.clip_coefficient,
-                        )
-                    )
-                    policy_loss = torch.maximum(
-                        unclipped_policy_loss,
-                        clipped_policy_loss,
-                    ).mean()
-                    entropy = distribution.entropy()[has_choice].mean()
-                else:
-                    policy_loss = output.value.sum() * 0.0
-                    entropy = output.value.sum() * 0.0
-
-                old_values = rollout_batch.old_values[minibatch_indexes]
-                returns = rollout_batch.returns[minibatch_indexes]
-                clipped_values = old_values + (
-                    output.value - old_values
-                ).clamp(
-                    -config.clip_coefficient,
-                    config.clip_coefficient,
+                policy_loss, value_loss, entropy = clipped_losses(
+                    log_ratio, output.value, rollout_batch.old_values[minibatch_indexes],
+                    rollout_batch.returns[minibatch_indexes], advantages[minibatch_indexes],
+                    distribution.entropy(), has_choice, config.clip_coefficient,
                 )
-                value_loss = 0.5 * torch.maximum(
-                    (output.value - returns).square(),
-                    (clipped_values - returns).square(),
-                ).mean()
                 loss = (
                     policy_loss
                     + config.value_coefficient * value_loss
