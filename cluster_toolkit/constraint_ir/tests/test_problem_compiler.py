@@ -255,6 +255,70 @@ def test_schema_v2_capabilities_and_reachability_are_lowered_to_bindings() -> No
         compile_problem(parse_problem(raw), TIME)
 
 
+def test_multiple_robots_and_intermediate_stations_compile_as_generic_ir() -> None:
+    raw = _raw()
+    raw["Modules"].update({
+        "BUF": {"type": "BUFFER"},
+        "AL": {"type": "AL"},
+    })
+    raw["ClusterTool"] = {
+        "TM0": {
+            "module_ids": ["LP", "PM1", "BUF", "AL"],
+            "arm_type": "dual_arm",
+            "pick_time": 1,
+            "place_time": 1,
+            "travel_times": 1,
+        },
+        "TM1": {
+            "module_ids": ["BUF", "PM2"],
+            "arm_type": "single_arm",
+            "pick_time": 2,
+            "place_time": 2,
+            "travel_times": 2,
+        },
+    }
+    raw["initial_state"]["robots"] = {
+        "TM0": {"position_module_id": None},
+        "TM1": {"position_module_id": None},
+    }
+    raw["routes"]["A"] = [
+        {"module_id": "AL", "process_time": 2},
+        {"module_id": "BUF", "process_time": 2},
+        {"module_id": "PM2", "process_time": 3},
+        {"module_id": "BUF", "process_time": 2},
+        {"module_id": "PM1", "process_time": 3},
+    ]
+    ir = compile_problem(parse_problem(raw), TIME)
+    assert {item.id for item in ir.resources if item.id.startswith("motion/")} == {
+        "motion/TM0", "motion/TM1",
+    }
+    assert "activity/BUF" in {item.id for item in ir.resources}
+    assert "activity/AL" in {item.id for item in ir.resources}
+    assert any("/TM0/" in item.id for item in ir.operator_templates)
+    assert any("/TM1/" in item.id for item in ir.operator_templates)
+    template_ids = {item.id for item in ir.operator_templates}
+    assert any("/pick/4/BUF/TM1/" in item for item in template_ids)
+    assert not any("/pick/4/BUF/TM0/" in item for item in template_ids)
+    assert any("/pick/8/BUF/TM0/" in item for item in template_ids)
+    assert not any("/pick/8/BUF/TM1/" in item for item in template_ids)
+    session = ReferenceKernel.start(ir)
+    assert session.frame().intents
+    assert ReferenceValidator.validate_session(ir, session.snapshot()).ok
+
+
+def test_zero_duration_route_station_advances_on_place_boundary() -> None:
+    raw = _raw()
+    raw["routes"]["A"][0]["process_time"] = 0
+    ir = compile_problem(parse_problem(raw), TIME)
+    assert any(
+        effect.kind == "set_state"
+        for template in ir.operator_templates
+        if template.origin == "selectable"
+        for interval in template.intervals
+        for effect in interval.end_effects
+    )
+
+
 def test_explicit_return_and_encoded_names_and_input_order() -> None:
     raw = _raw()
     raw["Modules"]["return/%"] = {"type": "LP"}
@@ -274,9 +338,9 @@ def test_explicit_return_and_encoded_names_and_input_order() -> None:
 
 @pytest.mark.parametrize(("mutation", "path"), [
     ("cleaning", "cleaning"), ("jit", "just_in_time"), ("residency", "residency_time"),
-    ("zero_pick", "pick_time"), ("zero_process", "process_time"), ("missing_process", "process_time"),
+    ("zero_pick", "pick_time"), ("missing_process", "process_time"),
     ("capacity", "capacity"), ("ll", "type"), ("priority", "priority"),
-    ("inflight", "wafers"), ("robots", "ClusterTool"),
+    ("inflight", "wafers"),
 ])
 def test_unsupported_semantics_fail_explicitly(mutation: str, path: str) -> None:
     raw = _raw(wafers=2)
@@ -288,8 +352,8 @@ def test_unsupported_semantics_fail_explicitly(mutation: str, path: str) -> None
         raw["routes"]["A"][0]["residency_time"] = 5
     elif mutation == "zero_pick":
         raw["ClusterTool"]["TM"]["pick_time"] = 0
-    elif mutation in {"zero_process", "missing_process"}:
-        raw["routes"]["A"][0]["process_time"] = 0 if mutation == "zero_process" else None
+    elif mutation == "missing_process":
+        raw["routes"]["A"][0]["process_time"] = None
     elif mutation == "capacity":
         raw["Modules"]["PM1"]["capacity"] = 2
     elif mutation == "ll":
@@ -301,13 +365,18 @@ def test_unsupported_semantics_fail_explicitly(mutation: str, path: str) -> None
         raw["initial_state"]["wafers"].append({**wafer, "wafer_index": "1", "priority": 1})
     elif mutation == "inflight":
         raw["initial_state"]["wafers"][0]["process_end_time"] = 2
-    else:
-        raw["ClusterTool"]["TM2"] = raw["ClusterTool"]["TM"].copy()
     problem = parse_problem(raw)
     with pytest.raises(SemanticError) as error:
         compile_problem(problem, TIME)
     assert error.value.code is DiagnosticCode.UNSUPPORTED_FEATURE
     assert path in error.value.path
+
+
+def test_problem_schema_rejects_a_tool_without_robots() -> None:
+    raw = _raw(wafers=2)
+    raw["ClusterTool"] = {}
+    with pytest.raises(ValueError, match="ClusterTool must not be empty"):
+        parse_problem(raw)
 
 
 def test_precision_loss_is_not_rounded() -> None:

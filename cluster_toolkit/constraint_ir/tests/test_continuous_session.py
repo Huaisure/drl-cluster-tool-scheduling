@@ -145,6 +145,21 @@ def test_repeated_bindings_get_new_instances_while_background_work_continues() -
     )
 
 
+def test_fork_preserves_a_trusted_session_and_mutates_independently() -> None:
+    session = ReferenceKernel.start(_repeated_problem())
+    frame = session.frame()
+    fork = session.fork()
+    assert fork.frame() == frame
+    assert fork.snapshot() == session.snapshot()
+
+    selected = (frame.intents[0].candidate_key,)
+    session.commit(frame.frame_token, selected)
+    assert fork.schedule != session.schedule
+    fork.commit(frame.frame_token, selected)
+    assert fork.schedule == session.schedule
+    assert fork.snapshot() == session.snapshot()
+
+
 def test_scope_without_release_still_prevents_repetition() -> None:
     session = ReferenceKernel.start(_repeated_problem(release=False))
     frame = session.frame()

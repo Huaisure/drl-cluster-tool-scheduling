@@ -22,11 +22,13 @@ from .schema import (
 
 
 def compile_problem(problem: ClusterProblem, time_domain: TimeDomain) -> ConstraintIRV1:
-    """Compile IO/LP + capacity-one PMs, positive operations, equal priorities.
+    """Compile finite robot-cell workloads with positive operation durations.
 
-    One single/dual-arm robot; every wafer starts unprocessed at step zero in
-    IO/LP. Alternatives and repeated visits are supported. Source times are
-    seconds. Unsupported semantics fail explicitly, never silently disappear.
+    Single/dual-arm robots and capacity-one PM/AL/BUFFER route stations are
+    supported; every wafer starts unprocessed at step zero in IO/LP.
+    Alternatives, repeated visits, and handoffs through shared stations are
+    preserved. Source times are seconds. Unsupported semantics fail explicitly,
+    never silently disappear.
     """
     # Source input accepts index expressions but stores integer wafer indexes.
     payload = problem.model_dump(mode="python", by_alias=True)
@@ -53,26 +55,52 @@ def _positive_ticks(time_domain: TimeDomain, value: float | None, path: str) -> 
     return ticks
 
 
+def _nonnegative_ticks(time_domain: TimeDomain, value: float | None, path: str) -> int:
+    if value is None:
+        _unsupported(path, "an explicit non-negative duration is required")
+    return compile_ticks(time_domain, value, path=path)
+
+
 def _check_supported(problem: ClusterProblem, time_domain: TimeDomain) -> None:
     if time_domain.unit != "second":
         _unsupported("time_domain.unit", "ClusterProblem durations are in seconds")
-    if len(problem.ClusterTool) != 1:
-        _unsupported("ClusterTool", "the first compiler supports exactly one robot")
+    if not problem.ClusterTool:
+        _unsupported("ClusterTool", "at least one robot is required")
     for name in ("cleaning", "just_in_time"):
         if getattr(problem, name) is not None:
             _unsupported(name, f"{name} is not supported by the first compiler")
     for module_id, module in problem.Modules.items():
-        if module.type not in {ModuleType.PM, ModuleType.IO, ModuleType.LP}:
-            _unsupported(f"Modules.{module_id}.type", "only PM and IO/LP are supported")
+        if module.type not in {
+            ModuleType.PM, ModuleType.AL, ModuleType.BUFFER,
+            ModuleType.IO, ModuleType.LP,
+        }:
+            _unsupported(
+                f"Modules.{module_id}.type",
+                "PM, AL, BUFFER, and IO/LP modules are supported",
+            )
         if module.load_lock is not None:
             _unsupported(f"Modules.{module_id}.load_lock", "pressure transitions are not yet compiled")
-        if module.type is ModuleType.PM and module.capacity != 1:
-            _unsupported(f"Modules.{module_id}.capacity", "physical PM capacity must be one")
-    robot_id, robot = next(iter(problem.ClusterTool.items()))
-    reachable = set(robot.module_ids)
-    for field in ("pick_time", "place_time"):
-        _positive_ticks(time_domain, getattr(robot, field), f"ClusterTool.{robot_id}.{field}")
-    compile_ticks(time_domain, robot.travel_times, path=f"ClusterTool.{robot_id}.travel_times")
+        if module.type not in {ModuleType.IO, ModuleType.LP} and module.capacity != 1:
+            _unsupported(
+                f"Modules.{module_id}.capacity",
+                "physical route-station capacity must be one",
+            )
+    reachable_by_robot = {
+        robot_id: set(robot.module_ids)
+        for robot_id, robot in problem.ClusterTool.items()
+    }
+    for robot_id, robot in problem.ClusterTool.items():
+        for field in ("pick_time", "place_time"):
+            _positive_ticks(
+                time_domain,
+                getattr(robot, field),
+                f"ClusterTool.{robot_id}.{field}",
+            )
+        compile_ticks(
+            time_domain,
+            robot.travel_times,
+            path=f"ClusterTool.{robot_id}.travel_times",
+        )
     if len({wafer.priority for wafer in problem.initial_state.wafers}) > 1:
         _unsupported("initial_state.wafers.priority", "mixed source priorities are not yet compiled")
     for index, wafer in enumerate(problem.initial_state.wafers):
@@ -81,18 +109,30 @@ def _check_supported(problem: ClusterProblem, time_domain: TimeDomain) -> None:
                 or not isinstance(wafer.location, ModuleLocation)
                 or problem.Modules[wafer.location.module_id].type not in {ModuleType.IO, ModuleType.LP}):
             _unsupported(path, "wafers must start unprocessed at step zero in IO/LP")
-        if wafer.location.module_id not in reachable or problem.return_module_id(wafer) not in reachable:
+        if not any(
+            wafer.location.module_id in reachable
+            for reachable in reachable_by_robot.values()
+        ) or not any(
+            problem.return_module_id(wafer) in reachable
+            for reachable in reachable_by_robot.values()
+        ):
             _unsupported(path, "source and return station must be reachable by the robot")
     for route_id, route in problem.routes.items():
         for index, visit in enumerate(route.visits):
             path = f"routes.{route_id}[{index}]"
             if visit.residency_time is not None:
                 _unsupported(f"{path}.residency_time", "residency deadlines are not yet compiled")
-            if any(problem.Modules[mid].type is not ModuleType.PM for mid in visit.module_ids):
-                _unsupported(path, "internal route visits must use PMs")
-            if not reachable.intersection(visit.module_ids):
+            if any(
+                problem.Modules[mid].type in {ModuleType.IO, ModuleType.LP, ModuleType.LL}
+                for mid in visit.module_ids
+            ):
+                _unsupported(path, "internal route visits must use PM/AL/BUFFER stations")
+            if not any(
+                reachable.intersection(visit.module_ids)
+                for reachable in reachable_by_robot.values()
+            ):
                 _unsupported(path, "visit has no candidate reachable by the robot")
-            _positive_ticks(time_domain, visit.process_time, f"{path}.process_time")
+            _nonnegative_ticks(time_domain, visit.process_time, f"{path}.process_time")
 
 
 def _id(prefix: str, *parts: str | int) -> str:
@@ -111,33 +151,60 @@ _PARAMETERS = (
 class _ProblemCompiler:
     def __init__(self, problem: ClusterProblem, time_domain: TimeDomain) -> None:
         self.problem, self.time_domain = problem, time_domain
-        self.robot_id, self.robot = next(iter(problem.ClusterTool.items()))
-        self.motion = _id("motion", self.robot_id)
-        self.position = _id("position", self.robot_id)
         self.unknown = _id("unknown")
-        initial_robot = problem.initial_state.robots.get(self.robot_id)
-        self.initial_position = None if initial_robot is None else initial_robot.position_module_id
-        arm_count = 1 if self.robot.arm_type is TMArmType.SINGLE_ARM else 2
-        self.hands = tuple(_id("hand", self.robot_id, f"arm{i}") for i in range(arm_count))
+        self.robots = dict(sorted(problem.ClusterTool.items()))
+        self.motions = {robot_id: _id("motion", robot_id) for robot_id in self.robots}
+        self.positions = {robot_id: _id("position", robot_id) for robot_id in self.robots}
+        self.initial_positions = {}
+        self.hands = {}
+        for robot_id, robot in self.robots.items():
+            initial_robot = problem.initial_state.robots.get(robot_id)
+            self.initial_positions[robot_id] = (
+                None if initial_robot is None else initial_robot.position_module_id
+            )
+            arm_count = 1 if robot.arm_type is TMArmType.SINGLE_ARM else 2
+            self.hands[robot_id] = tuple(
+                _id("hand", robot_id, f"arm{i}") for i in range(arm_count)
+            )
         self.templates: dict[str, OperatorTemplateSpec] = {}
         self.automatic: dict[str, AutomaticRuleSpec] = {}
         self.rules: dict[str, DynamicIntentSpec] = {}
         self.rows: dict[str, set[tuple[str, ...]]] = {}
 
     def compile(self) -> ConstraintIRV1:
-        resources = [ResourceSpec(id=self.motion, capacity=1)]
-        resources.extend(ResourceSpec(id=hand, capacity=1) for hand in self.hands)
+        resources = [
+            ResourceSpec(id=self.motions[robot_id], capacity=1)
+            for robot_id in self.robots
+        ]
+        resources.extend(
+            ResourceSpec(id=hand, capacity=1)
+            for robot_id in self.robots
+            for hand in self.hands[robot_id]
+        )
         for mid, module in sorted(self.problem.Modules.items()):
             resources.append(ResourceSpec(id=_id("module", mid), capacity=module.capacity))
-            if module.type is ModuleType.PM:
+            if module.type not in {ModuleType.IO, ModuleType.LP}:
                 resources.append(ResourceSpec(id=_id("activity", mid), capacity=1))
-        cells = [StateCellSpec(id=self.position, value_type="enum", enum_values=(
-            self.unknown, *(_id("at", mid) for mid in sorted(self.robot.module_ids)),
-        ))]
-        initial_values = [StateAssignment(
-            cell_id=self.position,
-            value=self.unknown if self.initial_position is None else _id("at", self.initial_position),
-        )]
+        cells = []
+        initial_values = []
+        for robot_id, robot in self.robots.items():
+            cells.append(StateCellSpec(
+                id=self.positions[robot_id],
+                value_type="enum",
+                enum_values=(
+                    self.unknown,
+                    *(_id("at", mid) for mid in sorted(robot.module_ids)),
+                ),
+            ))
+            initial_position = self.initial_positions[robot_id]
+            initial_values.append(StateAssignment(
+                cell_id=self.positions[robot_id],
+                value=(
+                    self.unknown
+                    if initial_position is None
+                    else _id("at", initial_position)
+                ),
+            ))
         initial_leases, terminal_leases, terminal_values = [], [], []
         for wafer in sorted(self.problem.initial_state.wafers, key=lambda item: item.wafer_key):
             owner = _id("wafer", wafer.route_id, wafer.wafer_index)
@@ -153,17 +220,43 @@ class _ProblemCompiler:
             sources = (wafer.location.module_id,)
             for index in range(len(visits) + 1):
                 targets = visits[index].module_ids if index < len(visits) else (return_module,)
-                process = (_positive_ticks(self.time_domain, visits[index].process_time,
-                                           f"routes.{wafer.route_id}[{index}].process_time")
+                process = (_nonnegative_ticks(self.time_domain, visits[index].process_time,
+                                              f"routes.{wafer.route_id}[{index}].process_time")
                            if index < len(visits) else 0)
-                for kind, phase, modules, duration in (
-                    ("pick", 2 * index, sources, self.robot.pick_time),
-                    ("place", 2 * index + 1, targets, self.robot.place_time),
+                for kind, phase, modules in (
+                    ("pick", 2 * index, sources),
+                    ("place", 2 * index + 1, targets),
                 ):
-                    for mid in sorted(set(modules).intersection(self.robot.module_ids)):
-                        for hand in self.hands:
-                            self._add(kind, phase, mid, duration, process if kind == "place" else 0,
-                                      (hand, _id("module", mid), stage, owner))
+                    for mid in sorted(set(modules)):
+                        for robot_id, robot in self.robots.items():
+                            if mid not in robot.module_ids:
+                                continue
+                            # A pick must leave the wafer on a robot that can
+                            # also reach at least one destination of this
+                            # route leg.  Shared handoff stations are visible
+                            # to both adjacent robots, but only the downstream
+                            # robot may remove a wafer for the next visit.
+                            # Without this reachability condition the IR
+                            # exposes locally legal picks with no possible
+                            # matching place, creating artificial dead ends.
+                            if (
+                                kind == "pick"
+                                and not set(targets).intersection(robot.module_ids)
+                            ):
+                                continue
+                            duration = (
+                                robot.pick_time if kind == "pick" else robot.place_time
+                            )
+                            for hand in self.hands[robot_id]:
+                                self._add(
+                                    robot_id,
+                                    kind,
+                                    phase,
+                                    mid,
+                                    duration,
+                                    process if kind == "place" else 0,
+                                    (hand, _id("module", mid), stage, owner),
+                                )
                 sources = targets
         return ConstraintIRV1(
             time_domain=self.time_domain, resources=tuple(resources), state_cells=tuple(cells),
@@ -179,28 +272,42 @@ class _ProblemCompiler:
         )
 
     def _add(
-        self, kind: str, phase: int, mid: str, duration: float, process: int,
+        self, robot_id: str, kind: str, phase: int, mid: str,
+        duration: float, process: int,
         row: tuple[str, ...],
     ) -> None:
         operation_ticks = _positive_ticks(self.time_domain, duration, kind)
-        travel_ticks = compile_ticks(self.time_domain, self.robot.travel_times, path="travel_times")
+        robot = self.robots[robot_id]
+        position = self.positions[robot_id]
+        initial_position = self.initial_positions[robot_id]
+        travel_ticks = compile_ticks(
+            self.time_domain,
+            robot.travel_times,
+            path=f"ClusterTool.{robot_id}.travel_times",
+        )
         variants = [("at", 0), ("away", travel_ticks)]
-        if self.initial_position is None:
+        if initial_position is None:
             variants.append(("unknown", 0))
         for variant, travel in variants:
-            template_id = _id("operator", kind, phase, mid, travel, operation_ticks, process)
+            template_id = _id(
+                "operator", kind, phase, mid, robot_id,
+                travel, operation_ticks, process,
+            )
             if template_id not in self.templates:
-                self._template(template_id, kind, phase, mid, travel, operation_ticks, process)
+                self._template(
+                    template_id, robot_id, kind, phase, mid,
+                    travel, operation_ticks, process,
+                )
             rule_id = _id("candidate", template_id, variant)
             if rule_id not in self.rules:
                 position_guards = (StateConditionTemplate(
-                    cell=LiteralIdRef(value=self.position),
+                    cell=LiteralIdRef(value=position),
                     operator="not_equal" if variant == "away" else "equal",
                     value=self.unknown if variant == "unknown" else _id("at", mid),
                 ),)
                 if variant == "away":
                     position_guards += (StateConditionTemplate(
-                        cell=LiteralIdRef(value=self.position), operator="not_equal", value=self.unknown,
+                        cell=LiteralIdRef(value=position), operator="not_equal", value=self.unknown,
                     ),)
                 self.rules[rule_id] = DynamicIntentSpec(
                     id=rule_id, operator_template_id=template_id, binding_domain_id=rule_id,
@@ -218,7 +325,7 @@ class _ProblemCompiler:
             self.rows[rule_id].add(row)
 
     def _template(
-        self, template_id: str, kind: str, phase: int, mid: str,
+        self, template_id: str, robot_id: str, kind: str, phase: int, mid: str,
         travel: int, duration: int, process: int,
     ) -> None:
         owner = ParameterIdRef(parameter="wafer")
@@ -230,9 +337,14 @@ class _ProblemCompiler:
             end_effects += (SetStateTemplateEffect(cell=stage, value=phase + 1),)
         action = IntervalTemplateSpec(
             id=kind, start_offset=travel, duration=duration, audit_kind=kind.title(),
-            resource_uses=(ResourceUseTemplate(resource=LiteralIdRef(value=self.motion)),),
+            resource_uses=(ResourceUseTemplate(
+                resource=LiteralIdRef(value=self.motions[robot_id])
+            ),),
             start_effects=(
-                SetStateTemplateEffect(cell=LiteralIdRef(value=self.position), value=_id("at", mid)),
+                SetStateTemplateEffect(
+                    cell=LiteralIdRef(value=self.positions[robot_id]),
+                    value=_id("at", mid),
+                ),
                 AcquireLeaseTemplateEffect(resource=destination, owner=owner),
             ),
             end_effects=end_effects,
@@ -241,7 +353,9 @@ class _ProblemCompiler:
         if travel:
             intervals = (IntervalTemplateSpec(
                 id="travel", start_offset=0, duration=travel, audit_kind="Travel",
-                resource_uses=(ResourceUseTemplate(resource=LiteralIdRef(value=self.motion)),),
+                resource_uses=(ResourceUseTemplate(
+                    resource=LiteralIdRef(value=self.motions[robot_id])
+                ),),
             ), action)
             dependencies = (StepDependencySpec(predecessor_step_id="travel", successor_step_id=kind),)
         self.templates[template_id] = OperatorTemplateSpec(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -18,9 +19,17 @@ from cluster_toolkit.constraint_ir import (
 from cluster_toolkit.problem import parse_problem
 from cluster_rl.ir.data import generate_dataset, load_cases, load_ir
 from cluster_rl.ir.env import IRSchedulingEnv
-from cluster_rl.ir.graph import IRGraphEncoder, NODE_INDEX
+from cluster_rl.ir.graph import (
+    EDGE_INDEX, FEATURE_VERSION, IRGraphEncoder, NODE_INDEX, NUMERIC_INDEX,
+)
 from cluster_rl.ir.network import IRActorCritic, collate_graphs
+from cluster_rl.ir.migrate_checkpoint import migrate_graph2_checkpoint
+from cluster_rl.ir.sample_search import _portfolio_attempts
+from cluster_rl.ir.sft import _policy_score
+from cluster_rl.ir.sft_data import replay_expert, verify_expert_coverage
+from cluster_rl.ir.safety_head import select_safe_action
 from cluster_rl.ir.train import IRTrainConfig, evaluate, load_checkpoint, train
+from cluster_rl.ir.wait_control import select_wait_control_action
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +76,168 @@ def _pm_problem(*, wafers: int = 1, process: int = 5) -> ConstraintIRV1:
 def _graph_equal(a, b) -> bool:
     return all(np.array_equal(getattr(a, name), getattr(b, name)) for name in
                ("node_types", "node_features", "edge_index", "edge_types", "action_nodes"))
+
+
+def test_safety_filter_preserves_actor_order_and_has_actor_fallback() -> None:
+    actor = torch.tensor([2.0, 4.0, 3.0])
+    safety = torch.tensor([1.0, -2.0, 0.5])
+    assert select_safe_action(actor, safety, 0.0) == 2
+    assert select_safe_action(actor, safety, 2.0) == 1
+    assert select_safe_action(actor, safety, None) == 1
+    assert select_safe_action(actor, safety, None, 0.0) == 0
+    assert select_safe_action(actor, safety, None, 0.75) == 2
+
+
+def test_solver_actions_replay_as_ir_supervision() -> None:
+    problem = _pm_problem()
+    actions = [
+        {"action_type": "pick", "module_id": "io", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 0},
+        {"action_type": "place", "module_id": "p", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 1},
+        {"action_type": "pick", "module_id": "p", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 1},
+        {"action_type": "place", "module_id": "io", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 2},
+    ]
+    verify_expert_coverage(problem, actions)
+    report = replay_expert(problem, actions)
+    assert report["success"]
+    assert report["expert_action_count"] == len(actions)
+    assert report["supervised_choice_count"] > 0
+
+
+def test_simultaneous_multi_robot_expert_actions_form_a_label_set() -> None:
+    problem = compile_problem(parse_problem({
+        "Modules": {
+            "io": {"type": "IO", "capacity": 2},
+            "p": {"type": "PM"},
+            "q": {"type": "PM"},
+        },
+        "ClusterTool": {
+            robot: {
+                "module_ids": ["io", "p", "q"],
+                "arm_type": "single_arm",
+                "pick_time": 1,
+                "place_time": 1,
+                "travel_times": 1,
+            }
+            for robot in ("r0", "r1")
+        },
+        "routes": {"route": [{"module_ids": ["p", "q"], "process_time": 5}]},
+        "initial_state": {"wafers": [{
+            "route_id": "route", "wafer_index": "0-1", "priority": 0,
+            "location": {"kind": "module", "module_id": "io"},
+        }]},
+    }), TimeDomain(unit="second", ticks_per_unit=1))
+    actions = []
+    for wafer, robot, process_module in ((0, "r0", "p"), (1, "r1", "q")):
+        actions.extend((
+            {"action_type": "pick", "module_id": "io", "tm_id": robot,
+             "route_id": "route", "wafer_index": wafer, "step_index": 0,
+             "start": 0},
+            {"action_type": "place", "module_id": process_module, "tm_id": robot,
+             "route_id": "route", "wafer_index": wafer, "step_index": 1,
+             "start": 2},
+            {"action_type": "pick", "module_id": process_module, "tm_id": robot,
+             "route_id": "route", "wafer_index": wafer, "step_index": 1,
+             "start": 8},
+            {"action_type": "place", "module_id": "io", "tm_id": robot,
+             "route_id": "route", "wafer_index": wafer, "step_index": 2,
+             "start": 10},
+        ))
+    actions.sort(key=lambda action: action["start"])
+    label_sets = []
+    report = replay_expert(
+        problem,
+        actions,
+        on_choice_set=lambda _graph, choices: label_sets.append(choices),
+    )
+    assert report["success"]
+    assert any(len(choices) == 2 for choices in label_sets)
+
+
+def test_expert_replay_stably_orders_unsorted_start_times() -> None:
+    problem = _pm_problem()
+    actions = [
+        {"action_type": "pick", "module_id": "io", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 0, "start": 0},
+        {"action_type": "place", "module_id": "p", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 1, "start": 2},
+        {"action_type": "pick", "module_id": "p", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 1, "start": 8},
+        {"action_type": "place", "module_id": "io", "tm_id": "r",
+         "route_id": "route", "wafer_index": 0, "step_index": 2, "start": 10},
+    ]
+    report = replay_expert(problem, [actions[0], actions[2], actions[1], actions[3]])
+    assert report["success"]
+    assert report["ir_makespan"] == 11
+
+
+def test_candidate_links_to_immediately_enabled_successor_plans() -> None:
+    graph, _ = IRSchedulingEnv(_pm_problem()).reset()
+    forward_remaining = EDGE_INDEX["remaining"]
+    for action_node in graph.action_nodes:
+        outgoing = graph.edge_types[graph.edge_index[0] == action_node]
+        assert forward_remaining in outgoing
+
+
+def test_graph3_exposes_generic_action_statistics_on_candidate_nodes() -> None:
+    env = IRSchedulingEnv(_choice_problem(duration=5))
+    graph, _ = env.reset()
+    duration_feature = NUMERIC_INDEX["action_duration_seconds"]
+    encoded = graph.node_features[graph.action_nodes, duration_feature]
+    expected = [
+        np.arcsinh(candidate.duration_ticks)
+        for candidate in env.frame.intents
+    ]
+    assert FEATURE_VERSION == "ir-graph-3"
+    np.testing.assert_allclose(encoded, expected)
+
+
+def test_graph2_checkpoint_migration_preserves_scalar_projection(tmp_path) -> None:
+    model = IRActorCritic(width=16, layers=2)
+    old_weight = torch.randn(16, 1)
+    state = model.state_dict()
+    state["numeric.weight"] = old_weight
+    source, destination = tmp_path / "old.pt", tmp_path / "new.pt"
+    torch.save({"feature_version": "ir-graph-2", "model": state}, source)
+    migrate_graph2_checkpoint(source, destination)
+    migrated = torch.load(destination, weights_only=True)
+    assert migrated["feature_version"] == "ir-graph-3"
+    torch.testing.assert_close(migrated["model"]["numeric.weight"][:, :1], old_weight)
+    assert torch.count_nonzero(migrated["model"]["numeric.weight"][:, 1:]) == 0
+
+
+def test_sample_search_portfolio_keeps_greedy_as_fallback() -> None:
+    greedy = {"success": True, "makespan": 10.0}
+    sampled = [
+        {"success": False, "makespan": None},
+        {"success": True, "makespan": 8.0},
+    ]
+    attempts = _portfolio_attempts(greedy, sampled)
+    assert attempts[0] is greedy
+    assert attempts[1:] == sampled
+
+
+def test_wait_control_penalizes_only_optional_wait() -> None:
+    logits = torch.tensor([0.1, 0.4, 1.0])
+    assert select_wait_control_action(logits, intent_count=2, penalty=0.0) == 2
+    assert select_wait_control_action(logits, intent_count=2, penalty=0.7) == 1
+    assert select_wait_control_action(logits, intent_count=2, penalty=math.inf) == 1
+    assert select_wait_control_action(logits[:2], intent_count=2, penalty=math.inf) == 1
+
+
+def test_sft_validation_score_prioritizes_completion_before_makespan() -> None:
+    reliable = {
+        "success_rate": 1.0, "deadlock_rate": 0.0,
+        "mean_ratio_to_branch_search": 2.0, "mean_ratio_to_genetic": 2.0,
+    }
+    fast_subset = {
+        "success_rate": 0.5, "deadlock_rate": 0.5,
+        "mean_ratio_to_branch_search": 0.5, "mean_ratio_to_genetic": 0.5,
+    }
+    assert _policy_score(reliable) > _policy_score(fast_subset)
 
 
 def test_environment_complete_audit_and_telescoping_time_reward():

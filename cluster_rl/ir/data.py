@@ -8,6 +8,8 @@ from pathlib import Path
 import random
 
 from cluster_toolkit.constraint_ir import ConstraintIRV1, TimeDomain, compile_problem
+from cluster_toolkit.cluster_generator.pipeline_models import SchedulingInstance
+from cluster_toolkit.cluster_generator.problem_adapter import to_cluster_problem
 from cluster_toolkit.problem import load_problem, parse_problem
 
 
@@ -15,6 +17,12 @@ def load_ir(path: Path) -> ConstraintIRV1:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw.get("schema_version"), str) and "reference" in raw["schema_version"]:
         return ConstraintIRV1.model_validate(raw)
+    if {"instance_id", "topology", "recipes", "workload"} <= raw.keys():
+        instance = SchedulingInstance.model_validate(raw)
+        return compile_problem(
+            to_cluster_problem(instance),
+            TimeDomain(unit="second", ticks_per_unit=1),
+        )
     return compile_problem(load_problem(path), TimeDomain(unit="second", ticks_per_unit=1000))
 
 

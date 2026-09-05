@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -127,6 +128,7 @@ class CandidatePlan:
     candidate: IntentCandidate
     seed: IntentSeedSpec
     consume_source: bool
+    addition: ScheduleV1
 
 
 class CandidateGenerator(Protocol):
@@ -164,44 +166,91 @@ class ExhaustiveReferenceCandidateGenerator:
 
     def __init__(self, *, include_legacy: bool = True) -> None:
         self._include_legacy = include_legacy
+        self._legacy_generator = LegacyIntentSeedCandidateGenerator()
+        self._compiled_rows: dict[
+            tuple[int, str],
+            tuple[
+                tuple[
+                    tuple[BindingAssignment, ...],
+                    tuple[ChoiceScopeClaimSpec, ...],
+                    tuple[StateCondition, ...],
+                    str,
+                ],
+                ...,
+            ],
+        ] = {}
+
+    def _rows(
+        self,
+        problem: ConstraintIRV1,
+        rule: DynamicIntentSpec,
+    ) -> tuple[
+        tuple[
+            tuple[BindingAssignment, ...],
+            tuple[ChoiceScopeClaimSpec, ...],
+            tuple[StateCondition, ...],
+            str,
+        ],
+        ...,
+    ]:
+        # ConstraintIRV1 is immutable for a session.  Its problem_hash property
+        # canonicalizes every binding row, so using the object identity here
+        # avoids recomputing the entire problem merely to look up this cache.
+        key = (id(problem), rule.id)
+        cached = self._compiled_rows.get(key)
+        if cached is not None:
+            return cached
+        domain = next(
+            item for item in problem.binding_domains
+            if item.id == rule.binding_domain_id
+        )
+        parameter_names = tuple(parameter.name for parameter in domain.parameters)
+        compiled = []
+        for row in domain.rows:
+            values = dict(zip(parameter_names, row.values))
+            bindings = tuple(
+                BindingAssignment(parameter=name, value=value)
+                for name, value in sorted(values.items())
+            )
+            compiled.append((
+                bindings,
+                _render_choice_scopes(rule, values),
+                tuple(_resolve_guard(condition, values) for condition in rule.guards),
+                canonical_digest([
+                    item.model_dump(mode="json") for item in bindings
+                ]),
+            ))
+        result = tuple(compiled)
+        self._compiled_rows[key] = result
+        return result
 
     def generate(
         self,
         context: CandidateGenerationContext,
     ) -> tuple[CandidatePlan, ...]:
         plans = list(
-            LegacyIntentSeedCandidateGenerator().generate(context)
+            self._legacy_generator.generate(context)
             if self._include_legacy
             else ()
         )
-        domains = {
-            domain.id: domain for domain in context.problem.binding_domains
-        }
+        occurrences = Counter(
+            (
+                selection.operator_template_id,
+                tuple(sorted(selection.bindings, key=lambda item: item.parameter)),
+            )
+            for record in context.commit_log
+            for selection in record.selections
+        )
         for rule in context.problem.dynamic_intents:
-            domain = domains[rule.binding_domain_id]
-            for row in domain.rows:
-                values = dict(
-                    zip(
-                        (parameter.name for parameter in domain.parameters),
-                        row.values,
-                    )
-                )
-                bindings = tuple(
-                    BindingAssignment(parameter=name, value=value)
-                    for name, value in sorted(values.items())
-                )
-                scopes = _render_choice_scopes(rule, values)
-                occurrence = sum(
-                    selection.operator_template_id == rule.operator_template_id
-                    and tuple(sorted(selection.bindings, key=lambda item: item.parameter))
-                    == bindings
-                    for record in context.commit_log
-                    for selection in record.selections
-                )
+            for bindings, scopes, guards, binding_digest in self._rows(
+                context.problem,
+                rule,
+            ):
+                occurrence = occurrences[(rule.operator_template_id, bindings)]
                 seed = IntentSeedSpec(
                     id=(
                         f"dynamic/{rule.id}/"
-                        f"{canonical_digest([item.model_dump(mode='json') for item in bindings])}"
+                        f"{binding_digest}"
                         f"/{occurrence}"
                     ),
                     operator_template_id=rule.operator_template_id,
@@ -209,10 +258,7 @@ class ExhaustiveReferenceCandidateGenerator:
                     earliest_start_offset=rule.earliest_start_offset,
                     latest_start_offset=rule.latest_start_offset,
                     required_obligation_ids=rule.required_obligation_ids,
-                    guards=tuple(
-                        _resolve_guard(condition, values)
-                        for condition in rule.guards
-                    ),
+                    guards=guards,
                     choice_scope_claims=scopes,
                 )
                 plan = _plan_seed(
@@ -235,6 +281,7 @@ class ReferenceSession:
         candidate_generator: CandidateGenerator | None = None,
     ) -> None:
         self.problem = problem
+        self._problem_hash = problem.problem_hash
         self._candidate_generator = (
             candidate_generator or ExhaustiveReferenceCandidateGenerator()
         )
@@ -246,6 +293,8 @@ class ReferenceSession:
         self._active_choice_scope_keys: set[str] = set()
         self._schedule = ScheduleV1()
         self._last_result: CommitResult | None = None
+        self._cached_frame_token: str | None = None
+        self._cached_plans: tuple[CandidatePlan, ...] | None = None
 
     @classmethod
     def from_snapshot(
@@ -296,13 +345,17 @@ class ReferenceSession:
         return session
 
     def frame(self) -> DecisionFrame:
-        candidates = tuple(
-            plan.candidate for plan in self._candidate_plans()
-        )
+        token = self._frame_token
+        if self._cached_frame_token == token and self._cached_plans is not None:
+            plans = self._cached_plans
+        else:
+            plans = self._candidate_plans()
+            self._cached_frame_token = token
+            self._cached_plans = plans
         return DecisionFrame(
-            frame_token=self._frame_token,
+            frame_token=token,
             tick=self._tick,
-            intents=candidates,
+            intents=tuple(plan.candidate for plan in plans),
         )
 
     def commit(
@@ -321,7 +374,11 @@ class ReferenceSession:
                 DiagnosticCode.INVALID_SCHEDULE,
                 "commit requires a non-empty set of distinct intent ids",
             )
-        plans = self._candidate_plans()
+        plans = (
+            self._cached_plans
+            if self._cached_frame_token == frame_token and self._cached_plans is not None
+            else self._candidate_plans()
+        )
         plans_by_reference = {
             reference: plan
             for plan in plans
@@ -350,22 +407,33 @@ class ReferenceSession:
         _validate_alternative_selection(selected)
         _validate_choice_scope_selection(selected_plans)
 
-        addition = _expand_intents(
-            self.problem,
-            selected,
-            anchor_tick=self._tick,
-            decision_round=_next_decision_round(self._schedule, self._tick),
+        addition = (
+            selected_plans[0].addition
+            if len(selected_plans) == 1
+            else _expand_intents(
+                self.problem,
+                selected,
+                anchor_tick=self._tick,
+                decision_round=_next_decision_round(self._schedule, self._tick),
+            )
         )
         schedule = _merge_schedules(self._schedule, addition)
         horizon = _schedule_horizon(schedule, self._tick)
-        ReferenceKernel.execute_until(
+        current_snapshot = self._current_kernel_snapshot
+        ReferenceKernel.preview_addition(
             self.problem,
             schedule,
+            addition,
+            current_snapshot,
             horizon,
             allow_open_obligations=True,
         )
-        execution = ReferenceKernel.execute_until(
-            self.problem, schedule, self._tick,
+        execution = ReferenceKernel.preview_addition(
+            self.problem,
+            schedule,
+            addition,
+            current_snapshot,
+            self._tick,
         )
         commit_record = _make_commit_record(
             previous_commit_id=(
@@ -400,6 +468,8 @@ class ReferenceSession:
         )
         self._revision += 1
         self._last_result = result
+        self._cached_frame_token = None
+        self._cached_plans = None
         return result
 
     def snapshot(self, tick: int | None = None) -> SessionSnapshot:
@@ -415,14 +485,17 @@ class ReferenceSession:
                 DiagnosticCode.INVALID_TIME_VALUE,
                 "snapshot must not precede the latest committed decision",
             )
-        execution = ReferenceKernel.execute_until(
-            self.problem,
-            self._schedule,
-            snapshot_tick,
+        kernel_snapshot = (
+            self._current_kernel_snapshot
+            if snapshot_tick == self._tick
+            else ReferenceKernel.execute_until(
+                self.problem,
+                self._schedule,
+                snapshot_tick,
+            ).final_snapshot
         )
-        kernel_snapshot = execution.final_snapshot
         return SessionSnapshot(
-            problem_hash=self.problem.problem_hash,
+            problem_hash=self._problem_hash,
             revision=self._revision,
             tick=snapshot_tick,
             committed_intent_ids=tuple(sorted(self._committed_ids)),
@@ -445,6 +518,26 @@ class ReferenceSession:
             ),
         )
 
+    def fork(self) -> "ReferenceSession":
+        """Cheap in-process clone for speculative planning from trusted state."""
+        clone = object.__new__(type(self))
+        clone.problem = self.problem
+        clone._problem_hash = self._problem_hash
+        clone._candidate_generator = self._candidate_generator
+        clone._revision = self._revision
+        clone._tick = self._tick
+        clone._committed_ids = set(self._committed_ids)
+        clone._committed_alternative_groups = set(
+            self._committed_alternative_groups
+        )
+        clone._commit_log = self._commit_log
+        clone._active_choice_scope_keys = set(self._active_choice_scope_keys)
+        clone._schedule = self._schedule
+        clone._last_result = self._last_result
+        clone._cached_frame_token = self._cached_frame_token
+        clone._cached_plans = self._cached_plans
+        return clone
+
     def advance_to(self, tick: int) -> ExecutionResult:
         """Explicit replay/diagnostic fast-forward; policy loops use advance_next."""
         if not isinstance(tick, int) or isinstance(tick, bool) or tick < 0:
@@ -457,9 +550,11 @@ class ReferenceSession:
                 DiagnosticCode.INVALID_TIME_VALUE,
                 "advance target must not precede the current tick",
             )
-        execution = ReferenceKernel.execute_until(
+        execution = ReferenceKernel.preview_addition(
             self.problem,
             self._schedule,
+            ScheduleV1(),
+            self._current_kernel_snapshot,
             tick,
         )
         self._tick = tick
@@ -473,6 +568,8 @@ class ReferenceSession:
             execution=execution,
             reservations=_derive_reservations(self._schedule),
         )
+        self._cached_frame_token = None
+        self._cached_plans = None
         return execution
 
     def advance_next(self) -> ExecutionResult | None:
@@ -543,7 +640,7 @@ class ReferenceSession:
     def _frame_token(self) -> str:
         return canonical_digest(
             {
-                "problem_hash": self.problem.problem_hash,
+                "problem_hash": self._problem_hash,
                 "revision": self._revision,
                 "state_hash": self._current_kernel_snapshot.state_hash,
                 "commitment_hash": self._commitment_hash,
@@ -620,18 +717,31 @@ def _plan_seed(
             addition,
             context.tick + seed.earliest_start_offset,
         )
-        ReferenceKernel.execute_until(context.problem, schedule, context.tick)
-        ReferenceKernel.execute_until(
+        # Current-tick effects must be checked with hard deadlines enabled;
+        # the longer preview below may defer only future open obligations.
+        ReferenceKernel.preview_addition(
+            context.problem, schedule, addition, context.current_snapshot,
+            context.tick,
+        )
+        validated = ReferenceKernel.preview_addition(
             context.problem,
             schedule,
+            addition,
+            context.current_snapshot,
             _schedule_horizon(schedule, context.tick),
             allow_open_obligations=True,
         )
-        predicted = ReferenceKernel.execute_until(
-            context.problem,
-            schedule,
-            completion_tick,
-            allow_open_obligations=True,
+        predicted = (
+            validated
+            if validated.final_snapshot.tick == completion_tick
+            else ReferenceKernel.preview_addition(
+                context.problem,
+                schedule,
+                addition,
+                context.current_snapshot,
+                completion_tick,
+                allow_open_obligations=True,
+            )
         )
     except SemanticError:
         return None
@@ -652,6 +762,7 @@ def _plan_seed(
         ),
         seed=seed,
         consume_source=consume_source,
+        addition=addition,
     )
 
 

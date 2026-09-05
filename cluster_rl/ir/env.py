@@ -49,7 +49,8 @@ class IRSchedulingEnv(gym.Env[IRGraph, int]):
     metadata = {"render_modes": []}
 
     def __init__(self, problem: ConstraintIRV1, *, max_decisions: int = 1000,
-                 max_time_seconds: float | None = None, reward_scale_seconds: float = 100.0) -> None:
+                 max_time_seconds: float | None = None, reward_scale_seconds: float = 100.0,
+                 encode_observations: bool = True) -> None:
         if max_decisions <= 0:
             raise ValueError("max_decisions must be positive")
         if not math.isfinite(reward_scale_seconds) or reward_scale_seconds <= 0:
@@ -57,7 +58,8 @@ class IRSchedulingEnv(gym.Env[IRGraph, int]):
         if max_time_seconds is not None and (not math.isfinite(max_time_seconds) or max_time_seconds <= 0):
             raise ValueError("max_time_seconds must be finite and positive")
         self.problem = problem
-        self.encoder = IRGraphEncoder(problem)
+        self.encode_observations = encode_observations
+        self.encoder = IRGraphEncoder(problem) if encode_observations else None
         self.max_decisions = max_decisions
         self.max_tick = (None if max_time_seconds is None else
                          math.floor(max_time_seconds * problem.time_domain.ticks_per_unit))
@@ -88,7 +90,8 @@ class IRSchedulingEnv(gym.Env[IRGraph, int]):
             raise RuntimeError("reset an unfinished episode before calling step")
         if isinstance(action, (bool, np.bool_)) or not isinstance(action, (int, np.integer)):
             raise ValueError("action must be a compact integer index")
-        if not 0 <= action < self.observation.action_count:
+        action_count = len(self.frame.intents) + (self.wait_tick is not None)
+        if not 0 <= action < action_count:
             raise ValueError("action is not available in this DecisionFrame")
         before = self.reward_tick
         self.decisions += 1
@@ -170,15 +173,22 @@ class IRSchedulingEnv(gym.Env[IRGraph, int]):
                 self.reason = "decision_limit" if self.decisions >= self.max_decisions else "deadlock"
             else:
                 self._advance(next_tick)
-        self.observation = self.encoder.encode(
-            self.snapshot, self.frame, self.wait_tick,
-            decisions_remaining=self.max_decisions - self.decisions,
-            time_remaining=None if self.max_tick is None else self.max_tick - self.snapshot.tick,
+        self.observation = (
+            self.encoder.encode(
+                self.snapshot, self.frame, self.wait_tick,
+                decisions_remaining=self.max_decisions - self.decisions,
+                time_remaining=(
+                    None if self.max_tick is None else self.max_tick - self.snapshot.tick
+                ),
+            )
+            if self.encode_observations
+            else None
         )
 
     def _info(self) -> dict:
         mask = np.zeros(self.action_space.n, dtype=np.bool_)
-        mask[:self.observation.action_count] = True
+        action_count = len(self.frame.intents) + (self.wait_tick is not None)
+        mask[:action_count] = True
         return {
             "success": self.reason == "success", "termination_reason": self.reason,
             "tick": self.snapshot.tick, "elapsed_seconds": self.snapshot.tick / self.problem.time_domain.ticks_per_unit,

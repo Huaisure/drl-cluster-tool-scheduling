@@ -65,6 +65,47 @@ class ReferenceKernel:
         )
 
     @classmethod
+    def preview_addition(
+        cls,
+        problem: ConstraintIRV1,
+        schedule: ScheduleV1,
+        addition: ScheduleV1,
+        current_snapshot: KernelSnapshot,
+        until_tick: int,
+        *,
+        allow_open_obligations: bool = False,
+    ) -> ExecutionResult:
+        """Preview a schedule addition from an already validated current state."""
+        runtime = _Runtime(problem, schedule, minimum_tick=current_snapshot.tick)
+        runtime.state_values = {
+            assignment.cell_id: assignment.value
+            for assignment in current_snapshot.state_values
+        }
+        runtime.leases = {
+            (lease.resource_id, lease.owner_id): lease.amount
+            for lease in current_snapshot.active_leases
+        }
+        runtime.obligations = {
+            obligation.id: obligation.deadline_tick
+            for obligation in current_snapshot.active_obligations
+        }
+        current_addition_ids = {
+            event.id for event in addition.events
+            if event.tick == current_snapshot.tick
+        }
+        runtime.events_by_tick = defaultdict(list)
+        for event in schedule.events:
+            if (
+                event.tick > current_snapshot.tick
+                or event.id in current_addition_ids
+            ):
+                runtime.events_by_tick[event.tick].append(event)
+        return runtime.execute(
+            until_tick=until_tick,
+            allow_open_obligations=allow_open_obligations,
+        )
+
+    @classmethod
     def start(
         cls,
         problem: ConstraintIRV1,
@@ -96,9 +137,16 @@ class ReferenceKernel:
 
 
 class _Runtime:
-    def __init__(self, problem: ConstraintIRV1, schedule: ScheduleV1) -> None:
+    def __init__(
+        self,
+        problem: ConstraintIRV1,
+        schedule: ScheduleV1,
+        *,
+        minimum_tick: int = 0,
+    ) -> None:
         self.problem = problem
         self.schedule = schedule
+        self.minimum_tick = minimum_tick
         self.resources = {resource.id: resource for resource in problem.resources}
         self.cells = {cell.id: cell for cell in problem.state_cells}
         self.state_values = {
@@ -133,6 +181,7 @@ class _Runtime:
             for interval in self.schedule.intervals
             for boundary in (interval.start_tick, interval.end_tick)
         )
+        fixed_ticks = {tick for tick in fixed_ticks if tick >= self.minimum_tick}
         if until_tick is not None:
             fixed_ticks = {tick for tick in fixed_ticks if tick <= until_tick}
             fixed_ticks.add(until_tick)

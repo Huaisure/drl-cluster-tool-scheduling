@@ -74,7 +74,7 @@ step reward = -0.5 × (C(t_after) - C(t_before))
 
 网络只使用有限通用原语词表，例如容量资源、相等条件、占位获取、状态更新、义务创建、边界和等待。它没有 Pick/Place/Clean 输出头，也没有 PM/LL 类型特征。消息传递保留邻接数量，避免平均聚合丢掉持有/容量相关的数量信息；Actor 统一评分候选，Critic 读取整图。没有节点编号或序列位置 embedding，节点重排应只导致对应重排。
 
-节点原语与边角色列表是版本化的模型输入协议 `ir-graph-1`。增加原语必须更新编码器、测试和协议，不允许未知字段静默丢失。这个编码器消费参考协议 `1.2-reference`；其 ID 查找是参考候选接口的 Adapter，不是模型语义。
+节点原语、边角色与数值通道顺序是版本化的模型输入协议 `ir-graph-3`。候选节点除保留完整关系子图外，还直接携带通用的启动偏移、期限余量、持续时间、资源数量/总量、状态变化数和直接后继数；这些通道不解析业务 ID。增加或重排通道必须更新编码器、测试和协议，不允许未知字段静默丢失。这个编码器消费参考协议 `1.2-reference`；其 ID 查找是参考候选接口的 Adapter，不是模型语义。
 
 ## PPO 与实验产物
 
@@ -120,3 +120,98 @@ run-dir/
 ```
 
 本轮实施与实测结果见 [dev/ir-training.md](../../dev/ir-training.md)。小样本训练成功只证明基础设施可用，后续仍需多 seed、更多规模、真实约束组合与分布外评估。
+
+## GA / Branch Search 监督 warm-up
+
+生产数据管线生成的 `SchedulingInstance`（多 Robot、PM/AL/BUFFER、跨 Cell
+handoff、0 秒过渡处理）可以直接编译到同一 IR 协议。先对已有运行执行官方
+reducer，再物化互斥 split：
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_toolkit.run_data_pipeline reduce `
+  datasets\raw\run-ga-branch-1000-20260831-113524
+
+.\.venv\Scripts\python.exe -m cluster_rl.ir.sft_data `
+  datasets\raw\run-ga-branch-1000-20260831-113524 `
+  datasets\ir_sft_ga_branch_v3 --seed 1701
+```
+
+`sft_data` 只纳入 reducer 标记为 usable 的合法 incumbent，复制不可变问题与
+压缩 expert 动作，保留动作 SHA-256、GA/Branch Search 各自最佳 makespan，
+并验证每个 expert 动作都能由编译后的 IR operator/binding 表达。split 按
+wafer 规模、Cell 数和胜出 expert 分层；test 不参与训练或选模。
+共享 handoff 站的 pick binding 只保留同时能到达当前站与至少一个下一
+路线目标的 Robot；上游 Robot “能取但不可能放到下一站”的局部合法死路不会
+暴露给策略。
+
+监督训练入口输出与 PPO 兼容的 `best.pt`/`last.pt`：
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_rl.ir.sft `
+  --train datasets\ir_sft_ga_branch_v3\train\manifest.json `
+  --validation datasets\ir_sft_ga_branch_v3\validation\manifest.json `
+  --test datasets\ir_sft_ga_branch_v3\test\manifest.json `
+  --run-dir runs\ir_sft_warmup_v1 --epochs 1 --width 32 --layers 3
+```
+
+SFT 逐步在 Reference Session 中重放 solver 的 module/robot/wafer 决策；当下一
+个 expert 操作尚不可提交时，插入显式 Wait 标签。只有候选数大于一的状态产生
+交叉熵损失。最终报告同时给出完成率、deadlock rate，以及相对 GA 和 Branch
+Search 的 makespan 比值；不能以 imitation accuracy 代替闭环调度指标。
+
+源文件不假定已按时间排序；回放先按 `(start, original_index)` 稳定排序。同一
+最早 `start` 时刻的多个当前合法动作使用集合标签，损失为该集合总
+概率的负对数；这避免多 Robot 可交换操作因序列化顺序产生互相矛盾的单标签。
+`--resume-from RUN/last.pt` 可在首轮 case 边界恢复模型、优化器、计数与确定性
+样本顺序，适用于被长 case 中断的 SFT 运行。
+
+对已保存 SFT checkpoint，可仅在 train split 上收集成功的 shield rollout 并做
+纠正蒸馏；validation/test 仍只用于评估：
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_rl.ir.safety_distill `
+  --checkpoint runs\ir_sft_warmup_v6_balanced\last.pt `
+  --train datasets\ir_sft_ga_branch_v2\train\manifest.json `
+  --validation datasets\ir_sft_ga_branch_v2\validation\manifest.json `
+  --test datasets\ir_sft_ga_branch_v2\test\manifest.json `
+  --run-dir runs\ir_sft_safety_distill --max-train-cases 4 `
+  --collection-max-wafers 12 --learning-rate 0.00003
+```
+
+该入口只训练模型首选被一阶 IR 检查拒绝的状态，并丢弃所有未完成轨迹。它是
+安全纠正实验，不保证全局可完成性；必须同时检查输出的 raw 与 shield 指标。
+
+`cluster_rl.ir.expert_margin` 提供更保守的 train-only 诊断：只对专家状态中模型
+最高分且一步失败的动作建立 pairwise margin。实验表明少量该类负例直接更新共享
+actor 会扰动全局调度排序；该入口保留用于复现，不应替代独立 safety/value head。
+
+独立安全头保持 SFT actor 冻结，用 train-only 专家动作和失败 rollout 尾部训练，
+并且只在 validation 选择绝对阈值或状态内相对 margin：
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_rl.ir.safety_head `
+  --checkpoint runs\ir_sft_warmup_v11_multilabel\best.pt `
+  --train datasets\ir_sft_ga_branch_v2\train\manifest.json `
+  --validation datasets\ir_sft_ga_branch_v2\validation\manifest.json `
+  --test datasets\ir_sft_ga_branch_v2\test\manifest.json `
+  --run-dir runs\ir_sft_safety_head --max-train-cases 4 `
+  --collection-max-decisions 200 --positive-cap 16 --negative-tail 8 `
+  --relative-margins 0 0.5
+```
+
+有界 shield 的预算与回溯步长同样必须在 validation 选择，选定后才执行一次 test：
+
+```powershell
+.\.venv\Scripts\python.exe -m cluster_rl.ir.evaluate_shield `
+  --checkpoint runs\ir_sft_warmup_v8_corrective_distill\last.pt `
+  --validation datasets\ir_sft_ga_branch_v2\validation\manifest.json `
+  --test datasets\ir_sft_ga_branch_v2\test\manifest.json `
+  --run-dir runs\ir_sft_shield_eval --budgets 25 --strides 1 4 8
+```
+
+这两个入口都会优先按完成率、deadlock rate 选择，再比较成功轨迹相对 Branch
+Search 的工期；测试集不参与阈值、预算或步长选择。
+
+`cluster_rl.ir.causal_safety` 可进一步在 train-only 失败轨迹上实际续跑原分支与
+替代分支，只从终局相反的反事实生成成对安全标签。若没有找到因果动作对，它会先
+写入 `status=no_causal_pairs` 的 `result.json`，不训练模型，也不访问验证/测试集。

@@ -17,7 +17,7 @@ from cluster_toolkit.constraint_ir import ConstraintIRV1, DecisionFrame, Session
 from cluster_toolkit.constraint_ir.schema import canonical_digest
 
 
-FEATURE_VERSION = "ir-graph-1"
+FEATURE_VERSION = "ir-graph-3"
 NODE_TYPES = (
     "program", "current", "initial", "goal", "resource", "cell_bool", "cell_int",
     "cell_enum", "owner", "symbol", "obligation", "scope", "group", "coalesce",
@@ -38,7 +38,18 @@ EDGE_TYPES = (
 )
 NODE_INDEX = {name: i for i, name in enumerate(NODE_TYPES)}
 EDGE_INDEX = {name: i for i, name in enumerate(EDGE_TYPES)}
-NUMERIC_WIDTH = 1
+NUMERIC_FEATURES = (
+    "scalar_value",
+    "action_earliest_seconds",
+    "action_latest_slack_seconds",
+    "action_duration_seconds",
+    "action_resource_count",
+    "action_resource_amount",
+    "action_state_change_count",
+    "action_successor_count",
+)
+NUMERIC_INDEX = {name: index for index, name in enumerate(NUMERIC_FEATURES)}
+NUMERIC_WIDTH = len(NUMERIC_FEATURES)
 
 
 @dataclass(frozen=True)
@@ -107,8 +118,14 @@ class _Builder:
     def node(self, kind: str, value: float = 0.0) -> int:
         index = len(self.types)
         self.types.append(NODE_INDEX[kind])
-        self.features.append([math.asinh(value)])
+        features = [0.0] * NUMERIC_WIDTH
+        features[NUMERIC_INDEX["scalar_value"]] = math.asinh(value)
+        self.features.append(features)
         return index
+
+    def feature(self, node: int, name: str, value: float, *, time: bool = False) -> None:
+        scaled = value / self.scale if time else value
+        self.features[node][NUMERIC_INDEX[name]] = math.asinh(scaled)
 
     def entity(self, kind: str, key: str) -> int:
         identity = kind, key
@@ -255,6 +272,7 @@ class IRGraphEncoder:
             self.auto.setdefault(rule.trigger_operator_template_id, []).append(rule)
         self.plans: dict[str, int] = {}
         self.seed_plans: dict[str, int] = {}
+        self.guarded_plans: dict[tuple[str, object], list[int]] = {}
         domains = {domain.id: domain for domain in problem.binding_domains}
         for rule in problem.dynamic_intents:
             domain = domains[rule.binding_domain_id]
@@ -264,6 +282,12 @@ class IRGraphEncoder:
                 prefix = f"dynamic/{rule.id}/{canonical_digest(encoded)}/"
                 plan = self._plan(rule, values)
                 self.plans[prefix] = plan
+                for guard in rule.guards:
+                    data = guard.model_dump(mode="python")
+                    if data.get("operator") != "equal" or "cell" not in data:
+                        continue
+                    cell_id = _Builder.resolve(data["cell"], values)
+                    self.guarded_plans.setdefault((cell_id, data["value"]), []).append(plan)
         for seed in problem.intent_seeds:
             self.seed_plans[seed.id] = self._plan(seed, {item.parameter: item.value for item in seed.bindings})
 
@@ -393,10 +417,38 @@ class IRGraphEncoder:
             if plan is None:
                 raise ValueError("candidate has no declared observation plan")
             b.edge(node, plan, "plan")
-            b.scalar(node, candidate.earliest_start_tick - now, "earliest", time=True)
+            earliest = candidate.earliest_start_tick - now
+            b.scalar(node, earliest, "earliest", time=True)
             latest = None if candidate.latest_start_tick is None else candidate.latest_start_tick - now
             b.scalar(node, latest, "latest", time=True)
             b.scalar(node, candidate.duration_ticks, "duration", time=True)
+            b.feature(node, "action_earliest_seconds", earliest, time=True)
+            if latest is not None:
+                b.feature(
+                    node, "action_latest_slack_seconds", latest - earliest,
+                    time=True,
+                )
+            b.feature(
+                node, "action_duration_seconds", candidate.duration_ticks,
+                time=True,
+            )
+            b.feature(
+                node, "action_resource_count", len(candidate.resource_footprint),
+            )
+            b.feature(
+                node, "action_resource_amount",
+                sum(use.amount for use in candidate.resource_footprint),
+            )
+            b.feature(
+                node, "action_state_change_count",
+                len(candidate.state_delta.state_values) + len(candidate.state_delta.leases),
+            )
+            successors = set()
+            for change in candidate.state_delta.state_values:
+                successors.update(
+                    self.guarded_plans.get((change.cell_id, change.after), ())
+                )
+            b.feature(node, "action_successor_count", len(successors))
             for use in candidate.resource_footprint:
                 claim = b.child(node, "reservation", "resource")
                 b.ref(claim, "resource", use.resource_id, "resource")
@@ -408,6 +460,11 @@ class IRGraphEncoder:
                 b.ref(delta, "cell", change.cell_id, "cell")
                 b.scalar(delta, change.before, "before")
                 b.scalar(delta, change.after, "after")
+                # A candidate must be able to reason about the operation it
+                # enables next. Linking by an explicit state transition and an
+                # equal guard is generic IR dataflow, not an identity heuristic.
+                for successor in self.guarded_plans.get((change.cell_id, change.after), ()):
+                    b.edge(node, successor, "remaining")
             for change in candidate.state_delta.leases:
                 delta = b.child(node, "delta", "effect")
                 b.ref(delta, "resource", change.resource_id, "resource")
@@ -417,5 +474,8 @@ class IRGraphEncoder:
         if wait_tick is not None:
             node = b.child(current, "wait")
             b.scalar(node, wait_tick - now, "duration", time=True)
+            b.feature(
+                node, "action_duration_seconds", wait_tick - now, time=True,
+            )
             actions.append(node)
         return b.finish(actions)
